@@ -3275,6 +3275,12 @@ fn validateExternCallconv(cc: std.lang.CallingConvention) bool {
         // For now we want to authorize PTX kernel to use zig objects, even if we end up exposing the ABI.
         // The goal is to experiment with more integrated CPU/GPU code.
         .nvptx_kernel => true,
+        // Same reasoning as `.nvptx_kernel`: a Metal kernel's arguments are buffers that the host
+        // binds, so its ABI is the compiler's to choose, and the name it is exported with is how
+        // the Metal runtime finds it. An `air64` module is a library of kernels; without this, no
+        // kernel and no compiler-rt function (whose convention on this target is `.metal_device`,
+        // not this one) could be exported at all.
+        .metal_kernel => true,
         else => !target_util.fnCallConvAllowsZigTypes(cc),
     };
 }
