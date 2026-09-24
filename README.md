@@ -21,8 +21,8 @@ the compiler was written by upstream Zig contributors.
   [doc/langref/test_private_fields.zig](doc/langref/test_private_fields.zig).
   Upstream closed the [proposal](https://github.com/ziglang/zig/issues/9909) as
   not planned.
-- **LLVM forever**, and a blessed path to PTX. See
-  [LLVM Is Forever](#llvm-is-forever).
+- **LLVM forever**, and a blessed path to PTX: `std.gpu` runs Zig++ and its
+  standard library on NVIDIA GPUs. See [LLVM Is Forever](#llvm-is-forever).
 - **AI in the toolchain.** See [AI Policy](#ai-policy).
 - **A BDFL and one rule: talk about code.** See [Governance](#governance).
 
@@ -42,37 +42,71 @@ upstream Zig binary cannot compile against it. Use the CMake build,
 Upstream Zig plans to drop its dependency on the LLVM libraries. Zig++ will
 never phase out LLVM. In `package.json` terms, LLVM stays in `dependencies`.
 
-LLVM, and MLIR above it, are how Zig++ goes the final stretch on GPUs. Zig++
-will have a blessed path that lowers Zig++ directly to PTX, with first-class
-GPU intrinsics. The reference design is [zzgpu](https://github.com/mattneel/zzgpu):
-plain Zig functions as kernels, intrinsics such as `gpu.globalId()`,
-`gpu.threadIdx`, and `gpu.syncThreads()`, shared memory, and kernels compiled to
-PTX and embedded at build time.
+LLVM, and MLIR above it, are how Zig++ goes the final stretch on GPUs. The
+blessed path lowers Zig++ directly to PTX, with first-class GPU intrinsics, and
+its first leg works today: `std.gpu`, a port of
+[ugpu](https://github.com/mattneel/ugpu) into the standard library.
 
-The first leg works today. With a Zig++ compiler built against LLVM, this kernel
-compiles to PTX that NVIDIA's `ptxas` accepts:
+- Kernels are plain Zig functions. `std.gpu` has CUDA's indexing (`threadIdx`,
+  `blockIdx`, `blockDim`, `gridDim`, `globalId`), `syncThreads`, warp shuffles,
+  votes and reductions, atomics, fast math approximations, and `print`.
+- The standard library runs on the GPU: `std.fmt`, `std.json`, `std.mem`,
+  `std.base64`, hash maps, and array lists, with allocators for the device heap
+  and for shared memory in `std.gpu.allocators`.
+- Every NVPTX module carries the compiler-rt routines that it calls, so
+  `@sin`, `@exp`, `@log`, `f128`, and float parsing work in kernels. Upstream
+  Zig crashes LLVM on `@sin` for NVPTX.
+- `std.gpu.cuda` loads the CUDA driver at run time, so programs build without
+  the CUDA toolkit, and launches kernels from the host.
 
 ```zig
-export fn add(
-    a: [*]addrspace(.global) const f32,
-    b: [*]addrspace(.global) const f32,
-    c: [*]addrspace(.global) f32,
-    n: u32,
-) callconv(.nvptx_kernel) void {
-    const i = @workGroupId(0) * @workGroupSize(0) + @workItemId(0);
-    if (i < n) c[i] = a[i] + b[i];
+// kernels.zig
+const gpu = @import("std").gpu;
+
+export fn wave(data: [*]f32, amplitude: f32, n: u32) callconv(.kernel) void {
+    const i = gpu.globalId(.x);
+    if (i < n) data[i] = amplitude * @sin(data[i]);
+}
+```
+
+```zig
+// main.zig
+const std = @import("std");
+const cuda = std.gpu.cuda;
+
+pub fn main() !void {
+    var driver = try cuda.Driver.open();
+    defer driver.close();
+    const context = try (try driver.device(0)).retainPrimaryContext();
+    defer context.release();
+    const module = try context.loadModule(@embedFile("kernels.ptx"), .{});
+    defer module.unload();
+
+    var data: [1000]f32 = undefined;
+    for (&data, 0..) |*x, i| x.* = @floatFromInt(i);
+    const buffer = try context.alloc(f32, data.len);
+    defer buffer.free();
+    try buffer.copyFromHost(&data);
+    const wave = try module.function("wave");
+    try wave.launch(.linear(data.len, 256), .{ buffer, @as(f32, 2), @as(u32, data.len) });
+    try context.synchronize();
+    try buffer.copyToHost(&data);
 }
 ```
 
 ```sh
-zig build-obj -target nvptx64-cuda -mcpu=sm_120 -O ReleaseFast -fno-emit-bin -femit-asm=add.ptx add.zig
-ptxas -arch=sm_120 add.ptx -o add.cubin
+zig build-obj -target nvptx64-cuda -mcpu=sm_75 -O ReleaseFast -fno-emit-bin -femit-asm=kernels.ptx kernels.zig
+zig build-exe -lc main.zig
 ```
 
-Still to come: a GPU API in the standard library covering the intrinsics above
-plus atomics, warp operations, and math functions; build system support for
-compiling and embedding kernels; and MLIR lowering for tensor cores and kernel
-fusion.
+PTX for `sm_75` runs on any newer GPU, because the driver compiles it for the
+GPU when it loads the module. In a build script, compile kernels with
+`b.addObject` and embed `getEmittedAsm()`;
+[test/standalone/gpu_cuda](test/standalone/gpu_cuda) does that and runs every
+ugpu example on the GPU.
+
+Still to come: MLIR lowering for tensor cores and kernel fusion, and GPUs from
+other vendors.
 
 ## AI Policy
 

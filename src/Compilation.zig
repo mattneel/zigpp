@@ -1783,7 +1783,7 @@ pub fn create(gpa: Allocator, arena: Allocator, io: Io, diag: *CreateDiagnostic,
 
         const compiler_rt_strat: RtStrat = s: {
             if (options.skip_linker_dependencies) break :s .none;
-            const want = options.want_compiler_rt orelse is_exe_or_dyn_lib;
+            const want = options.want_compiler_rt orelse (is_exe_or_dyn_lib or target_util.bundlesCompilerRt(target));
             if (!want) break :s .none;
             const need_llvm = switch (target_util.canBuildLibCompilerRt(target)) {
                 .no => break :s .none, // impossible to build

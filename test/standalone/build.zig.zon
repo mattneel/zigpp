@@ -193,6 +193,9 @@
         .run_args = .{
             .path = "run_args",
         },
+        .gpu_cuda = .{
+            .path = "gpu_cuda",
+        },
     },
     .paths = .{
         "build.zig",

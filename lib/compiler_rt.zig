@@ -29,7 +29,11 @@ pub inline fn symbol(comptime func: *const anyopaque, comptime name: []const u8)
 /// For now, we prefer weak linkage because some of the routines we implement here may also be
 /// provided by system/dynamic libc. Eventually we should be more disciplined about this on a
 /// per-symbol, per-target basis: https://github.com/ziglang/zig/issues/11883
-pub const linkage: std.builtin.GlobalLinkage = if (builtin.is_test)
+///
+/// NVPTX code is never linked against a separate compiler-rt: the compiler bundles compiler-rt
+/// into every NVPTX module, and each routine is only needed by callers in that same module.
+/// Internal linkage lets the unused routines be discarded before code generation.
+pub const linkage: std.builtin.GlobalLinkage = if (builtin.is_test or builtin.cpu.arch.isNvptx())
     .internal
 else if (ofmt_c)
     .strong

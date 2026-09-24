@@ -48,7 +48,28 @@ pub const Context = opaque {
 pub const Module = opaque {
     pub const dispose = LLVMDisposeModule;
     extern fn LLVMDisposeModule(*Module) void;
+
+    /// `passes` uses the textual pipeline syntax of `opt -passes`.
+    pub const runPasses = LLVMRunPasses;
+    extern fn LLVMRunPasses(M: *Module, Passes: [*:0]const u8, TM: ?*TargetMachine, Options: *PassBuilderOptions) ?*Error;
 };
+
+pub const PassBuilderOptions = opaque {
+    pub const create = LLVMCreatePassBuilderOptions;
+    extern fn LLVMCreatePassBuilderOptions() *PassBuilderOptions;
+
+    pub const dispose = LLVMDisposePassBuilderOptions;
+    extern fn LLVMDisposePassBuilderOptions(Options: *PassBuilderOptions) void;
+};
+
+pub const Error = opaque {
+    /// Consumes the error. Free the message with `disposeErrorMessage`.
+    pub const getMessage = LLVMGetErrorMessage;
+    extern fn LLVMGetErrorMessage(Err: *Error) [*:0]u8;
+};
+
+pub const disposeErrorMessage = LLVMDisposeErrorMessage;
+extern fn LLVMDisposeErrorMessage(ErrMsg: [*:0]u8) void;
 
 pub const disposeMessage = LLVMDisposeMessage;
 extern fn LLVMDisposeMessage(Message: [*:0]const u8) void;
