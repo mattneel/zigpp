@@ -69,7 +69,8 @@ Options:
                     PPUP_NO_MODIFY_PATH=1 does the same.
 
 Environment:
-  PPUP_HOME         Where toolchains live (default: \$HOME/.zigpp)
+  PPUP_HOME         Where toolchains live (default: the home that this ppup
+                    is installed in, else \$HOME/.zigpp)
 
 Releases are published for: $TARGETS
 EOF
@@ -87,6 +88,17 @@ cleanup() {
 trap 'cleanup' EXIT
 trap 'cleanup; exit 130' HUP INT TERM
 
+# An installed ppup is $PPUP_HOME/bin/ppup, and it keeps to that home when the
+# environment names none: nothing else records a PPUP_HOME chosen at install.
+if [ -z "${PPUP_HOME:-}" ]; then
+    case ${0:-} in
+        */bin/ppup)
+            if [ -f "$0" ] && [ -d "${0%/bin/ppup}/toolchains" ]; then
+                PPUP_HOME=$(CDPATH='' cd -- "${0%/bin/ppup}" && pwd) || PPUP_HOME=
+            fi
+            ;;
+    esac
+fi
 if [ -z "${PPUP_HOME:-}" ]; then
     [ -n "${HOME:-}" ] ||
         die 'HOME is not set, so the default PPUP_HOME cannot be guessed; set PPUP_HOME'
@@ -210,9 +222,24 @@ path_line() {
     esac
 }
 
+# Whether this is the installed ppup, $BIN_DIR/ppup, rather than the installer:
+# the script arriving on a pipe, or run from a download.
+is_installed_copy() {
+    [ -n "${PPUP_SELF:-}" ] && [ -d "$BIN_DIR" ] || return 1
+    [ "${PPUP_SELF##*/}" = ppup ] || return 1
+    self_dir=$(CDPATH='' cd -- "$(dirname -- "$PPUP_SELF")" && pwd -P) || return 1
+    bin_dir=$(CDPATH='' cd -- "$BIN_DIR" && pwd -P) || return 1
+    [ "$self_dir" = "$bin_dir" ]
+}
+
 add_to_path() {
     [ "$modify_path" = 1 ] || return 0
     [ -n "${HOME:-}" ] || return 0
+    # Profiles are the installer's business: the installed ppup leaves them as
+    # the install, or its --no-modify-path, left them.
+    if is_installed_copy; then
+        return 0
+    fi
 
     profile=$(profile_path)
     line=$(path_line "$profile")
@@ -455,7 +482,7 @@ install_ppup() {
     dst=$BIN_DIR/ppup
 
     if [ -n "${PPUP_SELF:-}" ] && [ -f "$PPUP_SELF" ]; then
-        if [ "$PPUP_SELF" != "$dst" ]; then
+        if ! is_installed_copy; then
             cp -f "$PPUP_SELF" "$dst" || die "cannot write to $dst"
         fi
     elif ! fetch "$PPUP_URL" "$dst.new"; then

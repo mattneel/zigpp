@@ -114,7 +114,8 @@ Options:
                     PPUP_NO_MODIFY_PATH=1 does the same.
 
 Environment:
-  PPUP_HOME         Where toolchains live (default: %LOCALAPPDATA%\zigpp)
+  PPUP_HOME         Where toolchains live (default: the home that this ppup
+                    is installed in, else %LOCALAPPDATA%\zigpp)
 
 Releases are published for: {2}
 '@ -f $PpupVersion, $PpupUrl, $Targets)
@@ -134,7 +135,20 @@ Releases are published for: {2}
         $ModifyPath = $false
     }
 
+    # An installed ppup is %PPUP_HOME%\bin\ppup.ps1, and it keeps to that home
+    # when the environment names none: nothing else records a PPUP_HOME chosen
+    # at install.
     $PpupHome = $env:PPUP_HOME
+    if (-not $PpupHome -and $ScriptFile) {
+        $scriptDir = Split-Path -Parent $ScriptFile
+        $installedHome = Split-Path -Parent $scriptDir
+        if ((Split-Path -Leaf $ScriptFile) -eq 'ppup.ps1' -and
+            (Split-Path -Leaf $scriptDir) -eq 'bin' -and
+            $installedHome -and
+            (Test-Path -LiteralPath (Join-Path $installedHome 'toolchains') -PathType Container)) {
+            $PpupHome = $installedHome
+        }
+    }
     if (-not $PpupHome) {
         if (-not $env:LOCALAPPDATA) {
             Fail 'LOCALAPPDATA is not set, so the default PPUP_HOME cannot be guessed; set PPUP_HOME'
@@ -156,6 +170,13 @@ Releases are published for: {2}
     $CurrentLink = Join-Path $PpupHome 'current'
     $PpupScript = Join-Path $BinDir 'ppup.ps1'
     $PpupShim = Join-Path $BinDir 'ppup.cmd'
+
+    # Whether this is the installed ppup, bin\ppup.ps1, rather than the
+    # installer: the script arriving through `irm | iex`, or run from a
+    # download.
+    $IsInstalledCopy = [bool]($ScriptFile -and
+        ([IO.Path]::GetFullPath($ScriptFile) -eq [IO.Path]::GetFullPath($PpupScript)))
+
     $Scratch.Dir = Join-Path $PpupHome ('tmp-' + [IO.Path]::GetRandomFileName())
 
     # ------------------------------------------------------------------ hosts
@@ -416,7 +437,9 @@ Releases are published for: {2}
     }
 
     function Add-ToPath {
-        if (-not $ModifyPath) {
+        # The user PATH is the installer's business: the installed ppup leaves
+        # it as the install, or its --no-modify-path, left it.
+        if (-not $ModifyPath -or $IsInstalledCopy) {
             return
         }
         $entries = @($CurrentLink, $BinDir)
@@ -460,7 +483,7 @@ Releases are published for: {2}
     function Install-Ppup {
         New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 
-        if ($ScriptFile -and ([IO.Path]::GetFullPath($ScriptFile) -ne [IO.Path]::GetFullPath($PpupScript))) {
+        if ($ScriptFile -and -not $IsInstalledCopy) {
             # Running from a file: install that file.
             Copy-Item -LiteralPath $ScriptFile -Destination $PpupScript -Force
             Write-Info "installed ppup $PpupVersion as $PpupScript"

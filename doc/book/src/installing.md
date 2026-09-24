@@ -60,6 +60,9 @@ curl -fsSL https://zigpp.lol/ppup | sh -s -- --no-modify-path
 PPUP_HOME=/opt/zigpp curl -fsSL https://zigpp.lol/ppup | sh
 ```
 
+The installed `ppup` keeps to the home it is installed in, so `PPUP_HOME` is
+needed only for the install.
+
 Zig++ publishes releases for these four targets; anything else (an
 `x86_64` Mac, say) fails with a message listing them:
 
