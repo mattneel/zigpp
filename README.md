@@ -43,21 +43,26 @@ Upstream Zig plans to drop its dependency on the LLVM libraries. Zig++ will
 never phase out LLVM. In `package.json` terms, LLVM stays in `dependencies`.
 
 LLVM, and MLIR above it, are how Zig++ goes the final stretch on GPUs. The
-blessed path lowers Zig++ directly to PTX, with first-class GPU intrinsics, and
-its first leg works today: `std.gpu`, a port of
+blessed path lowers Zig++ directly to PTX and to AMD GPU code objects, with
+first-class GPU intrinsics, and its first leg works today: `std.gpu`, a port of
 [ugpu](https://github.com/mattneel/ugpu) into the standard library.
 
 - Kernels are plain Zig functions. `std.gpu` has CUDA's indexing (`threadIdx`,
-  `blockIdx`, `blockDim`, `gridDim`, `globalId`), `syncThreads`, warp shuffles,
-  votes and reductions, atomics, fast math approximations, and `print`.
+  `blockIdx`, `blockDim`, `gridDim`, `globalId`), `syncThreads` (the new
+  `@workGroupBarrier` builtin), warp shuffles, votes and reductions, atomics,
+  fast math approximations, and `print`.
 - The standard library runs on the GPU: `std.fmt`, `std.json`, `std.mem`,
-  `std.base64`, hash maps, and array lists, with allocators for the device heap
-  and for shared memory in `std.gpu.allocators`.
-- Every NVPTX module carries the compiler-rt routines that it calls, so
-  `@sin`, `@exp`, `@log`, `f128`, and float parsing work in kernels. Upstream
-  Zig crashes LLVM on `@sin` for NVPTX.
+  `std.base64`, hash maps, and array lists, with allocators for shared memory
+  and for the CUDA device heap in `std.gpu.allocators`. A panic in a kernel
+  reports its message to the host.
+- Every NVPTX and AMDGPU module carries the compiler-rt routines that it calls,
+  so `@sin`, `@exp`, `@log`, `f128`, and float parsing work in kernels, with the
+  same results as on the host, bit for bit. Upstream Zig crashes LLVM on `@sin`
+  for NVPTX.
 - `std.gpu.cuda` loads the CUDA driver at run time, so programs build without
-  the CUDA toolkit, and launches kernels from the host.
+  the CUDA toolkit, and launches kernels from the host. `std.gpu.hip` does the
+  same with the HIP runtime of AMD GPUs, on Linux and on Windows, where it needs
+  no libc.
 
 ```zig
 // kernels.zig
@@ -101,12 +106,22 @@ zig build-exe -lc main.zig
 
 PTX for `sm_75` runs on any newer GPU, because the driver compiles it for the
 GPU when it loads the module. In a build script, compile kernels with
-`b.addObject` and embed `getEmittedAsm()`;
-[test/standalone/gpu_cuda](test/standalone/gpu_cuda) does that and runs every
-ugpu example on the GPU.
+`b.addObject` and embed `getEmittedAsm()`.
 
-Still to come: MLIR lowering for tensor cores and kernel fusion, and GPUs from
-other vendors.
+For AMD GPUs, the same kernels compile to a code object, and the host program
+uses `std.gpu.hip` in place of `std.gpu.cuda` with the same calls:
+
+```sh
+zig build-lib -dynamic -target amdgcn-amdhsa -mcpu=gfx1036 -O ReleaseFast kernels.zig
+```
+
+A code object only runs on the architecture that `-mcpu` names, which
+`hip.Device.archName` reports for a GPU.
+[test/standalone/gpu](test/standalone/gpu) builds the kernels both ways and
+runs every ugpu example on NVIDIA and AMD GPUs.
+
+Still to come: MLIR lowering for tensor cores and kernel fusion, and GPUs
+beyond NVIDIA's and AMD's.
 
 ## AI Policy
 
