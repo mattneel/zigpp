@@ -7114,6 +7114,7 @@ const ParamTypeIterator = struct {
                     it.llvm_index += 1;
                     return .slice;
                 }
+                if (target.cpu.arch.isNvptx()) if (nvptxIntParamLowering(ty, zcu)) |lowering| return lowering;
                 if (isByRef(ty, zcu)) return .byref;
                 return .byval;
             },
@@ -7505,6 +7506,26 @@ const ParamTypeIterator = struct {
         return .multiple_llvm_types;
     }
 };
+
+/// How the Zig calling convention passes `ty` on NVPTX when LLVM represents it with an integer
+/// whose width PTX cannot pass as it is, or null when `ty` is any other type.
+///
+/// LLVM's NVPTX back end asserts when it builds the prototype of an indirect call with such an
+/// integer parameter, such as the `u6` of `std.mem.Alignment` in the vtable of
+/// `std.mem.Allocator`: every call through an allocator or a `std.Io.Writer` in a kernel is one.
+/// These integers go as the integer of their ABI size instead, which is 8, 16, 32, 64, or 128
+/// bits wide. PTX passes integers of those widths, and wider ones as arrays of bytes.
+fn nvptxIntParamLowering(ty: Type, zcu: *Zcu) ?ParamTypeIterator.Lowering {
+    const bits = switch (ty.zigTypeTag(zcu)) {
+        .int, .@"enum", .error_set => ty.bitSize(zcu),
+        .@"struct", .@"union" => if (ty.containerLayout(zcu) == .@"packed") ty.bitSize(zcu) else return null,
+        else => return null,
+    };
+    return switch (bits) {
+        2...7, 9...15, 17...31, 33...63, 65...127 => .abi_sized_int,
+        else => null,
+    };
+}
 pub fn iterateParamTypes(
     object: *Object,
     cc: std.lang.CallingConvention,
