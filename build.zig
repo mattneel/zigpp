@@ -380,7 +380,7 @@ pub fn build(b: *std.Build) !void {
             try addCmakeCfgOptionsToExe(b, cfg, exe, use_zig_libcxx);
         } else {
             // Here we are -Denable-llvm but no cmake integration.
-            try addStaticLlvmOptionsToModule(exe.root_module, .{
+            try addStaticLlvmOptionsToModule(b, exe.root_module, .{
                 .llvm_has_m68k = llvm_has_m68k,
                 .llvm_has_csky = llvm_has_csky,
                 .llvm_has_arc = llvm_has_arc,
@@ -1038,7 +1038,7 @@ fn addCmakeCfgOptionsToExe(
     }
 }
 
-fn addStaticLlvmOptionsToModule(mod: *std.Build.Module, options: struct {
+fn addStaticLlvmOptionsToModule(b: *std.Build, mod: *std.Build.Module, options: struct {
     llvm_has_m68k: bool,
     llvm_has_csky: bool,
     llvm_has_arc: bool,
@@ -1053,6 +1053,82 @@ fn addStaticLlvmOptionsToModule(mod: *std.Build.Module, options: struct {
     mod.addCSourceFiles(.{
         .files = &zig_cpp_sources,
         .flags = &zig_cpp_cflags,
+    });
+
+    // The Metal AIR stage: the AIR rewrites (src/zig_air_rewrite.cpp, driven by
+    // src/zig_air.cpp) and the vendored llvm-downgrade bitcode writers under
+    // src/llvm-downgrade/. See doc/proposals/metal.md sections 2 and 4.
+    //
+    // The AIR sources use C++ exceptions (the downgrader reports writer errors by throwing),
+    // which the rest of the C++ sources explicitly disable, so -fexceptions has to follow
+    // -fno-exceptions in exe_cflags.
+    const air_glue_cflags = zig_cpp_cflags ++ [_][]const u8{
+        "-DLLVMDG_STATIC",
+        "-fexceptions",
+    };
+    mod.addCSourceFiles(.{
+        .files = &zig_air_sources,
+        .flags = &air_glue_cflags,
+    });
+
+    // The vendored writers need more than that:
+    //
+    // * -DLLVMDG_HAS_140/150/180 come from src/BitcodeWriter{140,150,180}.cpp existing; the
+    //   C API's target table is built from them (the AIR pipeline asks for 14.0).
+    // * They call Value::dump() inside #ifndef NDEBUG and a release LLVM has no definition of
+    //   it, so they must see -DNDEBUG (it is in zig_cpp_cflags).
+    // * common/LegacyOpts.h is force-included into every writer translation unit (the writers
+    //   share a de-static'd cl::opt).
+    // * include/ carries augmented LLVM headers (BitcodeWriter.h with the legacy writer
+    //   declarations, LLVMBitCodes.h with the pre-opaque-pointer enum values) that must
+    //   shadow the installed ones. clang searches -I directories in the order given and a C
+    //   source file's flags follow the module's include paths on the command line, so the two
+    //   augmented headers are force-included ahead of everything instead; their include guards
+    //   make the later #include of the installed header a no-op.
+    //
+    // The CMake path additionally passes -fno-gnu-unique when it compiles these files with
+    // GCC on glibc (glibc treats STB_GNU_UNIQUE symbols as process-unique regardless of
+    // visibility); clang never emits unique symbols and does not know the option, which is
+    // why it is not here.
+    //
+    // Like the source paths above, these are relative to the build root: the C++ compiler is
+    // spawned in the directory `zig build` was started from, which is the build root, and the
+    // same assumption backs every relative path in this file.
+    const air_include_flags = [_][]const u8{
+        b.fmt("-I{s}", .{b.pathJoin(&.{ "src", "llvm-downgrade", "include" })}),
+        b.fmt("-I{s}", .{b.pathJoin(&.{ "src", "llvm-downgrade", "src" })}),
+        b.fmt("-I{s}", .{b.pathJoin(&.{ "src", "llvm-downgrade", "common" })}),
+        b.fmt("-include{s}", .{b.pathJoin(&.{
+            "src",
+            "llvm-downgrade",
+            "common",
+            "LegacyOpts.h",
+        })}),
+        b.fmt("-include{s}", .{b.pathJoin(&.{
+            "src",
+            "llvm-downgrade",
+            "include",
+            "llvm",
+            "Bitcode",
+            "LLVMBitCodes.h",
+        })}),
+        b.fmt("-include{s}", .{b.pathJoin(&.{
+            "src",
+            "llvm-downgrade",
+            "include",
+            "llvm",
+            "Bitcode",
+            "BitcodeWriter.h",
+        })}),
+    };
+    const air_vendor_cflags = air_glue_cflags ++ [_][]const u8{
+        "-DLLVMDG_HAS_140",
+        "-DLLVMDG_HAS_150",
+        "-DLLVMDG_HAS_180",
+    } ++ air_include_flags;
+    mod.addCSourceFiles(.{
+        .files = &llvm_downgrade_sources,
+        .flags = &air_vendor_cflags,
     });
 
     const lsl_options: std.Build.Module.LinkSystemLibraryOptions = .{ .use_pkg_config = .no };
@@ -1348,6 +1424,36 @@ const zig_cpp_sources = [_][]const u8{
     "src/zig_clang_driver.cpp",
     "src/zig_clang_cc1_main.cpp",
     "src/zig_clang_cc1as_main.cpp",
+};
+
+// The Metal AIR stage: the C API entry point (ZigLLVMAirLower) and the AIR rewrites.
+const zig_air_sources = [_][]const u8{
+    "src/zig_air.cpp",
+    "src/zig_air_rewrite.cpp",
+};
+
+// The vendored llvm-downgrade library (https://github.com/JuliaLLVM/llvm-downgrade): the
+// legacy bitcode writers that re-emit a module in the LLVM-14 format Apple's Metal reader
+// is built on, plus the typed-pointer and module rewriters they use.
+const llvm_downgrade_sources = [_][]const u8{
+    "src/llvm-downgrade/lib/llvm-downgrade.cpp",
+    "src/llvm-downgrade/common/legacy_opts.cpp",
+    "src/llvm-downgrade/src/BitcodeWriter50.cpp",
+    "src/llvm-downgrade/src/BitcodeWriter70.cpp",
+    "src/llvm-downgrade/src/BitcodeWriter140.cpp",
+    "src/llvm-downgrade/src/BitcodeWriter150.cpp",
+    "src/llvm-downgrade/src/BitcodeWriter180.cpp",
+    "src/llvm-downgrade/src/ModuleRewriter50.cpp",
+    "src/llvm-downgrade/src/ModuleRewriter70.cpp",
+    "src/llvm-downgrade/src/ModuleRewriter140.cpp",
+    "src/llvm-downgrade/src/ModuleRewriter150.cpp",
+    "src/llvm-downgrade/src/ModuleRewriter180.cpp",
+    "src/llvm-downgrade/src/PointerRewriter.cpp",
+    "src/llvm-downgrade/src/ValueEnumerator50.cpp",
+    "src/llvm-downgrade/src/ValueEnumerator70.cpp",
+    "src/llvm-downgrade/src/ValueEnumerator140.cpp",
+    "src/llvm-downgrade/src/ValueEnumerator150.cpp",
+    "src/llvm-downgrade/src/ValueEnumerator180.cpp",
 };
 
 const clang_libs = [_][]const u8{

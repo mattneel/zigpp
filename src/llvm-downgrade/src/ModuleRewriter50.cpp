@@ -1,0 +1,87 @@
+//===- ValueEnumerator50.cpp - Rewrite IR for LLVM 5.0 ----------------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements the ModuleRewriter50 class.
+//
+//===----------------------------------------------------------------------===//
+
+#include "llvm/Bitcode/BitcodeWriter.h"
+#include "PointerRewriter.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/Module.h"
+using namespace llvm;
+
+static bool removeFreeze(Module &M) {
+    // Find freeze instructions
+    SmallVector<FreezeInst *, 8> Worklist;
+    for (Function &F : M) {
+        for (BasicBlock &BB : F) {
+            for (Instruction &I : BB) {
+                if (auto *FI = dyn_cast<FreezeInst>(&I)) {
+                    Worklist.push_back(FI);
+                }
+            }
+        }
+    }
+    if (Worklist.empty())
+        return false;
+
+    // Replace freeze instructions by their operand
+    for (FreezeInst *FI : Worklist) {
+        FI->replaceAllUsesWith(FI->getOperand(0));
+        FI->eraseFromParent();
+    }
+    return true;
+}
+
+static bool replaceFNeg(Module &M) {
+  // Find fneg instructions
+  SmallVector<UnaryOperator *, 8> Worklist;
+  for (Function &F : M)
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (auto *Op = dyn_cast<UnaryOperator>(&I))
+          if (Op->getOpcode() == Instruction::FNeg)
+            Worklist.push_back(Op);
+  if (Worklist.empty())
+    return false;
+
+  // Replace fneg instructions by fsub instructions, keeping the fast-math
+  // flags (the builder does not copy them from the replaced instruction)
+  IRBuilder<> Builder(M.getContext());
+  for (UnaryOperator *Op : Worklist) {
+    Builder.SetInsertPoint(Op);
+    Builder.setFastMathFlags(Op->getFastMathFlags());
+    Value *In = Op->getOperand(0);
+    Value *Zero = ConstantFP::get(In->getType(), -0.0);
+    Op->replaceAllUsesWith(Builder.CreateFSub(Zero, In));
+    Op->eraseFromParent();
+  }
+  return true;
+}
+
+bool BitcodeWriter50::prepareModule(Module &M) {
+  bool Changed = removeFreeze(M);
+  Changed |= replaceFNeg(M);
+
+  // Lower intrinsics to their legacy names/signatures, and reject any
+  // pointer-typed intrinsic we cannot reconstruct a typed signature for.
+  Changed |= PointerRewriter::prepareIntrinsics(M, 5);
+
+  // Downgrade module flags whose behavior postdates LLVM 5.
+  Changed |= PointerRewriter::downgradeModuleFlags(M);
+  PointerRewriter::checkIntrinsics(M, 5);
+
+  PointerRewriter PR(M);
+  Changed |= PR.run();
+
+  return Changed;
+}

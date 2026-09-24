@@ -203,6 +203,40 @@ set(ZIG_CPP_SOURCES
     src/zig_clang_cc1_main.cpp
     src/zig_clang_cc1as_main.cpp
 )
+
+# Sync with "zig_air_sources" and "llvm_downgrade_sources" in build.zig.
+#
+# The Metal AIR stage: the C API entry point, the AIR rewrites, and the vendored
+# llvm-downgrade library (https://github.com/JuliaLLVM/llvm-downgrade) whose legacy bitcode
+# writers re-emit a module in the LLVM-14 format Apple's Metal reader is built on. These
+# translation units need flags the rest of zigcpp must not have (C++ exceptions, NDEBUG for
+# the writers' Value::dump() calls, and the vendored include/ directory shadowing the LLVM
+# headers it augments), so their per-source options are set below.
+set(ZIG_AIR_SOURCES
+    src/zig_air.cpp
+    src/zig_air_rewrite.cpp
+)
+set(ZIG_AIR_VENDOR_SOURCES
+    src/llvm-downgrade/lib/llvm-downgrade.cpp
+    src/llvm-downgrade/common/legacy_opts.cpp
+    src/llvm-downgrade/src/BitcodeWriter50.cpp
+    src/llvm-downgrade/src/BitcodeWriter70.cpp
+    src/llvm-downgrade/src/BitcodeWriter140.cpp
+    src/llvm-downgrade/src/BitcodeWriter150.cpp
+    src/llvm-downgrade/src/BitcodeWriter180.cpp
+    src/llvm-downgrade/src/ModuleRewriter50.cpp
+    src/llvm-downgrade/src/ModuleRewriter70.cpp
+    src/llvm-downgrade/src/ModuleRewriter140.cpp
+    src/llvm-downgrade/src/ModuleRewriter150.cpp
+    src/llvm-downgrade/src/ModuleRewriter180.cpp
+    src/llvm-downgrade/src/PointerRewriter.cpp
+    src/llvm-downgrade/src/ValueEnumerator50.cpp
+    src/llvm-downgrade/src/ValueEnumerator70.cpp
+    src/llvm-downgrade/src/ValueEnumerator140.cpp
+    src/llvm-downgrade/src/ValueEnumerator150.cpp
+    src/llvm-downgrade/src/ValueEnumerator180.cpp
+)
+list(APPEND ZIG_CPP_SOURCES ${ZIG_AIR_SOURCES} ${ZIG_AIR_VENDOR_SOURCES})
 # Needed because we use cmake, not the zig build system, to build zig2.o.
 set(ZIG_STAGE2_SOURCES
     "${ZIG_CONFIG_ZIG_OUT}"
@@ -219,6 +253,7 @@ set(ZIG_STAGE2_SOURCES
     lib/std/Target.zig
     lib/std/Target/Query.zig
     lib/std/Target/aarch64.zig
+    lib/std/Target/air64.zig
     lib/std/Target/amdgcn.zig
     lib/std/Target/arm.zig
     lib/std/Target/avr.zig
@@ -360,6 +395,7 @@ set(ZIG_STAGE2_SOURCES
     src/codegen/c/type/render_defs.zig
     src/codegen/llvm.zig
     src/codegen/llvm/bindings.zig
+    src/metallib.zig
     src/codegen/loongarch/abi.zig
     src/codegen/loongarch/encoding.zig
     src/codegen/loongarch/decode_tree.zon
@@ -407,6 +443,7 @@ set(ZIG_STAGE2_SOURCES
     src/link/LdScript.zig
     src/link/Lld.zig
     src/link/MachO.zig
+    src/link/Metallib.zig
     src/link/MachO/Archive.zig
     src/link/MachO/Atom.zig
     src/link/MachO/CodeSignature.zig
@@ -542,6 +579,63 @@ target_link_libraries(zigcpp PUBLIC
     ${LLVM_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
 )
+
+# Metal AIR stage: the AIR rewrites and the vendored llvm-downgrade writers (see
+# ZIG_AIR_SOURCES above). The flags, and the reason for each, are the same as in build.zig's
+# addStaticLlvmOptionsToModule:
+#
+# * -fexceptions after the target's -fno-exceptions: the downgrader reports writer errors by
+#   throwing.
+# * -DNDEBUG: the vendored writers call Value::dump() inside #ifndef NDEBUG and a release
+#   LLVM has no definition of it.
+# * -DLLVMDG_STATIC: link the C API statically (only meaningful on Windows).
+# * -DLLVMDG_HAS_140/150/180: src/BitcodeWriter{140,150,180}.cpp exist, so the C API's target
+#   table offers 14.0, the format the AIR pipeline asks for.
+# * -include common/LegacyOpts.h: the writers share a de-static'd cl::opt, which has to be
+#   visible in every writer translation unit.
+# * include/ carries an augmented BitcodeWriter.h (the legacy writer declarations) and
+#   LLVMBitCodes.h (the pre-opaque-pointer enum values) that must shadow the installed ones.
+#   clang searches -I directories in the order given, so the two augmented headers are
+#   force-included instead; their include guards make the later #include of the installed
+#   header a no-op.
+# * -fno-gnu-unique: glibc treats STB_GNU_UNIQUE symbols as process-unique regardless of
+#   visibility, which would defeat the writers' own isolation.
+if(MSVC)
+  set_property(SOURCE ${ZIG_AIR_SOURCES}
+    APPEND PROPERTY COMPILE_DEFINITIONS NDEBUG LLVMDG_STATIC)
+  set_property(SOURCE ${ZIG_AIR_SOURCES}
+    APPEND PROPERTY COMPILE_OPTIONS /EHsc)
+  set_property(SOURCE ${ZIG_AIR_VENDOR_SOURCES}
+    APPEND PROPERTY COMPILE_DEFINITIONS NDEBUG LLVMDG_STATIC
+    LLVMDG_HAS_140 LLVMDG_HAS_150 LLVMDG_HAS_180)
+  set_property(SOURCE ${ZIG_AIR_VENDOR_SOURCES}
+    APPEND PROPERTY COMPILE_OPTIONS /EHsc /GR-
+    "/I${PROJECT_SOURCE_DIR}/src/llvm-downgrade/include"
+    "/I${PROJECT_SOURCE_DIR}/src/llvm-downgrade/src"
+    "/I${PROJECT_SOURCE_DIR}/src/llvm-downgrade/common"
+    "/FI${PROJECT_SOURCE_DIR}/src/llvm-downgrade/common/LegacyOpts.h"
+    "/FI${PROJECT_SOURCE_DIR}/src/llvm-downgrade/include/llvm/Bitcode/LLVMBitCodes.h"
+    "/FI${PROJECT_SOURCE_DIR}/src/llvm-downgrade/include/llvm/Bitcode/BitcodeWriter.h")
+else()
+  set(ZIG_AIR_COMMON_FLAGS -fexceptions -fno-rtti)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT WIN32)
+    list(APPEND ZIG_AIR_COMMON_FLAGS -fno-gnu-unique)
+  endif()
+  set_property(SOURCE ${ZIG_AIR_SOURCES} ${ZIG_AIR_VENDOR_SOURCES}
+    APPEND PROPERTY COMPILE_DEFINITIONS NDEBUG LLVMDG_STATIC)
+  set_property(SOURCE ${ZIG_AIR_SOURCES}
+    APPEND PROPERTY COMPILE_OPTIONS ${ZIG_AIR_COMMON_FLAGS})
+  set_property(SOURCE ${ZIG_AIR_VENDOR_SOURCES}
+    APPEND PROPERTY COMPILE_DEFINITIONS LLVMDG_HAS_140 LLVMDG_HAS_150 LLVMDG_HAS_180)
+  set_property(SOURCE ${ZIG_AIR_VENDOR_SOURCES}
+    APPEND PROPERTY COMPILE_OPTIONS ${ZIG_AIR_COMMON_FLAGS}
+    "-I${PROJECT_SOURCE_DIR}/src/llvm-downgrade/include"
+    "-I${PROJECT_SOURCE_DIR}/src/llvm-downgrade/src"
+    "-I${PROJECT_SOURCE_DIR}/src/llvm-downgrade/common"
+    "-include${PROJECT_SOURCE_DIR}/src/llvm-downgrade/common/LegacyOpts.h"
+    "-include${PROJECT_SOURCE_DIR}/src/llvm-downgrade/include/llvm/Bitcode/LLVMBitCodes.h"
+    "-include${PROJECT_SOURCE_DIR}/src/llvm-downgrade/include/llvm/Bitcode/BitcodeWriter.h")
+endif()
 
 # Handle multi-config builds and place each into a common lib. The VS generator
 # for example will append a Debug folder by default if not explicitly specified.
