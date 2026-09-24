@@ -20,18 +20,21 @@ where this book's sources live as `doc/book/`.
 - **Private fields.** A struct or union field marked `priv` can only be named
   from the file that declares its type. See
   [Private fields](what-zigpp-adds.md#private-fields).
-- **LLVM forever**, and a blessed path to PTX: `std.gpu` runs Zig++ and its
-  standard library on NVIDIA GPUs. See
+- **LLVM forever**, and a blessed path to GPUs: `std.gpu` runs Zig++ and its
+  standard library on NVIDIA and AMD GPUs. See
   [LLVM is forever](what-zigpp-adds.md#llvm-is-forever) and
   [GPU Programming](gpu.md).
 - **AI in the toolchain.** See [AI Policy and Governance](ai-policy.md).
+- **Any Zig version, automatically.** A project's `build.zig.zon` can pin the
+  exact compiler version it is built with, and `zig` runs that version instead
+  of itself, downloading it on first use. See [Any Zig Version](any-version.md).
 - **A BDFL and one rule: talk about code.** See
   [Governance](ai-policy.md#governance).
 
 ## Questions people ask
 
 **Does Zig++ compile to Zig, the way TypeScript compiles to JavaScript?** No.
-It compiles to machine code, C, WebAssembly, and PTX.
+It compiles to machine code, C, WebAssembly, PTX, and AMD GPU code objects.
 
 **Is Zig++ stable?** Zig++ follows semantic versioning exactly as closely as
 TypeScript does. The compiler is at `0.17.0-dev`, every push to master is a

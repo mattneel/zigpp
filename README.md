@@ -26,8 +26,8 @@ the compiler was written by upstream Zig contributors.
   [doc/langref/test_private_fields.zig](doc/langref/test_private_fields.zig).
   Upstream closed the [proposal](https://github.com/ziglang/zig/issues/9909) as
   not planned.
-- **LLVM forever**, and a blessed path to PTX: `std.gpu` runs Zig++ and its
-  standard library on NVIDIA GPUs. See [LLVM Is Forever](#llvm-is-forever).
+- **LLVM forever**, and a blessed path to GPUs: `std.gpu` runs Zig++ and its
+  standard library on NVIDIA and AMD GPUs. See [LLVM Is Forever](#llvm-is-forever).
 - **AI in the toolchain.** See [AI Policy](#ai-policy).
 - **Any Zig version, automatically.** A project's `build.zig.zon` can pin the
   exact compiler version it is built with, and `zig` runs that version instead
@@ -36,7 +36,7 @@ the compiler was written by upstream Zig contributors.
 - **A BDFL and one rule: talk about code.** See [Governance](#governance).
 
 **Does Zig++ compile to Zig, the way TypeScript compiles to JavaScript?** No.
-It compiles to machine code, C, WebAssembly, and PTX.
+It compiles to machine code, C, WebAssembly, PTX, and AMD GPU code objects.
 
 **Is Zig++ stable?** Zig++ follows semantic versioning exactly as closely as
 TypeScript does.
