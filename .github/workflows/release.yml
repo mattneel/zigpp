@@ -106,7 +106,7 @@ jobs:
           - target: aarch64-linux-musl
             runner: ubuntu-24.04-arm
           - target: aarch64-macos-none
-            runner: macos-15
+            runner: macos-latest
           - target: x86_64-windows-gnu
             runner: windows-2025
     steps:

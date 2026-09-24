@@ -52,5 +52,5 @@ jobs:
     name: aarch64 macOS
     uses: ./.github/workflows/ci-host.yml
     with:
-      runner: macos-15
+      runner: macos-latest
       target: aarch64-macos-none
