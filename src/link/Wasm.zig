@@ -3245,6 +3245,7 @@ pub const Feature = packed struct(u8) {
         @"tail-call",
         @"shared-mem",
         @"wide-arithmetic",
+        @"relaxed-atomics",
 
         pub fn fromCpuFeature(feature: std.Target.wasm.Feature) Tag {
             return switch (feature) {
@@ -3262,6 +3263,7 @@ pub const Feature = packed struct(u8) {
                 .nontrapping_bulk_memory_len0 => .@"nontrapping-bulk-memory-len0", // Zig extension.
                 .nontrapping_fptoint => .@"nontrapping-fptoint",
                 .reference_types => .@"reference-types",
+                .relaxed_atomics => .@"relaxed-atomics",
                 .relaxed_simd => .@"relaxed-simd",
                 .sign_ext => .@"sign-ext",
                 .simd128 => .simd128,
@@ -3287,6 +3289,7 @@ pub const Feature = packed struct(u8) {
                 .@"nontrapping-bulk-memory-len0" => .nontrapping_bulk_memory_len0, // Zig extension.
                 .@"nontrapping-fptoint" => .nontrapping_fptoint,
                 .@"reference-types" => .reference_types,
+                .@"relaxed-atomics" => .relaxed_atomics,
                 .@"relaxed-simd" => .relaxed_simd,
                 .@"sign-ext" => .sign_ext,
                 .simd128 => .simd128,

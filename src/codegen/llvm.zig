@@ -598,10 +598,15 @@ pub const Object = struct {
         const optimize_mode = comp.root_mod.optimize_mode;
 
         const opt_level: bindings.CodeGenOptLevel = if (optimize_mode == .debug)
-            // The fast register allocator of LLVM's unoptimized AMDGPU code generation miscompiles
-            // divergent loops: the lanes that leave a loop early see clobbered registers. Debug
-            // builds keep their unoptimized IR either way.
-            if (comp.root_mod.resolved_target.result.cpu.arch == .amdgcn) .Less else .None
+            // LLVM's AMDGPU code generation miscompiles the unoptimized IR of Debug builds at low
+            // optimization levels: at .None the fast register allocator clobbers registers of
+            // divergent loops, and at .Less MachineLICM hoists the materializations of private
+            // (scratch) addresses out of loops, and the longer live ranges that this creates are
+            // then spilled to VGPR lanes and read back with the wrong value, so that stores into
+            // stack arrays never reach them (std.fmt.parseFloat's Decimal.parse, for example).
+            // Debug builds keep their unoptimized IR either way; only the code generation level
+            // changes, and the AMDGPU backend is only correct from .Default on.
+            if (comp.root_mod.resolved_target.result.cpu.arch == .amdgcn) .Default else .None
         else
             .Aggressive;
 
@@ -1017,11 +1022,6 @@ pub const Object = struct {
         try o.flushTypePool(pt);
     }
 
-    fn workaroundPrivateSymbolBugs(target: *const std.Target, resolved: *const InternPool.Nav.Resolved) bool {
-        // https://codeberg.org/ziglang/zig/issues/31865
-        return target.cpu.arch.isAARCH64() and target.ofmt == .coff and resolved.@"threadlocal";
-    }
-
     pub fn updateNav(o: *Object, pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) !void {
         const zcu = o.zcu;
         const ip = &zcu.intern_pool;
@@ -1094,14 +1094,14 @@ pub const Object = struct {
                 false => .default,
             };
             llvm_global.ptr(&o.builder).linkage = switch (@"extern".linkage) {
-                .internal => if (o.builder.strip and !workaroundPrivateSymbolBugs(zcu.getTarget(), &resolved)) .private else .internal,
+                .internal => if (o.builder.strip) .private else .internal,
                 .strong => .external,
                 .weak => .extern_weak,
                 .link_once => unreachable,
             };
             llvm_global.ptr(&o.builder).visibility = .fromSymbolVisibility(@"extern".visibility);
         } else {
-            llvm_global.ptr(&o.builder).linkage = if (o.builder.strip and !workaroundPrivateSymbolBugs(zcu.getTarget(), &resolved)) .private else .internal;
+            llvm_global.ptr(&o.builder).linkage = if (o.builder.strip) .private else .internal;
             llvm_global.ptr(&o.builder).visibility = .default;
             llvm_global.ptr(&o.builder).dll_storage_class = .default;
             llvm_global.ptr(&o.builder).unnamed_addr = .unnamed_addr;
@@ -4375,6 +4375,8 @@ pub fn toLlvmCallConvTag(cc_tag: std.lang.CallingConvention.Tag, target: *const 
         .amdgcn_cs => .amdgpu_cs,
         .nvptx_device => .ptx_device,
         .nvptx_kernel => .ptx_kernel,
+        .loongarch32_preserve_none => .preserve_nonecc,
+        .loongarch64_preserve_none => .preserve_nonecc,
 
         // Calling conventions which LLVM uses function attributes for.
         .riscv64_interrupt,
@@ -4463,88 +4465,44 @@ pub fn toLlvmCallConvTag(cc_tag: std.lang.CallingConvention.Tag, target: *const 
 
 /// Convert a zig-address space to an llvm address space.
 pub fn toLlvmAddressSpace(address_space: std.lang.AddressSpace, target: *const std.Target) Builder.AddrSpace {
-    for (llvmAddrSpaceInfo(target)) |info| if (info.zig == address_space) return info.llvm;
-    unreachable;
-}
-
-const AddrSpaceInfo = struct {
-    zig: ?std.lang.AddressSpace,
-    llvm: Builder.AddrSpace,
-    non_integral: bool = false,
-    size: ?u16 = null,
-    abi: ?u16 = null,
-    pref: ?u16 = null,
-    idx: ?u16 = null,
-    force_in_data_layout: bool = false,
-};
-fn llvmAddrSpaceInfo(target: *const std.Target) []const AddrSpaceInfo {
     return switch (target.cpu.arch) {
-        .x86, .x86_64 => &.{
-            .{ .zig = .generic, .llvm = .default },
-            .{ .zig = .gs, .llvm = Builder.AddrSpace.x86.gs },
-            .{ .zig = .fs, .llvm = Builder.AddrSpace.x86.fs },
-            .{ .zig = .ss, .llvm = Builder.AddrSpace.x86.ss },
-            .{ .zig = null, .llvm = Builder.AddrSpace.x86.ptr32_sptr, .size = 32, .abi = 32, .force_in_data_layout = true },
-            .{ .zig = null, .llvm = Builder.AddrSpace.x86.ptr32_uptr, .size = 32, .abi = 32, .force_in_data_layout = true },
-            .{ .zig = null, .llvm = Builder.AddrSpace.x86.ptr64, .size = 64, .abi = 64, .force_in_data_layout = true },
+        .amdgcn => switch (address_space) {
+            .generic => Builder.AddrSpace.amdgpu.flat,
+            .global => Builder.AddrSpace.amdgpu.global,
+            .shared => Builder.AddrSpace.amdgpu.local,
+            .constant => Builder.AddrSpace.amdgpu.constant,
+            .local => Builder.AddrSpace.amdgpu.private,
+            else => unreachable,
         },
-        .nvptx, .nvptx64 => &.{
-            .{ .zig = .generic, .llvm = Builder.AddrSpace.nvptx.generic },
-            .{ .zig = .global, .llvm = Builder.AddrSpace.nvptx.global },
-            .{ .zig = .constant, .llvm = Builder.AddrSpace.nvptx.constant },
-            .{ .zig = .param, .llvm = Builder.AddrSpace.nvptx.param },
-            .{ .zig = .shared, .llvm = Builder.AddrSpace.nvptx.shared },
-            .{ .zig = .local, .llvm = Builder.AddrSpace.nvptx.local },
+        .avr => switch (address_space) {
+            .generic => Builder.AddrSpace.avr.data,
+            .flash => Builder.AddrSpace.avr.program,
+            .flash1 => Builder.AddrSpace.avr.program1,
+            .flash2 => Builder.AddrSpace.avr.program2,
+            .flash3 => Builder.AddrSpace.avr.program3,
+            .flash4 => Builder.AddrSpace.avr.program4,
+            .flash5 => Builder.AddrSpace.avr.program5,
+            else => unreachable,
         },
-        .amdgcn => &.{
-            .{ .zig = .generic, .llvm = Builder.AddrSpace.amdgpu.flat, .force_in_data_layout = true },
-            .{ .zig = .global, .llvm = Builder.AddrSpace.amdgpu.global, .force_in_data_layout = true },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.region, .size = 32, .abi = 32 },
-            .{ .zig = .shared, .llvm = Builder.AddrSpace.amdgpu.local, .size = 32, .abi = 32 },
-            .{ .zig = .constant, .llvm = Builder.AddrSpace.amdgpu.constant, .force_in_data_layout = true },
-            .{ .zig = .local, .llvm = Builder.AddrSpace.amdgpu.private, .size = 32, .abi = 32 },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.constant_32bit, .size = 32, .abi = 32 },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.buffer_fat_pointer, .non_integral = true, .size = 160, .abi = 256, .idx = 32 },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.buffer_resource, .non_integral = true, .size = 128, .abi = 128 },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.buffer_strided_pointer, .non_integral = true, .size = 192, .abi = 256, .idx = 32 },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.constant_buffer_0 },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.constant_buffer_1 },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.constant_buffer_2 },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.constant_buffer_3 },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.constant_buffer_4 },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.constant_buffer_5 },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.constant_buffer_6 },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.constant_buffer_7 },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.constant_buffer_8 },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.constant_buffer_9 },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.constant_buffer_10 },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.constant_buffer_11 },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.constant_buffer_12 },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.constant_buffer_13 },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.constant_buffer_14 },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.constant_buffer_15 },
-            .{ .zig = null, .llvm = Builder.AddrSpace.amdgpu.streamout_register },
+        .nvptx, .nvptx64 => switch (address_space) {
+            .generic => Builder.AddrSpace.nvptx.generic,
+            .global => Builder.AddrSpace.nvptx.global,
+            .constant => Builder.AddrSpace.nvptx.constant,
+            .param => Builder.AddrSpace.nvptx.entry_param,
+            .shared => Builder.AddrSpace.nvptx.shared,
+            .local => Builder.AddrSpace.nvptx.local,
+            else => unreachable,
         },
-        .avr => &.{
-            .{ .zig = .generic, .llvm = Builder.AddrSpace.avr.data, .abi = 8 },
-            .{ .zig = .flash, .llvm = Builder.AddrSpace.avr.program, .abi = 8 },
-            .{ .zig = .flash1, .llvm = Builder.AddrSpace.avr.program1, .abi = 8 },
-            .{ .zig = .flash2, .llvm = Builder.AddrSpace.avr.program2, .abi = 8 },
-            .{ .zig = .flash3, .llvm = Builder.AddrSpace.avr.program3, .abi = 8 },
-            .{ .zig = .flash4, .llvm = Builder.AddrSpace.avr.program4, .abi = 8 },
-            .{ .zig = .flash5, .llvm = Builder.AddrSpace.avr.program5, .abi = 8 },
+        .x86, .x86_64 => switch (address_space) {
+            .generic => .default,
+            .gs => Builder.AddrSpace.x86.gs,
+            .fs => Builder.AddrSpace.x86.fs,
+            .ss => Builder.AddrSpace.x86.ss,
+            else => unreachable,
         },
-        .wasm32, .wasm64 => &.{
-            .{ .zig = .generic, .llvm = Builder.AddrSpace.wasm.default, .force_in_data_layout = true },
-            .{ .zig = null, .llvm = Builder.AddrSpace.wasm.variable, .non_integral = true },
-            .{ .zig = .externref, .llvm = Builder.AddrSpace.wasm.externref, .non_integral = true, .size = 8, .abi = 8 },
-            .{ .zig = .funcref, .llvm = Builder.AddrSpace.wasm.funcref, .non_integral = true, .size = 8, .abi = 8 },
-        },
-        .m68k => &.{
-            .{ .zig = .generic, .llvm = .default, .abi = 16, .pref = 32 },
-        },
-        else => &.{
-            .{ .zig = .generic, .llvm = .default },
+        else => switch (address_space) {
+            .generic => .default,
+            else => unreachable,
         },
     };
 }
