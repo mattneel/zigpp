@@ -323,7 +323,138 @@ pub fn genMainBody(fg: *FuncGen) TodoError!void {
 
     fg.args = args.items;
 
+    if (zcu.getTarget().cpu.arch == .air64 and fn_info.cc == .metal_kernel) {
+        try fg.recordAirKernel(fn_info);
+    }
+
     try fg.genBody(fg.air.getMainBody(), .poi);
+}
+
+/// Records a kernel for the `air64` target's `!air.kernel` metadata: the module-level list of
+/// kernel functions Apple's Metal runtime finds kernels in (doc/proposals/metal.md section 2.5).
+/// Every Zig parameter is a parameter the *host* binds, and kernels pass their arguments by
+/// value, so the Zig parameter index is the index the host binds at: a pointer in device,
+/// constant or threadgroup memory becomes a buffer, a scalar or aggregate the host passes as
+/// bytes becomes a parameter the AIR pass loads through a `constant` pointer. The
+/// thread-position builtins a kernel uses are appended after these by that pass.
+fn recordAirKernel(fg: *FuncGen, fn_info: InternPool.Key.FuncType) TodoError!void {
+    const o = fg.object;
+    const zcu = o.zcu;
+    const ip = &zcu.intern_pool;
+    const gpa = o.gpa;
+    const target = zcu.getTarget();
+    const global = fg.wip.function.ptrConst(&o.builder).global;
+    const param_types = fn_info.param_types.get(ip);
+
+    var args: std.ArrayList(Object.AirKernel.AirArg) = .empty;
+    defer args.deinit(gpa);
+    errdefer for (args.items) |arg| {
+        gpa.free(arg.type_name);
+        gpa.free(arg.name);
+    };
+
+    // Anything the backend lowers into a different number of LLVM parameters, or into something
+    // the host cannot bind as bytes, is rejected here rather than producing a kernel a Metal
+    // host could not launch.
+    var it = iterateParamTypes(o, fn_info.cc, param_types);
+    for (param_types, 0..) |param_ty_index, param_index| {
+        const param_ty: Type = .fromInterned(param_ty_index);
+        const llvm_index_before = it.llvm_index;
+        const lowering = (try it.next()) orelse return fg.air64Unsupported("this kernel signature");
+        if (lowering != .byval or it.zig_index != param_index + 1 or
+            it.llvm_index != llvm_index_before + 1)
+        {
+            return fg.air64Unsupported("a kernel parameter that is not one host-visible " ++
+                "argument; pass it in a buffer or as a single value");
+        }
+
+        // A parameter the host binds as bytes (not a pointer) goes in `constant` memory, and
+        // the AIR pass turns it into a pointer and a load.
+        var address_space: u3 = 2;
+        var elem_ty = param_ty;
+        var access: Object.AirKernel.AirArg.Access = .read;
+        if (param_ty.isPtrAtRuntime(zcu)) {
+            const info = param_ty.ptrInfo(zcu);
+            const llvm_as = llvm.toLlvmAddressSpace(info.flags.address_space, target);
+            if (@backingInt(llvm_as) > std.math.maxInt(u3)) {
+                return fg.air64Unsupported("a kernel pointer outside AIR's address spaces");
+            }
+            address_space = @intCast(@backingInt(llvm_as));
+            elem_ty = .fromInterned(info.child);
+            access = if (info.flags.is_const) .read else .read_write;
+        }
+
+        const type_name = try airTypeName(gpa, fg.pt, elem_ty);
+        errdefer gpa.free(type_name);
+        const name = try std.fmt.allocPrint(gpa, "arg{d}", .{param_index});
+        errdefer gpa.free(name);
+        try args.append(gpa, .{
+            .address_space = address_space,
+            .location_index = @intCast(param_index),
+            .access = access,
+            .type_name = type_name,
+            .type_size = elem_ty.abiSize(zcu),
+            .type_align = elem_ty.abiAlignment(zcu).toByteUnits() orelse 1,
+            .name = name,
+        });
+    }
+    try o.addAirKernel(global, args.items);
+}
+
+/// The Metal name of the type a buffer holds, spelled the way Apple's `air.arg_type_name`
+/// reflection field spells the MSL scalar types. Anything else (a struct, a vector, ...) is not
+/// a Metal scalar type, and the field is reflection only, so the Zig type name is more useful
+/// there than nothing.
+fn airTypeName(gpa: Allocator, pt: Zcu.PerThread, ty: Type) Allocator.Error![]const u8 {
+    const name: []const u8 = switch (ty.toIntern()) {
+        .bool_type => "bool",
+        .f16_type => "half",
+        .f32_type => "float",
+        .i8_type => "char",
+        .u8_type => "uchar",
+        .i16_type => "short",
+        .u16_type => "ushort",
+        .i32_type => "int",
+        .u32_type => "uint",
+        .i64_type => "long",
+        .u64_type => "ulong",
+        else => return std.fmt.allocPrint(gpa, "{f}", .{ty.fmt(pt)}),
+    };
+    return gpa.dupe(u8, name);
+}
+
+/// Apple GPUs have no double-precision arithmetic and Apple's Metal compiler rejects a module
+/// that uses `double` at all, which would otherwise surface as a crash inside the Metal compiler
+/// instead of a Zig error (doc/proposals/metal.md section 9). The backend has no source location
+/// for an instruction, so this is reported against the function being compiled, like the other
+/// `todo`s in this file.
+fn air64CheckFloats(fg: *FuncGen, inst: Air.Inst.Index) TodoError!void {
+    const zcu = fg.object.zcu;
+    const bits = air64WideFloatBits(zcu, fg.typeOfIndex(inst)) orelse return;
+    return zcu.codegenFail(fg.nav_index, "type 'f{d}' is not available on the air64 target: " ++
+        "Apple GPUs have no double-precision arithmetic and Apple's Metal compiler rejects " ++
+        "modules that use it. Use f32 or an integer type instead", .{bits});
+}
+
+/// The width of a runtime float wider than f32 inside `ty`, or null if there is none. Pointers
+/// are not followed: the instruction that loads or stores through one reveals its element type.
+fn air64WideFloatBits(zcu: *const Zcu, ty: Type) ?u16 {
+    const bits = if (ty.zigTypeTag(zcu) == .float) bits: {
+        const bits = ty.floatBits(zcu.getTarget());
+        break :bits if (bits > 32) bits else return null;
+    } else switch (ty.zigTypeTag(zcu)) {
+        .vector, .array => return air64WideFloatBits(zcu, ty.childType(zcu)),
+        .optional => return air64WideFloatBits(zcu, ty.optionalChild(zcu)),
+        .error_union => return air64WideFloatBits(zcu, ty.errorUnionPayload(zcu)),
+        .@"struct" => {
+            for (0..ty.structFieldCount(zcu)) |field_index| {
+                if (air64WideFloatBits(zcu, ty.fieldType(field_index, zcu))) |bits| return bits;
+            }
+            return null;
+        },
+        else => return null,
+    };
+    return bits;
 }
 
 fn genBody(self: *FuncGen, body: []const Air.Inst.Index, coverage_point: Air.CoveragePoint) TodoError!void {
@@ -351,6 +482,8 @@ fn genBody(self: *FuncGen, body: []const Air.Inst.Index, coverage_point: Air.Cov
     }
     for (body) |inst| {
         if (self.liveness.isUnused(inst) and !self.air.mustLower(inst, ip)) continue;
+
+        if (zcu.getTarget().cpu.arch == .air64) try self.air64CheckFloats(inst);
 
         const val: Builder.Value = switch (air_tags[@backingInt(inst)]) {
             // zig fmt: off
@@ -5356,7 +5489,7 @@ fn airCmpxchg(
     self: *FuncGen,
     inst: Air.Inst.Index,
     kind: Builder.Function.Instruction.CmpXchg.Kind,
-) Allocator.Error!Builder.Value {
+) TodoError!Builder.Value {
     const o = self.object;
     const zcu = o.zcu;
     const ty_pl = self.air.instructions.items(.data)[@backingInt(inst)].ty_pl;
@@ -5368,6 +5501,25 @@ fn airCmpxchg(
     const operand_ty = ptr_ty.childType(zcu);
     const llvm_operand_ty = try o.lowerType(operand_ty, .as_value);
     const llvm_abi_ty = try self.getAtomicAbiType(operand_ty, false);
+
+    self.maybeMarkAllowZeroAccess(ptr_ty.ptrInfo(zcu));
+
+    if (zcu.getTarget().cpu.arch == .air64) {
+        // AIR has no `cmpxchg` instruction: Zig's compare-exchange is a call to Apple's
+        // `air.atomic.*.cmpxchg.weak`, which takes the expected value by pointer and updates it
+        // (doc/proposals/metal.md section 2.6). AIR has only the weak form, and Apple's
+        // implementation does not fail spuriously when the value still matches what it observed
+        // — the same assumption Metal.jl's compare-exchange makes.
+        const payload, const success_bit = try self.air64Cmpxchg(
+            ptr,
+            ptr_ty,
+            try self.resolveInst(extra.expected_value),
+            try self.resolveInst(extra.new_value),
+            operand_ty,
+        );
+        return self.buildCmpxchgResult(payload, success_bit, operand_ty, self.typeOfIndex(inst));
+    }
+
     if (llvm_abi_ty != .none) {
         // operand needs widening and truncating
         const signedness: Builder.Function.Instruction.Cast.Signedness =
@@ -5375,8 +5527,6 @@ fn airCmpxchg(
         expected_value = try self.wip.conv(signedness, expected_value, llvm_abi_ty, "");
         new_value = try self.wip.conv(signedness, new_value, llvm_abi_ty, "");
     }
-
-    self.maybeMarkAllowZeroAccess(ptr_ty.ptrInfo(zcu));
 
     const result = try self.wip.cmpxchg(
         kind,
@@ -5397,6 +5547,146 @@ fn airCmpxchg(
     if (llvm_abi_ty != .none) payload = try self.wip.cast(.trunc, payload, llvm_operand_ty, "");
     const success_bit = try self.wip.extractValue(result, &.{1}, "");
 
+    return self.buildCmpxchgResult(payload, success_bit, operand_ty, optional_ty);
+}
+
+/// Air64 lowers `@atomicRmw` to `air.atomic.{global,local}.<op>.<type>`, whose arguments are the
+/// pointer, the operand, the memory order, the scope and the volatile flag, and whose result is
+/// the value the operation replaced (doc/proposals/metal.md section 2.6). AIR accepts no
+/// `atomicrmw` instruction: Apple's own compiler never emits one.
+fn air64AtomicRmw(self: *FuncGen, inst: Air.Inst.Index) TodoError!Builder.Value {
+    const o = self.object;
+    const zcu = o.zcu;
+    const pl_op = self.air.instructions.items(.data)[@backingInt(inst)].pl_op;
+    const extra = self.air.extraData(Air.AtomicRmw, pl_op.payload).data;
+    const ptr_ty = self.typeOf(pl_op.operand);
+    const operand_ty = ptr_ty.childType(zcu);
+    const ptr = try self.resolveInst(pl_op.operand);
+
+    const op = extra.op();
+    const elem = try self.air64AtomicElement(operand_ty, op);
+    const op_name = switch (op) {
+        .Xchg => "xchg",
+        .Add => "add",
+        .Sub => "sub",
+        .And => "and",
+        .Or => "or",
+        .Xor => "xor",
+        .Max => "max",
+        .Min => "min",
+        .Nand => return self.air64Unsupported("an atomic nand"),
+    };
+    const scope = try self.air64AtomicScope(ptr_ty.ptrInfo(zcu));
+    const name = try std.fmt.allocPrint(o.gpa, "air.atomic.{s}.{s}.{s}", .{
+        scope.memory, op_name, elem.suffix,
+    });
+    defer o.gpa.free(name);
+
+    var operand = try self.resolveInst(extra.operand);
+    if (elem.bitcast) operand = try self.wip.cast(.bitcast, operand, elem.llvm_ty, "");
+
+    self.maybeMarkAllowZeroAccess(ptr_ty.ptrInfo(zcu));
+
+    const result = try self.air64Atomic(name, elem.llvm_ty, &.{
+        try o.lowerType(ptr_ty, .as_value), elem.llvm_ty, .i32, .i32, .i1,
+    }, &.{
+        ptr,
+        operand,
+        try self.air64AtomicOrder(extra.ordering()),
+        try o.builder.intValue(.i32, scope.scope),
+        // AIR atomics carry the same volatile flag as the MSL builtins, and Apple's frontend
+        // passes true.
+        Builder.Value.true,
+    });
+    if (!elem.bitcast) return result;
+    return self.wip.cast(.bitcast, result, try o.lowerType(operand_ty, .as_value), "");
+}
+
+/// Air64 lowers `@atomicLoad` to `air.atomic.{global,local}.load.<type>`; there is no `load
+/// atomic` instruction in AIR (doc/proposals/metal.md section 2.6).
+fn air64AtomicLoad(self: *FuncGen, inst: Air.Inst.Index) TodoError!Builder.Value {
+    const o = self.object;
+    const zcu = o.zcu;
+    const atomic_load = self.air.instructions.items(.data)[@backingInt(inst)].atomic_load;
+    const ptr_ty = self.typeOf(atomic_load.ptr);
+    const operand_ty = ptr_ty.childType(zcu);
+    const ptr = try self.resolveInst(atomic_load.ptr);
+    const elem = try self.air64AtomicElement(operand_ty, .Xchg);
+    const scope = try self.air64AtomicScope(ptr_ty.ptrInfo(zcu));
+    const name = try std.fmt.allocPrint(o.gpa, "air.atomic.{s}.load.{s}", .{
+        scope.memory, elem.suffix_plain,
+    });
+    defer o.gpa.free(name);
+
+    self.maybeMarkAllowZeroAccess(ptr_ty.ptrInfo(zcu));
+
+    const result = try self.air64Atomic(name, elem.llvm_ty, &.{
+        try o.lowerType(ptr_ty, .as_value), .i32, .i32, .i1,
+    }, &.{
+        ptr,
+        try self.air64AtomicOrder(atomic_load.order),
+        try o.builder.intValue(.i32, scope.scope),
+        Builder.Value.true,
+    });
+    if (!elem.bitcast) return result;
+    return self.wip.cast(.bitcast, result, try o.lowerType(operand_ty, .as_value), "");
+}
+
+/// Air64 lowers `@atomicStore` to `air.atomic.{global,local}.store.<type>`; there is no `store
+/// atomic` instruction in AIR (doc/proposals/metal.md section 2.6).
+fn air64AtomicStore(self: *FuncGen, inst: Air.Inst.Index, ordering: Builder.AtomicOrdering) TodoError!Builder.Value {
+    const o = self.object;
+    const zcu = o.zcu;
+    const bin_op = self.air.instructions.items(.data)[@backingInt(inst)].bin_op;
+    const ptr_ty = self.typeOf(bin_op.lhs);
+    const operand_ty = ptr_ty.childType(zcu);
+    const ptr = try self.resolveInst(bin_op.lhs);
+    const elem = try self.air64AtomicElement(operand_ty, .Xchg);
+    const scope = try self.air64AtomicScope(ptr_ty.ptrInfo(zcu));
+    const name = try std.fmt.allocPrint(o.gpa, "air.atomic.{s}.store.{s}", .{
+        scope.memory, elem.suffix_plain,
+    });
+    defer o.gpa.free(name);
+
+    var element = try self.resolveInst(bin_op.rhs);
+    if (elem.bitcast) element = try self.wip.cast(.bitcast, element, elem.llvm_ty, "");
+
+    self.maybeMarkAllowZeroAccess(ptr_ty.ptrInfo(zcu));
+
+    _ = try self.air64Atomic(name, .void, &.{
+        try o.lowerType(ptr_ty, .as_value), elem.llvm_ty, .i32, .i32, .i1,
+    }, &.{
+        ptr,
+        element,
+        try self.air64AtomicOrder2(ordering),
+        try o.builder.intValue(.i32, scope.scope),
+        Builder.Value.true,
+    });
+    return .none;
+}
+
+/// The AIR encoding of an ordering that arrived already lowered to LLVM's enum. See
+/// `air64AtomicOrder`.
+fn air64AtomicOrder2(self: *FuncGen, ordering: Builder.AtomicOrdering) TodoError!Builder.Value {
+    const o = self.object;
+    return switch (ordering) {
+        .monotonic, .unordered => o.builder.intValue(.i32, 0),
+        else => self.air64Unsupported("an atomic ordering stronger than .monotonic: " ++
+            "the Metal language has only relaxed atomics"),
+    };
+}
+
+/// Wraps the payload and the success flag of a compare-exchange in the optional that Zig's
+/// `@cmpxchg*` returns.
+fn buildCmpxchgResult(
+    self: *FuncGen,
+    payload: Builder.Value,
+    success_bit: Builder.Value,
+    operand_ty: Type,
+    optional_ty: Type,
+) Allocator.Error!Builder.Value {
+    const o = self.object;
+    const zcu = o.zcu;
     if (optional_ty.optionalReprIsPayload(zcu)) {
         const zero = try o.builder.zeroInitValue(payload.typeOfWip(&self.wip));
         return self.wip.select(.normal, success_bit, zero, payload, "");
@@ -5422,9 +5712,187 @@ fn airCmpxchg(
     return alloca_inst;
 }
 
-fn airAtomicRmw(self: *FuncGen, inst: Air.Inst.Index) Allocator.Error!Builder.Value {
+/// The `(scope, memory)` an AIR atomic uses for a pointer: `air.atomic.global.*` with scope 2
+/// (device) for device and constant memory, `air.atomic.local.*` with scope 1 (threadgroup) for
+/// threadgroup memory. AIR has no scope for generic pointers.
+fn air64AtomicScope(self: *FuncGen, ptr_info: InternPool.Key.PtrType) TodoError!struct {
+    scope: u32,
+    memory: []const u8,
+} {
+    return switch (ptr_info.flags.address_space) {
+        .global, .constant => .{ .scope = 2, .memory = "global" },
+        .shared => .{ .scope = 1, .memory = "local" },
+        .generic => self.air64Unsupported("an atomic on a generic pointer: give the pointer an " ++
+            "explicit address space (*addrspace(.global) or *addrspace(.shared))"),
+        else => self.air64Unsupported("an atomic on a pointer in this address space"),
+    };
+}
+
+/// The AIR encoding of a Zig atomic ordering. Apple's AIR names the orderings that C11 does, but
+/// the MSL frontend only accepts `memory_order_relaxed` before Metal 4.1
+/// (`doc/proposals/metal.md` section 2.6), which is what Zig's `.monotonic` maps to.
+fn air64AtomicOrder(self: *FuncGen, order: std.lang.AtomicOrder) TodoError!Builder.Value {
+    const o = self.object;
+    return switch (order) {
+        .unordered, .monotonic => o.builder.intValue(.i32, 0),
+        else => self.air64Unsupported("an atomic ordering stronger than .monotonic: " ++
+            "the Metal language has only relaxed atomics"),
+    };
+}
+
+/// What one AIR atomic operation is: the type the intrinsic takes on the wire, the type suffix
+/// in its name, and whether the Zig operand has to be bitcast to the wire type. AIR reinterprets
+/// floats as integers instead of naming them for every operation (`air.atomic.global.add.u.i32`
+/// is `float` add by the time it reaches the hardware).
+const Air64AtomicElement = struct {
+    llvm_ty: Builder.Type,
+    /// The type suffix of the name of an operation that is signedness-aware, e.g. `u.i32` in
+    /// `air.atomic.global.add.u.i32`.
+    suffix: []const u8,
+    /// The type suffix of an operation that only names the width, e.g. `i32` in
+    /// `air.atomic.global.load.i32`.
+    suffix_plain: []const u8,
+    bitcast: bool,
+};
+
+fn air64AtomicElement(self: *FuncGen, operand_ty: Type, op: std.lang.AtomicRmwOp) TodoError!Air64AtomicElement {
+    const zcu = self.object.zcu;
+    const bits: u16 = switch (operand_ty.zigTypeTag(zcu)) {
+        .int, .@"enum" => @intCast(operand_ty.bitSize(zcu)),
+        .float => switch (operand_ty.floatBits(zcu.getTarget())) {
+            32 => 32,
+            else => return self.air64Unsupported("an atomic on a float type wider or narrower than f32"),
+        },
+        else => return self.air64Unsupported("an atomic on this type"),
+    };
+    switch (bits) {
+        8, 16, 32, 64 => {},
+        else => return self.air64Unsupported("an atomic on a type that is not 8, 16, 32 or 64 bits wide"),
+    }
+    if (bits != operand_ty.abiSize(zcu) * 8) {
+        return self.air64Unsupported("an atomic on a type whose size is not a power of two");
+    }
+    if (operand_ty.isRuntimeFloat()) switch (op) {
+        // Only add, sub and the bit-preserving exchange exist for floats: `air.atomic.*.xchg`
+        // is the integer form Metal.jl also bitcasts floats for, and Metal has no atomic
+        // float min/max at all.
+        .Add, .Sub => return .{
+            .llvm_ty = try self.object.lowerType(operand_ty, .as_value),
+            .suffix = "f32",
+            .suffix_plain = "f32",
+            .bitcast = false,
+        },
+        .Xchg => return .{
+            .llvm_ty = .i32,
+            .suffix = "u.i32",
+            .suffix_plain = "i32",
+            .bitcast = true,
+        },
+        else => return self.air64Unsupported("this atomic operation on a float"),
+    };
+    const signed = operand_ty.isSignedInt(zcu);
+    const suffix: []const u8 = switch (bits) {
+        8 => if (signed) "s.i8" else "u.i8",
+        16 => if (signed) "s.i16" else "u.i16",
+        32 => if (signed) "s.i32" else "u.i32",
+        else => if (signed) "s.i64" else "u.i64",
+    };
+    const suffix_plain: []const u8 = switch (bits) {
+        8 => "i8",
+        16 => "i16",
+        32 => "i32",
+        else => "i64",
+    };
+    return .{
+        .llvm_ty = try self.object.lowerType(operand_ty, .as_value),
+        .suffix = suffix,
+        .suffix_plain = suffix_plain,
+        .bitcast = false,
+    };
+}
+
+/// Reports an `air64` feature the Metal language has no equivalent for, with a source location.
+fn air64Unsupported(self: *FuncGen, comptime what: []const u8) TodoError {
+    return self.object.zcu.codegenFail(
+        self.nav_index,
+        "the air64 target does not support " ++ what ++ " (doc/proposals/metal.md section 9)",
+        .{},
+    );
+}
+
+/// One `air.atomic.<memory>.<op>.<suffix>` call. `air64AtomicElement` describes the wire type.
+fn air64Atomic(
+    self: *FuncGen,
+    name: []const u8,
+    ret_ty: Builder.Type,
+    param_tys: []const Builder.Type,
+    args: []const Builder.Value,
+) Allocator.Error!Builder.Value {
+    const o = self.object;
+    const fn_ty = try o.builder.fnType(ret_ty, param_tys, .normal);
+    const decl = try o.airDecl(name, fn_ty);
+    return self.wip.call(.normal, .ccc, .none, fn_ty, decl.toValue(), args, "");
+}
+
+/// Air64 lowers `@cmpxchg*` to `air.atomic.{global,local}.cmpxchg.weak.<suffix>`, whose second
+/// argument is a pointer to the expected value: the callee leaves it alone when the exchange
+/// happened and writes the value it observed back into it otherwise (Metal.jl reads the same
+/// box to decide whether the exchange succeeded), so the result is the box's contents after the
+/// call.
+fn air64Cmpxchg(
+    self: *FuncGen,
+    ptr: Builder.Value,
+    ptr_ty: Type,
+    expected_value: Builder.Value,
+    new_value: Builder.Value,
+    operand_ty: Type,
+) TodoError!struct { Builder.Value, Builder.Value } {
     const o = self.object;
     const zcu = o.zcu;
+    const elem = try self.air64AtomicElement(operand_ty, .Xchg);
+
+    const expected_slot = try self.buildZigAlloca(operand_ty, .none);
+    _ = try self.store(expected_slot, .none, expected_value, operand_ty, .normal);
+
+    const scope = try self.air64AtomicScope(ptr_ty.ptrInfo(zcu));
+    const name = try std.fmt.allocPrint(o.gpa, "air.atomic.{s}.cmpxchg.weak.{s}", .{
+        scope.memory, elem.suffix,
+    });
+    defer o.gpa.free(name);
+
+    const llvm_ptr_ty = try o.lowerType(ptr_ty, .as_value);
+    const expected_ptr_ty = try o.builder.ptrType(llvm.toLlvmAddressSpace(.generic, zcu.getTarget()));
+    const new_value_arg = if (elem.bitcast)
+        try self.wip.cast(.bitcast, new_value, elem.llvm_ty, "")
+    else
+        new_value;
+
+    _ = try self.air64Atomic(name, elem.llvm_ty, &.{
+        llvm_ptr_ty, expected_ptr_ty, elem.llvm_ty, .i32, .i32, .i32, .i1,
+    }, &.{
+        ptr,
+        expected_slot,
+        new_value_arg,
+        try o.builder.intValue(.i32, 0), // success order: relaxed
+        try o.builder.intValue(.i32, 0), // failure order: relaxed
+        try o.builder.intValue(.i32, scope.scope),
+        Builder.Value.true, // AIR atomics carry the volatile flag; Apple passes true
+    });
+
+    var observed = try self.load(expected_slot, .none, operand_ty, .normal);
+    var expected_bits = expected_value;
+    if (elem.bitcast) {
+        observed = try self.wip.cast(.bitcast, observed, elem.llvm_ty, "");
+        expected_bits = try self.wip.cast(.bitcast, expected_value, elem.llvm_ty, "");
+    }
+    const success_bit = try self.wip.icmp(.eq, observed, expected_bits, "");
+    return .{ observed, success_bit };
+}
+
+fn airAtomicRmw(self: *FuncGen, inst: Air.Inst.Index) TodoError!Builder.Value {
+    const o = self.object;
+    const zcu = o.zcu;
+    if (zcu.getTarget().cpu.arch == .air64) return self.air64AtomicRmw(inst);
     const pl_op = self.air.instructions.items(.data)[@backingInt(inst)].pl_op;
     const extra = self.air.extraData(Air.AtomicRmw, pl_op.payload).data;
     const ptr = try self.resolveInst(pl_op.operand);
@@ -5487,9 +5955,10 @@ fn airAtomicRmw(self: *FuncGen, inst: Air.Inst.Index) Allocator.Error!Builder.Va
     }
 }
 
-fn airAtomicLoad(self: *FuncGen, inst: Air.Inst.Index) Allocator.Error!Builder.Value {
+fn airAtomicLoad(self: *FuncGen, inst: Air.Inst.Index) TodoError!Builder.Value {
     const o = self.object;
     const zcu = o.zcu;
+    if (zcu.getTarget().cpu.arch == .air64) return self.air64AtomicLoad(inst);
     const atomic_load = self.air.instructions.items(.data)[@backingInt(inst)].atomic_load;
     const ptr = try self.resolveInst(atomic_load.ptr);
     const ptr_ty = self.typeOf(atomic_load.ptr);
@@ -5536,12 +6005,13 @@ fn airAtomicStore(
     self: *FuncGen,
     inst: Air.Inst.Index,
     ordering: Builder.AtomicOrdering,
-) Allocator.Error!Builder.Value {
+) TodoError!Builder.Value {
     const zcu = self.object.zcu;
     const bin_op = self.air.instructions.items(.data)[@backingInt(inst)].bin_op;
     const ptr_ty = self.typeOf(bin_op.lhs);
     const operand_ty = ptr_ty.childType(zcu);
     if (!operand_ty.hasRuntimeBits(zcu)) return .none;
+    if (zcu.getTarget().cpu.arch == .air64) return self.air64AtomicStore(inst, ordering);
     const ptr = try self.resolveInst(bin_op.lhs);
     var element = try self.resolveInst(bin_op.rhs);
     const llvm_abi_ty = try self.getAtomicAbiType(operand_ty, false);
@@ -6591,6 +7061,25 @@ fn workIntrinsic(
     }, &.{}, &.{}, "");
 }
 
+/// Calls the `air64` builtin placeholder that the AIR pass turns into the kernel argument
+/// carrying `air_name` in `dimension`. `default` is the value of the builtin in a dimension the
+/// kernel does not have, like the CUDA and AMD paths below; dimensions beyond `z` have no
+/// builtin at all.
+fn airBuiltin(self: *FuncGen, air_name: []const u8, dimension: u32, default: u32) Allocator.Error!Builder.Value {
+    const o = self.object;
+    if (dimension > 2) return o.builder.intValue(.i32, default);
+    const decl = try o.airBuiltinDecl(air_name, dimension);
+    return self.wip.call(
+        .normal,
+        .ccc,
+        .none,
+        decl.typeOf(&o.builder),
+        decl.toValue(),
+        &.{},
+        "",
+    );
+}
+
 fn airWorkItemId(self: *FuncGen, inst: Air.Inst.Index) Allocator.Error!Builder.Value {
     const target = self.object.zcu.getTarget();
 
@@ -6598,6 +7087,7 @@ fn airWorkItemId(self: *FuncGen, inst: Air.Inst.Index) Allocator.Error!Builder.V
     const dimension = pl_op.payload;
 
     return switch (target.cpu.arch) {
+        .air64 => self.airBuiltin("thread_position_in_threadgroup", dimension, 0),
         .amdgcn => self.workIntrinsic(dimension, 0, "amdgcn.workitem.id"),
         .nvptx, .nvptx64 => self.workIntrinsic(dimension, 0, "nvvm.read.ptx.sreg.tid"),
         else => unreachable,
@@ -6611,6 +7101,7 @@ fn airWorkGroupSize(self: *FuncGen, inst: Air.Inst.Index) Allocator.Error!Builde
     const dimension = pl_op.payload;
 
     switch (target.cpu.arch) {
+        .air64 => return self.airBuiltin("threads_per_threadgroup", dimension, 1),
         .amdgcn => {
             if (dimension >= 3) return .@"1";
 
@@ -6639,6 +7130,7 @@ fn airWorkGroupId(self: *FuncGen, inst: Air.Inst.Index) Allocator.Error!Builder.
     const dimension = pl_op.payload;
 
     return switch (target.cpu.arch) {
+        .air64 => self.airBuiltin("threadgroup_position_in_grid", dimension, 0),
         .amdgcn => self.workIntrinsic(dimension, 0, "amdgcn.workgroup.id"),
         .nvptx, .nvptx64 => self.workIntrinsic(dimension, 0, "nvvm.read.ptx.sreg.ctaid"),
         else => unreachable,
@@ -6648,6 +7140,20 @@ fn airWorkGroupId(self: *FuncGen, inst: Air.Inst.Index) Allocator.Error!Builder.
 fn airWorkGroupBarrier(self: *FuncGen) Allocator.Error!Builder.Value {
     const target = self.object.zcu.getTarget();
     switch (target.cpu.arch) {
+        .air64 => {
+            // `air.wg.barrier(mem_flags, barrier_id)` with `mem_threadgroup` and barrier 0, the
+            // shape Apple's frontend emits for `threadgroup_barrier(mem_flags::mem_threadgroup)`
+            // (doc/proposals/metal.md section 2.6), which also orders the threadgroup memory
+            // accesses around it. Bare LLVM `fence` instructions are not part of AIR: Metal.jl
+            // rewrites them into `air.atomic.fence`, so none are emitted here.
+            const o = self.object;
+            const fn_ty = try o.builder.fnType(.void, &.{ .i32, .i32 }, .normal);
+            const decl = try o.airDecl("air.wg.barrier", fn_ty);
+            _ = try self.wip.call(.normal, .ccc, .none, fn_ty, decl.toValue(), &.{
+                try o.builder.intValue(.i32, 2),
+                try o.builder.intValue(.i32, 1),
+            }, "");
+        },
         .amdgcn => {
             // Like HIP's `__syncthreads`: `s_barrier` only waits for the other waves, so publish the
             // memory accesses of this work item to the work group before it and make theirs visible
