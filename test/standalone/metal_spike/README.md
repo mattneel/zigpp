@@ -124,14 +124,16 @@ the real compiler derives from the Zig type system.
 1. **`parsef`** (`std.fmt.parseFloat(f32, …)`): the module passes `xcrun air-opt` and
    `xcrun metal-opt -O3`, and `vadd`/`reduce` compile from the same library, but creating the
    pipeline for `parsef` crashes Apple's compiler service
-   (`XPC_ERROR_CONNECTION_INTERRUPTED`). Ruled out by experiment: the `fastcc` convention of the
-   outlined helpers, the f64 slow path (`convert_slow` stubbed out), `llvm.umul.with.overflow.i64`
-   (replaced with `mul` + explicit overflow), `llvm.ctlz.i64` (Apple's frontend emits
-   `air.clz.i64`, and rewriting to that changed nothing), and the container/metadata shape (the
-   other two kernels compile from the very same library). The remaining suspects are the
-   inlined 64-bit Eisel–Lemire path and the `%BiasedFp(f64)`-typed allocas/staging buffer; the
-   next step is to read the Metal compiler's crash report (`~/Library/Logs/DiagnosticReports`,
-   not readable from this account) or bisect the inlined body.
+   (`XPC_ERROR_CONNECTION_INTERRUPTED`). Ruled out by experiment, each by editing the emitted
+   module and re-running on the M4: the `fastcc` convention of the outlined helpers (→ `ccc`),
+   the f64 slow path (`convert_slow` stubbed out), `llvm.umul.with.overflow.i64` (→ `mul` plus an
+   explicit false overflow flag), `llvm.ctlz.i64` (→ `air.clz.i64`), all of
+   `llvm.{ctlz,umax,umin,usub.sat}` (→ `air.{clz,max.u,min.u,sub_sat.u}`), and Apple's own
+   `metal-opt -O3` over the module before wrapping. What is left as the difference to Apple's
+   own frontend output: `llvm.memcpy.p0.p1.i64`/`llvm.memset.p0.i64` (the 32-byte staging copy
+   out of device memory), the `%BiasedFp(f64)`-typed allocas, and `llvm.assume`. Next step: read
+   the Metal compiler's crash report (`~/Library/Logs/DiagnosticReports`, not readable from this
+   account) or bisect the inlined body of `@parsef`.
 2. Whether Apple's AIR backend accepts `alloca`-heavy kernels at all, once (1) is answered.
 3. `-fno-compiler-rt` was used for the stand-in compile to keep the module small; the real
    target bundles compiler-rt for kernels (works in this tree: 588 KB module measured with

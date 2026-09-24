@@ -47,13 +47,15 @@
 //!     `metallib dump` also accepts the one variant found in Apple's vadd.metallib,
 //!     where an empty group declares size 4, i.e. omits its ENDT from the count, and
 //!     reports that as a note rather than a mismatch.
-//!   * modules: the module bytes follow with no wrapper and no alignment,
-//!     concatenated (library.jl:891-894,1054-1056). MDSZ and HASH are the byte count
-//!     and hash of exactly those stored bytes, so nothing is transformed here.
-//!     Store raw (unwrapped) bitcode: a module in Apple's 0x0b17c0de wrapper was
-//!     reproducibly rejected by `newComputePipelineStateWithFunction` with
-//!     XPC_ERROR_CONNECTION_INTERRUPTED on macOS 26.6.2, while the same module
-//!     stored raw loaded and ran. `write` warns when the input looks wrapped.
+//!   * modules: the module bytes follow with no extra alignment, concatenated
+//!     (library.jl:891-894,1054-1056). MDSZ and HASH are the byte count and hash of
+//!     exactly those stored bytes, so nothing is transformed here.
+//!     Keep Apple's 0x0b17c0de module-section header: `xcrun metal -c` writes it,
+//!     `air-rewrite` writes it, and it works through the runtime. Stripping it is
+//!     not safe: a Zig++ module stored without the header was rejected by
+//!     `newComputePipelineStateWithFunction` ("unable to copy bitcode for function",
+//!     macOS 26.6.2), while the same module with the header loaded and ran. `write`
+//!     reports when the input does not look wrapped.
 //!   * UUID derivation: the first 16 bytes of SHA-256 over the module bytes,
 //!     interpreted big-endian as u128, with the RFC 4122 version nibble (bits 76-79)
 //!     stamped to 4 and the variant bits (bits 62-63) to binary 10 -- exactly
@@ -1099,11 +1101,12 @@ fn writeOutput(io: Io, path: []const u8, data: []const u8, out: *Io.Writer) void
 
 fn noteWrappedModule(out: *Io.Writer, module: []const u8) !void {
     if (module.len < 4) return;
-    if (mem.readInt(u32, module[0..4], .little) != bitcode_wrapper_magic) return;
+    if (mem.readInt(u32, module[0..4], .little) == bitcode_wrapper_magic) return;
     try out.print(
-        "NOTE: the module starts with Apple's 0x0b17c0de bitcode wrapper. Store raw bitcode: " ++
-            "wrapped modules were rejected by newComputePipelineStateWithFunction " ++
-            "(XPC_ERROR_CONNECTION_INTERRUPTED) on macOS 26.6.2, raw modules loaded and ran.\n",
+        "NOTE: the module does not start with Apple's 0x0b17c0de module-section header. " ++
+            "Keep it: a Zig++ module stored without the header was rejected by " ++
+            "newComputePipelineStateWithFunction (\"unable to copy bitcode for function\", " ++
+            "macOS 26.6.2), while the same module with the header loaded and ran.\n",
         .{},
     );
 }

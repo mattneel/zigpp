@@ -638,11 +638,25 @@ things a compiler must get exactly right:
 
 `parsef` remains open. Its module passes `xcrun air-opt` and `xcrun metal-opt -O3`, and the two
 other kernels in the same library compile, so the failure is inside Apple's AIR→GPU backend for
-that function. Ruled out by experiment: the `fastcc` convention of the outlined std helpers,
-the `convert_slow` f64 fallback (stubbed out), `llvm.umul.with.overflow.i64` (rewritten to
-`mul` + explicit flag), and `llvm.ctlz.i64` (Apple's own frontend emits `air.clz.i64`; rewriting
-it changed nothing). Remaining suspects: the inlined 64-bit Eisel–Lemire path and the
-`%BiasedFp(f64)`-typed allocas/staging buffer.
+that one function (the compiler service dies with `XPC_ERROR_CONNECTION_INTERRUPTED`). Ruled out
+by experiment, each by editing the emitted module and re-running on the M4:
+
+| experiment | result |
+| --- | --- |
+| the `fastcc` convention of the outlined std helpers → `ccc` | still crashes |
+| the `convert_slow` f64 fallback stubbed out (1884 lines removed) | still crashes |
+| `llvm.umul.with.overflow.i64` → `mul` + explicit false overflow flag | still crashes |
+| `llvm.ctlz.i64` → `air.clz.i64` (Apple's frontend emits the `air.` form) | still crashes |
+| `llvm.{ctlz,umax,umin,usub.sat}` → `air.{clz,max.u,min.u,sub_sat.u}` throughout | still crashes |
+| Apple's own `metal-opt -O3` over the module before wrapping | still crashes |
+
+What is left as the difference to Apple's own frontend output: `llvm.memcpy.p0.p1.i64` /
+`llvm.memset.p0.i64` (the kernel's 32-byte staging copy out of device memory), the
+`%BiasedFp(f64)`-typed allocas, and `llvm.assume`. Apple's frontend emits `air.convert.*` for
+conversions and `llvm.lifetime.*` for locals, and never `memcpy`/`memset` or these bit
+intrinsics in their `llvm.` spelling. The next step is to read the Metal compiler's crash report
+(`~/Library/Logs/DiagnosticReports`, not readable from the account used here) or to bisect the
+inlined body of `@parsef` further.
 
 ## 13. Reproducing the spike
 
