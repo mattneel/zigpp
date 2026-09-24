@@ -48,7 +48,13 @@ fn clear_cache(start: usize, end: usize) callconv(.c) void {
         .sparc, .sparc64 => true,
         else => false,
     };
-    const apple = switch (os) {
+    // Darwin's libSystem provides the instruction cache flush that a trampoline needs. A bundled
+    // compiler-rt is inside a GPU module, which has no libSystem and no trampolines: a kernel
+    // is machine code that the driver compiled for the device before it ran, and it cannot write
+    // code for itself, so `__clear_cache` has nothing to do there and is not provided.
+    // (`air64` is the target this matters for: its OS is macOS, so without this check the arm
+    // below would be selected and the module would reference a symbol the device does not have.)
+    const apple = !compiler_rt.bundled and switch (os) {
         .ios, .maccatalyst, .macos, .watchos, .tvos, .visionos => true,
         else => false,
     };
