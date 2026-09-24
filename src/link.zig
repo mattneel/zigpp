@@ -664,8 +664,8 @@ pub const File = struct {
                 base.file = mf.memory_map.file;
                 try mf.ensureTotalCapacity(@intCast(mf.nodes.items[0].location().resolve(mf)[1]));
             },
-            .c, .spirv => if (base.file == null) {
-                dev.checkAny(&.{ .c_linker, .spirv_linker });
+            .c, .spirv, .metallib => if (base.file == null) {
+                dev.checkAny(&.{ .c_linker, .spirv_linker, .metallib_linker });
                 base.file = try base.emit.root_dir.handle.openFile(io, base.emit.sub_path, .{
                     .mode = .write_only,
                 });
@@ -754,6 +754,7 @@ pub const File = struct {
                 base.file = null;
             },
             .c, .spirv => dev.checkAny(&.{ .c_linker, .spirv_linker }),
+            .metallib => dev.check(.metallib_linker),
             .plan9 => unreachable,
             .spork8 => dev.check(.spork8_linker),
         }
@@ -789,6 +790,9 @@ pub const File = struct {
         switch (base.tag) {
             .lld => unreachable,
             .spirv => unreachable,
+            // Metal libraries are emitted whole by the LLVM backend; nothing looks up symbols
+            // in them.
+            .metallib => unreachable,
             .c => unreachable,
             inline else => |tag| {
                 dev.check(tag.devFeature());
@@ -828,6 +832,9 @@ pub const File = struct {
         switch (base.tag) {
             .lld => unreachable,
             .plan9 => unreachable,
+            // `air64` has no self-hosted backend, so its ZCU is always codegenned by LLVM and
+            // these updates never reach the linker (see the `assert` above).
+            .metallib => unreachable,
             inline else => |tag| {
                 dev.check(tag.devFeature());
                 return @as(*tag.Type(), @fieldParentPtr("base", base)).updateNav(pt, nav_index);
@@ -863,6 +870,8 @@ pub const File = struct {
         switch (base.tag) {
             .lld => unreachable,
             .plan9 => unreachable,
+            // Like `updateNav`: an `air64` ZCU is always codegenned by LLVM, not by the linker.
+            .metallib => unreachable,
             inline else => |tag| {
                 dev.check(tag.devFeature());
                 return @as(*tag.Type(), @fieldParentPtr("base", base)).updateFunc(pt, func_index, mir);
@@ -899,6 +908,7 @@ pub const File = struct {
             .lld => unreachable,
             .plan9 => unreachable,
             .spirv => {},
+            .metallib => {},
             .coff2 => {},
             inline else => |tag| {
                 dev.check(tag.devFeature());
@@ -1029,6 +1039,8 @@ pub const File = struct {
         switch (base.tag) {
             .lld => unreachable,
             .plan9 => unreachable,
+            // Like `updateNav`: an `air64` ZCU is always codegenned by LLVM, not by the linker.
+            .metallib => unreachable,
             inline else => |tag| {
                 dev.check(tag.devFeature());
                 return @as(*tag.Type(), @fieldParentPtr("base", base)).updateExports(pt, export_indices);
@@ -1062,6 +1074,7 @@ pub const File = struct {
             .lld => unreachable,
             .c => unreachable,
             .spirv => unreachable,
+            .metallib => unreachable,
             .wasm => unreachable,
             .plan9 => unreachable,
             .spork8 => unreachable,
@@ -1085,6 +1098,7 @@ pub const File = struct {
             .lld => unreachable,
             .c => unreachable,
             .spirv => unreachable,
+            .metallib => unreachable,
             .wasm => unreachable,
             .plan9 => unreachable,
             .spork8 => unreachable,
@@ -1103,6 +1117,7 @@ pub const File = struct {
             .lld => unreachable,
             .c => unreachable,
             .spirv => unreachable,
+            .metallib => unreachable,
             .wasm => unreachable,
             .plan9 => unreachable,
             .spork8 => unreachable,
@@ -1131,6 +1146,8 @@ pub const File = struct {
             .plan9,
             .lld,
             .spork8,
+            // A Metal library is written whole by the LLVM backend; it has no linker state to dump.
+            .metallib,
             => return .unimplemented,
             inline else => |tag| {
                 dev.check(tag.devFeature());
@@ -1242,7 +1259,7 @@ pub const File = struct {
         assert(!base.post_prelink);
 
         switch (base.tag) {
-            inline .coff2, .elf, .elf2, .wasm, .spirv => |tag| {
+            inline .coff2, .elf, .elf2, .wasm, .spirv, .metallib => |tag| {
                 dev.check(tag.devFeature());
                 return @as(*tag.Type(), @fieldParentPtr("base", base)).loadInput(input);
             },
@@ -1309,6 +1326,7 @@ pub const File = struct {
         c,
         wasm,
         spirv,
+        metallib,
         spork8,
         plan9,
         lld,
@@ -1322,6 +1340,7 @@ pub const File = struct {
                 .c => C,
                 .wasm => Wasm,
                 .spirv => Spirv,
+                .metallib => Metallib,
                 .lld => Lld,
                 .plan9 => comptime unreachable,
                 .spork8 => Spork8,
@@ -1337,6 +1356,7 @@ pub const File = struct {
                 .plan9 => .plan9,
                 .c => .c,
                 .spirv => .spirv,
+                .metallib => .metallib,
                 .hex => @panic("TODO implement hex object format"),
                 // This may seem surprising at first, but with a little massaging, the spork8 linker
                 // could and probably should be generalized into a "raw linker" which is used to output
@@ -1426,6 +1446,7 @@ pub const File = struct {
     pub const Elf2 = @import("link/Elf2.zig");
     pub const MachO = @import("link/MachO.zig");
     pub const Spirv = @import("link/Spirv.zig");
+    const Metallib = @import("link/Metallib.zig");
     pub const Wasm = @import("link/Wasm.zig");
     pub const Dwarf = @import("link/Dwarf.zig");
     pub const Dwarf2 = @import("link/Dwarf2.zig");
