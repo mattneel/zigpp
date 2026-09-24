@@ -9,6 +9,9 @@ liveness: Air.Liveness,
 wip: Builder.WipFunction,
 is_naked: bool,
 fuzz: ?Fuzz,
+/// Whether this function is an `air64` kernel, and is therefore checked for the wide floats
+/// that the target cannot have (see `air64CheckFloats`).
+air64_kernel_floats: bool = false,
 
 file: Builder.Metadata,
 scope: Builder.Metadata,
@@ -324,6 +327,13 @@ pub fn genMainBody(fg: *FuncGen) TodoError!void {
     fg.args = args.items;
 
     if (zcu.getTarget().cpu.arch == .air64 and fn_info.cc == .metal_kernel) {
+        // Only a kernel is checked for the wide floats this target cannot have, because only a
+        // kernel is what Apple's compiler compiles as a kernel. A module also carries the routines
+        // of a bundled compiler-rt (and the standard-library functions those reference, such as
+        // `std.math.frexp`), and those contain `f64` and `f80` conversions that no kernel can
+        // call: the AIR pass drops what nothing calls before Apple sees the module, so checking
+        // them would reject every module of this target.
+        fg.air64_kernel_floats = true;
         try fg.recordAirKernel(fn_info);
     }
 
@@ -430,6 +440,16 @@ fn airTypeName(gpa: Allocator, pt: Zcu.PerThread, ty: Type) Allocator.Error![]co
 /// `todo`s in this file.
 fn air64CheckFloats(fg: *FuncGen, inst: Air.Inst.Index) TodoError!void {
     const zcu = fg.object.zcu;
+    // A bundled compiler-rt is a part of every module of this target, and its routines include
+    // conversions of `f64` and `f80` that no kernel can call: the AIR pass drops the routines
+    // that nothing calls (GlobalDCE) before Apple's compiler sees the module, so their f64 never
+    // reaches it. Rejecting them here would reject every module, since the routines are compiled
+    // in whether or not a kernel calls them. A kernel, or a standard-library function that a
+    // kernel calls, still gets the error below.
+    if (zcu.root_mod.deps.get("compiler_rt")) |rt_mod| {
+        const file_scope = zcu.navFileScopeIndex(fg.nav_index);
+        if (zcu.fileByIndex(file_scope).mod == rt_mod) return;
+    }
     const bits = air64WideFloatBits(zcu, fg.typeOfIndex(inst)) orelse return;
     return zcu.codegenFail(fg.nav_index, "type 'f{d}' is not available on the air64 target: " ++
         "Apple GPUs have no double-precision arithmetic and Apple's Metal compiler rejects " ++
@@ -483,7 +503,7 @@ fn genBody(self: *FuncGen, body: []const Air.Inst.Index, coverage_point: Air.Cov
     for (body) |inst| {
         if (self.liveness.isUnused(inst) and !self.air.mustLower(inst, ip)) continue;
 
-        if (zcu.getTarget().cpu.arch == .air64) try self.air64CheckFloats(inst);
+        if (self.air64_kernel_floats) try self.air64CheckFloats(inst);
 
         const val: Builder.Value = switch (air_tags[@backingInt(inst)]) {
             // zig fmt: off
