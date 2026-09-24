@@ -4909,12 +4909,19 @@ pub fn doNotOptimizeAway(val: anytype) void {
         .float => |float| switch (float.bits) {
             else => comptime unreachable,
             16, 80, 128 => doNotOptimizeAway(&val),
-            32, 64 => asm volatile (""
+            // AMDGPU inline assembly has no memory operands.
+            32, 64 => if (builtin.target.cpu.arch == .amdgcn) asm volatile (""
+                :
+                : [_] "r" (val),
+            ) else asm volatile (""
                 :
                 : [_] "rm" (val),
             ),
         },
-        .pointer => asm volatile (""
+        .pointer => if (builtin.target.cpu.arch == .amdgcn) asm volatile (""
+            :
+            : [_] "r" (val),
+            : .{ .memory = true }) else asm volatile (""
             :
             : [_] "m" (val),
             : .{ .memory = true }),

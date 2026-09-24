@@ -2393,8 +2393,10 @@ pub fn supportsAddressSpace(
 
         .global, .local, .shared => is_gpu,
         .private => is_spirv,
+        // AMDGPU reads the dispatch packet and the kernel arguments through pointers into its
+        // constant address space.
         .constant => (is_gpu and (context == null or context == .constant)) or
-            (is_spirv and (context == null or context == .constant or context == .pointer)),
+            ((is_spirv or arch == .amdgcn) and context == .pointer),
         .param => is_nvptx,
         .input, .output, .uniform, .push_constant, .storage_buffer => is_spirv,
         .physical_storage_buffer => arch == .spirv64,
@@ -3058,6 +3060,19 @@ pub fn ptrBitWidth(target: *const Target) u16 {
     return ptrBitWidth_cpu_abi(target.cpu, target.abi);
 }
 
+/// The width of a pointer into `address_space`. It is `ptrBitWidth` except in the address spaces
+/// of AMD GPUs that have 32-bit addresses: the shared memory of a work group, and the private
+/// memory of a work item.
+pub fn ptrBitWidthInAddressSpace(target: *const Target, address_space: std.builtin.AddressSpace) u16 {
+    return switch (target.cpu.arch) {
+        .amdgcn => switch (address_space) {
+            .shared, .local => 32,
+            else => target.ptrBitWidth(),
+        },
+        else => target.ptrBitWidth(),
+    };
+}
+
 pub fn stackAlignment(target: *const Target) u16 {
     // Overrides for when the stack alignment is not equal to the pointer width.
     switch (target.cpu.arch) {
@@ -3481,8 +3496,7 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) ?u16 {
             .char => 8,
             .short, .ushort => 16,
             .int, .uint, .float => 32,
-            .long, .ulong, .longlong, .ulonglong, .double => 64,
-            .longdouble => 128,
+            .long, .ulong, .longlong, .ulonglong, .double, .longdouble => 64,
         },
 
         .opencl, .vulkan => switch (c_type) {

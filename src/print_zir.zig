@@ -524,6 +524,7 @@ const Writer = struct {
             .c_va_start,
             .in_comptime,
             .value_placeholder,
+            .work_group_barrier,
             => try self.writeExtNode(stream, extended),
 
             .builtin_src => {

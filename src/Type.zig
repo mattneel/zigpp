@@ -966,7 +966,11 @@ pub fn abiAlignment(ty: Type, zcu: *const Zcu) Alignment {
             if (int_type.bits == 0) return .@"1";
             return .fromByteUnits(std.zig.target.intAlignment(target, int_type.bits));
         },
-        .ptr_type, .anyframe_type => ptrAbiAlignment(target),
+        .ptr_type => |ptr_type| switch (ptr_type.flags.size) {
+            .slice => sliceAbiAlignment(target, ptr_type.flags.address_space),
+            .one, .many, .c => ptrAbiAlignment(target, ptr_type.flags.address_space),
+        },
+        .anyframe_type => ptrAbiAlignment(target, .generic),
         .array_type => |array_type| Type.fromInterned(array_type.child).abiAlignment(zcu),
         .vector_type => |vector_type| {
             if (vector_type.len == 0) return .@"1";
@@ -1147,10 +1151,10 @@ pub fn abiSize(ty: Type, zcu: *const Zcu) u64 {
     return switch (ip.indexToKey(ty.toIntern())) {
         .int_type => |int_type| std.zig.target.intByteSize(target, int_type.bits),
         .ptr_type => |ptr_type| switch (ptr_type.flags.size) {
-            .slice => ptrAbiSize(target) * 2,
-            .one, .many, .c => ptrAbiSize(target),
+            .slice => sliceAbiSize(target, ptr_type.flags.address_space),
+            .one, .many, .c => ptrAbiSize(target, ptr_type.flags.address_space),
         },
-        .anyframe_type => ptrAbiSize(target),
+        .anyframe_type => ptrAbiSize(target, .generic),
         .array_type => |arr| arr.lenIncludingSentinel() * Type.fromInterned(arr.child).abiSize(zcu),
         .vector_type => |vec| {
             const elem_ty: Type = .fromInterned(vec.child);
@@ -1215,7 +1219,7 @@ pub fn abiSize(ty: Type, zcu: *const Zcu) u64 {
 
             .bool => 1,
             .anyerror, .adhoc_inferred_error_set => errorAbiSize(zcu),
-            .usize, .isize => ptrAbiSize(target),
+            .usize, .isize => ptrAbiSize(target, .generic),
 
             .c_char => target.cTypeByteSize(.char).?,
             .c_short => target.cTypeByteSize(.short).?,
@@ -1306,14 +1310,31 @@ pub fn abiSize(ty: Type, zcu: *const Zcu) u64 {
     };
 }
 
-pub fn ptrAbiAlignment(target: *const Target) Alignment {
+/// The ABI alignment of a pointer into `address_space`.
+pub fn ptrAbiAlignment(target: *const Target, address_space: std.lang.AddressSpace) Alignment {
     // The eZ80 has 24-bit pointers, which aren't exact powers of two, tripping
     // the assert. The alignment of eZ80 pointers is 1, so we bypass the check.
     if (target.cpu.arch == .ez80) return .@"1";
-    return .fromNonzeroByteUnits(@divExact(target.ptrBitWidth(), 8));
+    return .fromNonzeroByteUnits(@divExact(target.ptrBitWidthInAddressSpace(address_space), 8));
 }
-pub fn ptrAbiSize(target: *const Target) u64 {
-    return @divExact(target.ptrBitWidth(), 8);
+/// The ABI size of a pointer into `address_space`, which is smaller than `usize` in the 32-bit
+/// address spaces of AMD GPUs.
+pub fn ptrAbiSize(target: *const Target, address_space: std.lang.AddressSpace) u64 {
+    return @divExact(target.ptrBitWidthInAddressSpace(address_space), 8);
+}
+/// The ABI alignment of a slice of pointers into `address_space`: the larger of the alignments of
+/// its pointer and of its `usize` length.
+pub fn sliceAbiAlignment(target: *const Target, address_space: std.lang.AddressSpace) Alignment {
+    return ptrAbiAlignment(target, address_space).max(ptrAbiAlignment(target, .generic));
+}
+/// The ABI size of a slice of pointers into `address_space`: the pointer, then the `usize` length.
+pub fn sliceAbiSize(target: *const Target, address_space: std.lang.AddressSpace) u64 {
+    return sliceLenOffset(target, address_space) + ptrAbiSize(target, .generic);
+}
+/// The offset of the length of a slice of pointers into `address_space`: the first multiple of the
+/// alignment of `usize` after the pointer.
+pub fn sliceLenOffset(target: *const Target, address_space: std.lang.AddressSpace) u64 {
+    return ptrAbiAlignment(target, .generic).forward(ptrAbiSize(target, address_space));
 }
 pub fn errorAbiAlignment(zcu: *const Zcu) Alignment {
     return .fromNonzeroByteUnits(std.zig.target.intAlignment(zcu.getTarget(), zcu.errorSetBits()));
@@ -1330,7 +1351,15 @@ pub fn bitSize(ty: Type, zcu: *const Zcu) u64 {
         .float => ty.floatBits(zcu.getTarget()),
         .pointer, .optional => {
             assert(ty.isPtrAtRuntime(zcu));
-            return zcu.getTarget().ptrBitWidth();
+            const address_space: std.lang.AddressSpace = switch (zcu.intern_pool.indexToKey(ty.toIntern())) {
+                .ptr_type => |ptr_type| ptr_type.flags.address_space,
+                .opt_type => |child| switch (zcu.intern_pool.indexToKey(child)) {
+                    .ptr_type => |ptr_type| ptr_type.flags.address_space,
+                    else => .generic,
+                },
+                else => .generic,
+            };
+            return zcu.getTarget().ptrBitWidthInAddressSpace(address_space);
         },
         .array, .vector => ty.arrayLenIncludingSentinel(zcu) * ty.childType(zcu).bitSize(zcu),
         else => ty.intInfo(zcu).bits,

@@ -597,6 +597,7 @@ fn genBody(self: *FuncGen, body: []const Air.Inst.Index, coverage_point: Air.Cov
             .work_item_id => try self.airWorkItemId(inst),
             .work_group_size => try self.airWorkGroupSize(inst),
             .work_group_id => try self.airWorkGroupId(inst),
+            .work_group_barrier => try self.airWorkGroupBarrier(),
             .spirv_runtime_array_len => unreachable,
 
             // Instructions that are known to always be `noreturn` based on their tag.
@@ -4053,7 +4054,7 @@ fn buildFloatOp(
         .sqrt,
         .tan,
         .trunc,
-        => if (intrinsicsAllowed(.libc, scalar_ty, target) and !nvptxLacksInstruction(op, target)) return fg.wip.callIntrinsic(fast, .none, switch (op) {
+        => if (intrinsicsAllowed(.libc, scalar_ty, target) and !callsBundledCompilerRt(op, target)) return fg.wip.callIntrinsic(fast, .none, switch (op) {
             .fma => .fma,
             .fmax => .maxnum,
             .fmin => .minnum,
@@ -6639,7 +6640,8 @@ fn airWorkGroupSize(self: *FuncGen, inst: Air.Inst.Index) Allocator.Error!Builde
             // Load the work_group_* member from the struct as u16.
             // Just treat the dispatch pointer as an array of u16 to keep things simple.
             const workgroup_size_ptr = try self.ptraddConst(dispatch_ptr, (2 + dimension) * 2);
-            return self.load(workgroup_size_ptr, .@"2", .u16, .normal);
+            const workgroup_size = try self.load(workgroup_size_ptr, .@"2", .u16, .normal);
+            return self.wip.cast(.zext, workgroup_size, .i32, "");
         },
         .nvptx, .nvptx64 => {
             return self.workIntrinsic(dimension, 1, "nvvm.read.ptx.sreg.ntid");
@@ -6659,6 +6661,28 @@ fn airWorkGroupId(self: *FuncGen, inst: Air.Inst.Index) Allocator.Error!Builder.
         .nvptx, .nvptx64 => self.workIntrinsic(dimension, 0, "nvvm.read.ptx.sreg.ctaid"),
         else => unreachable,
     };
+}
+
+fn airWorkGroupBarrier(self: *FuncGen) Allocator.Error!Builder.Value {
+    const target = self.object.zcu.getTarget();
+    switch (target.cpu.arch) {
+        .amdgcn => {
+            // Like HIP's `__syncthreads`: `s_barrier` only waits for the other waves, so publish the
+            // memory accesses of this work item to the work group before it and make theirs visible
+            // after it.
+            _ = try self.wip.fence(.workgroup, .release);
+            _ = try self.wip.callIntrinsic(.normal, .none, .@"amdgcn.s.barrier", &.{}, &.{}, "");
+            _ = try self.wip.fence(.workgroup, .acquire);
+        },
+        .nvptx, .nvptx64 => {
+            // `bar.sync 0`, which also orders the memory accesses of the CTA.
+            _ = try self.wip.callIntrinsic(.normal, .none, .@"nvvm.barrier.cta.sync.aligned.all", &.{}, &.{
+                try self.object.builder.intValue(.i32, 0),
+            }, "");
+        },
+        else => unreachable,
+    }
+    return .none;
 }
 
 /// Assumes that `Type.optionalReprIsPayload` is `false` for `opt_ty` and that the payload has bits.
@@ -8061,11 +8085,12 @@ fn intrinsicsAllowed(kind: enum { compiler_rt, libc }, scalar_ty: Type, target: 
     };
 }
 
-/// NVPTX has no instructions for these operations, only approximations that LLVM uses for
-/// some of them when fast-math allows it, and LLVM cannot emit library calls for NVPTX.
-/// Call the compiler-rt routines that are bundled into every NVPTX module instead.
-fn nvptxLacksInstruction(comptime op: FloatOp, target: *const std.Target) bool {
-    if (!target.cpu.arch.isNvptx()) return false;
+/// GPUs have no instructions that compute these operations to full precision: LLVM lowers them
+/// to hardware approximations or not at all, and it cannot emit library calls for GPU targets.
+/// Call the compiler-rt routines that are bundled into every GPU module instead (see
+/// `target_util.bundlesCompilerRt`), which also gives the same results as the host.
+fn callsBundledCompilerRt(comptime op: FloatOp, target: *const std.Target) bool {
+    if (!target_util.bundlesCompilerRt(target)) return false;
     return switch (op) {
         .cos, .exp, .exp2, .log, .log10, .log2, .sin, .tan => true,
         else => false,

@@ -6055,6 +6055,19 @@ fn cmpxchgWeakButNotAtomic(comptime T: type, ptr: *T, expected_value: T, new_val
       </p>
       {#header_close#}
 
+      {#header_open|@workGroupBarrier#}
+      <pre>{#syntax#}@workGroupBarrier() void{#endsyntax#}</pre>
+      <p>
+      Waits until every work item of the work group has reached this call. The memory writes that
+      each work item made before the call are visible to every work item of the work group after
+      it. Every work item of the work group must reach the same call; calling it where only some
+      of them go is undefined behavior.
+      </p>
+      <p>
+      Only available on GPU targets. {#syntax#}std.gpu.syncThreads{#endsyntax#} is this builtin.
+      </p>
+      {#header_close#}
+
       {#header_open|@workGroupId#}
       <pre>{#syntax#}@workGroupId(comptime dimension: u32) u32{#endsyntax#}</pre>
       <p>

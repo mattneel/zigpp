@@ -214,6 +214,7 @@ const Writer = struct {
 
             .trap,
             .breakpoint,
+            .work_group_barrier,
             .dbg_empty_stmt,
             .unreach,
             .ret_addr,

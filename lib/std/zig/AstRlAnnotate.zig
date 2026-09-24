@@ -862,6 +862,7 @@ fn builtinCall(astrl: *AstRlAnnotate, block: ?*Block, ri: ResultInfo, node: Ast.
         .panic,
         .trap,
         .c_va_start,
+        .work_group_barrier,
         => return false,
         // TODO: this is a workaround for llvm/llvm-project#68409
         // Zig tracking issue: #16876

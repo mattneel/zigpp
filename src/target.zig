@@ -460,11 +460,15 @@ pub fn canBuildLibCompilerRt(target: *const std.Target) enum { no, yes, llvm_onl
     };
 }
 
-/// Whether objects for this target must contain the compiler-rt routines that they call.
-/// NVPTX modules are loaded by the CUDA driver as they are, so no link step can supply
-/// compiler-rt; each module instead compiles in the routines it references.
+/// Whether modules for this target compile in the compiler-rt routines that they call, instead
+/// of linking against a separately built compiler-rt. LLVM cannot emit library calls for GPU
+/// targets, NVPTX modules are loaded by the CUDA driver as they are, and compiler-rt does not
+/// build as a library for AMDGPU (https://github.com/ziglang/zig/issues/23714).
 pub fn bundlesCompilerRt(target: *const std.Target) bool {
-    return target.cpu.arch.isNvptx();
+    return switch (target.cpu.arch) {
+        .nvptx, .nvptx64, .amdgcn => true,
+        else => false,
+    };
 }
 
 pub fn canBuildLibUbsanRt(target: *const std.Target) enum { no, yes, llvm_only, llvm_lld_only } {

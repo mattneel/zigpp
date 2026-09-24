@@ -2460,6 +2460,7 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
             .work_item_id,
             .work_group_size,
             .work_group_id,
+            .work_group_barrier,
             => unreachable,
             .ret, .ret_safe, .ret_load => {
                 const un_op = air_data[@backingInt(air_inst_index)].un_op;

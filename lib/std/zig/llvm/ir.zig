@@ -2245,6 +2245,27 @@ pub const ModuleBlock = struct {
         };
     };
 
+    pub const SyncScopeNamesBlock = struct {
+        pub const id: BlockId = .SYNC_SCOPE_NAMES;
+
+        pub const abbrevs = [_]type{
+            ModuleBlock.SyncScopeNamesBlock.SyncScopeName,
+        };
+
+        pub const Code = enum(u1) {
+            /// NAME: [strchr x N]
+            SYNC_SCOPE_NAME = 1,
+        };
+
+        pub const SyncScopeName = struct {
+            pub const ops = [_]AbbrevOp{
+                .{ .literal = @backingInt(ModuleBlock.SyncScopeNamesBlock.Code.SYNC_SCOPE_NAME) },
+                .{ .array_fixed = 8 },
+            };
+            name: []const u8,
+        };
+    };
+
     pub const MetadataKindBlock = struct {
         pub const id: BlockId = .METADATA_KIND;
 

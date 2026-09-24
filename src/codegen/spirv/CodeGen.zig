@@ -4237,6 +4237,7 @@ fn genInst(cg: *CodeGen, inst: Air.Inst.Index) Error!void {
             .work_item_id => try cg.airWorkItemId(inst),
             .work_group_size => try cg.airWorkGroupSize(inst),
             .work_group_id => try cg.airWorkGroupId(inst),
+            .work_group_barrier => try cg.airWorkGroupBarrier(),
 
             // zig fmt: on
 
@@ -8736,6 +8737,20 @@ fn airWorkGroupId(cg: *CodeGen, inst: Air.Inst.Index) !?Id {
     const pl_op = cg.air.instructions.items(.data)[@backingInt(inst)].pl_op;
     const dimension = pl_op.payload;
     return try cg.builtin3D(.u32, .workgroup_id, dimension, 0);
+}
+
+fn airWorkGroupBarrier(cg: *CodeGen) !?Id {
+    const workgroup = try cg.constInt(.u32, @backingInt(spec.Scope.workgroup));
+    const semantics = try cg.constInt(.u32, @as(Word, @bitCast(spec.MemorySemantics{
+        .acquire_release = true,
+        .workgroup_memory = true,
+    })));
+    try cg.body.emit(cg.gpa, .OpControlBarrier, .{
+        .execution = workgroup,
+        .memory = workgroup,
+        .semantics = semantics,
+    });
+    return null;
 }
 
 const std = @import("std");
