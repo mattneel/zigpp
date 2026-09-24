@@ -300,8 +300,10 @@ pub fn build(b: *std.Build) !void {
             "git",
             "-C", b.fmt("{f}", .{b.root}), // affects the --git-dir argument
             "--git-dir", ".git", // affected by the -C argument
-            "describe", "--match",    "*.*.*", //
-            "--tags",   "--abbrev=9",
+            "describe", "--match", "*.*.*", //
+            // The tags of Zig++ releases name the build they publish, not a base version.
+            "--exclude", "zigpp-*", //
+            "--tags",    "--abbrev=9",
         }, &code, .ignore) catch {
             break :v version_string;
         };
@@ -337,8 +339,9 @@ pub fn build(b: *std.Build) !void {
                     break :v version_string;
                 }
 
-                // The version is reformatted in accordance with the https://semver.org specification.
-                break :v b.fmt("{s}-dev.{s}+{s}", .{ version_string, commit_height, commit_id[1..] });
+                // The version is reformatted in accordance with the https://semver.org specification,
+                // and its build metadata says that this is Zig++.
+                break :v b.fmt("{s}-dev.{s}+zigpp.{s}", .{ version_string, commit_height, commit_id[1..] });
             },
             else => {
                 std.log.warn("unexpected \"git describe\" output: {s}", .{git_describe});
