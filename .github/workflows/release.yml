@@ -41,7 +41,9 @@ jobs:
           path: ~/deps
           key: devkit-x86_64-linux-musl-${{ hashFiles('.github/scripts/devkit.sh') }}
 
-      - name: Build Zig++ from source
+      - name: Build Zig++
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: .github/scripts/bootstrap.sh
 
       - name: Read the version
