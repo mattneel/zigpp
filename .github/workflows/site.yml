@@ -1,0 +1,216 @@
+name: Site
+
+# Publishes https://zigpp.lol: the book in doc/book/, the standard library
+# autodocs under /std/, the language reference at /langref.html, and the
+# download index under /download/.
+#
+# The autodocs and the language reference come from the newest release, so the
+# published documentation matches a released compiler rather than master. Until
+# the first release is published, both are stand-in pages that say so.
+on:
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/site.yml"
+      - ".github/scripts/downloads.py"
+      - "doc/assets/**"
+      - "doc/book/**"
+  pull_request:
+    paths:
+      - ".github/workflows/site.yml"
+      - ".github/scripts/downloads.py"
+      - "doc/assets/**"
+      - "doc/book/**"
+  # A new release changes /std/ and /langref.html, so the site is rebuilt when
+  # the Release workflow finishes on master.
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Pages publishes one site at a time; a run that is queued behind another waits
+# for it rather than replacing it.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  MDBOOK_VERSION: "0.5.4"
+
+jobs:
+  build:
+    name: Build the site
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      # The release artifacts of mdBook are static binaries, and the book's
+      # theme is written against this version.
+      - name: Install mdBook
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSL \
+            "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Every release carries the index.json it was published with. Collecting
+      # them turns into the cumulative index and the Downloads chapter.
+      - name: Collect the index of every release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist-index
+          gh api --paginate "repos/${{ github.repository }}/releases?per_page=100" \
+            --jq '.[] | select(.tag_name | startswith("zigpp-")) | .tag_name' > tags.txt
+          while read -r tag; do
+            url="https://github.com/${{ github.repository }}/releases/download/$tag/index.json"
+            curl -fsSL -o "dist-index/$tag.json" "$url"
+            echo "$tag"
+          done < tags.txt
+
+      - name: Write the download index and the Downloads chapter
+        run: |
+          mkdir -p _site/download
+          python3 .github/scripts/downloads.py \
+            --releases dist-index \
+            --page doc/book/src/downloads.md \
+            --index _site/download/index.json
+
+      # The docs are generated from the newest release, so they describe a
+      # compiler that can be downloaded. With no release yet, there is nothing
+      # to generate them from, and the steps below write stand-ins.
+      - name: Fetch the newest release for its docs
+        id: release
+        run: |
+          if ! jq -e .master _site/download/index.json > /dev/null; then
+            echo "no release yet: the docs will be stand-ins"
+            exit 0
+          fi
+          version=$(jq -r '.master.version' _site/download/index.json)
+          curl -fsSL -o release.tar.xz "$(jq -r '.master["x86_64-linux"].tarball' _site/download/index.json)"
+          echo "$(jq -r '.master["x86_64-linux"].shasum' _site/download/index.json)  release.tar.xz" \
+            | sha256sum -c -
+          mkdir release
+          tar -xJf release.tar.xz -C release
+          dir=$(find release -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "$version from $dir"
+
+      # The same static output that `zig std` serves: index.html, main.js,
+      # main.wasm, and sources.tar.
+      - name: Generate the standard library documentation
+        if: steps.release.outputs.dir != ''
+        run: |
+          "${{ steps.release.outputs.dir }}/zig" build-obj \
+            -fno-emit-bin \
+            -femit-docs="$PWD/_site/std" \
+            --zig-lib-dir "$PWD/${{ steps.release.outputs.dir }}/lib" \
+            "${{ steps.release.outputs.dir }}/lib/std/std.zig"
+
+      # The archives carry the language reference of the release's own
+      # compiler.
+      - name: Take the language reference from that release
+        if: steps.release.outputs.dir != ''
+        run: cp "${{ steps.release.outputs.dir }}/doc/langref.html" _site/langref.html
+
+      - name: Say that the docs come with the first release
+        if: steps.release.outputs.dir == ''
+        run: |
+          mkdir -p _site/std
+          page() {
+            cat > "$1" <<EOF
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>$2 &middot; The Zig++ Book</title>
+          <link rel="icon" href="/favicon.ico" sizes="any">
+          <link rel="icon" type="image/png" href="/favicon-32x32.png" sizes="32x32">
+          <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+          <link rel="manifest" href="/site.webmanifest">
+          <style>
+            :root { color-scheme: light dark; }
+            body {
+              margin: 0;
+              padding: 4rem 1.5rem;
+              font-family: "Open Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+              line-height: 1.6;
+              background: #ffffff;
+              color: #000000;
+            }
+            main { max-width: 40rem; margin: 0 auto; }
+            h1 { border-bottom: 3px solid; border-image: linear-gradient(90deg, #02c8fb, #0250f2 50%, #f714f2) 1; padding-bottom: 0.6rem; }
+            a { color: #0250f2; }
+            .note { color: #5c5c5c; }
+            @media (prefers-color-scheme: dark) {
+              body { background: hsl(226, 23%, 11%); color: #bcbdd0; }
+              a { color: #02c8fb; }
+              .note { color: #a1adb8; }
+            }
+          </style>
+          </head>
+          <body>
+          <main>
+          <h1>$2</h1>
+          <p>$3</p>
+          <p class="note">It is generated from a new release by
+          <a href="https://github.com/${{ github.repository }}/blob/master/.github/workflows/site.yml">the site workflow</a>,
+          which rebuilds this site whenever the
+          <a href="https://github.com/${{ github.repository }}/blob/master/.github/workflows/release.yml">Release workflow</a>
+          publishes one.</p>
+          <p><a href="/">The Zig++ book</a> &middot; <a href="/downloads.html">Downloads</a> &middot;
+          <a href="https://github.com/${{ github.repository }}/releases">Releases</a></p>
+          </main>
+          </body>
+          </html>
+          EOF
+          }
+          page _site/std/index.html "Standard library" \
+            "The standard library documentation is generated from a released compiler, and Zig++ has no release yet."
+          page _site/langref.html "Language reference" \
+            "The language reference is the doc/langref.html of a release archive, and Zig++ has no release yet."
+
+      - name: Build the book
+        run: mdbook build doc/book
+
+      # The book owns the site root. The theme's images, the manifest, and the
+      # custom domain file are not part of the book, so they are copied next to
+      # it; mdBook only copies a theme's favicon.png, and the book links to
+      # these by their names at the root of the site.
+      - name: Assemble the site
+        run: |
+          mkdir -p _site
+          cp -R doc/book/_book/. _site/
+          cp doc/book/theme/*.png doc/book/theme/*.ico doc/book/theme/site.webmanifest _site/
+          echo "zigpp.lol" > _site/CNAME
+          find _site -maxdepth 2 | sort
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v5

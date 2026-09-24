@@ -1,6 +1,11 @@
+![Zig++](doc/assets/zigpp-logo.png)
+
 # Zig++
 
 *Pronounced "zig peepee".*
+
+[zigpp.lol](https://zigpp.lol/) is Zig++'s documentation: installing it, what it
+adds to Zig, GPU programming with `std.gpu`, and how versions and releases work.
 
 Zig++ is to Zig what TypeScript is to JavaScript: a superset that adds the
 features people kept asking for. Every valid Zig program is a valid Zig++
@@ -21,8 +26,8 @@ the compiler was written by upstream Zig contributors.
   [doc/langref/test_private_fields.zig](doc/langref/test_private_fields.zig).
   Upstream closed the [proposal](https://github.com/ziglang/zig/issues/9909) as
   not planned.
-- **LLVM forever**, and a blessed path to PTX: `std.gpu` runs Zig++ and its
-  standard library on NVIDIA GPUs. See [LLVM Is Forever](#llvm-is-forever).
+- **LLVM forever**, and a blessed path to GPUs: `std.gpu` runs Zig++ and its
+  standard library on NVIDIA and AMD GPUs. See [LLVM Is Forever](#llvm-is-forever).
 - **AI in the toolchain.** See [AI Policy](#ai-policy).
 - **Any Zig version, automatically.** A project's `build.zig.zon` can pin the
   exact compiler version it is built with, and `zig` runs that version instead
@@ -31,7 +36,7 @@ the compiler was written by upstream Zig contributors.
 - **A BDFL and one rule: talk about code.** See [Governance](#governance).
 
 **Does Zig++ compile to Zig, the way TypeScript compiles to JavaScript?** No.
-It compiles to machine code, C, WebAssembly, and PTX.
+It compiles to machine code, C, WebAssembly, PTX, and AMD GPU code objects.
 
 **Is Zig++ stable?** Zig++ follows semantic versioning exactly as closely as
 TypeScript does.
@@ -159,6 +164,9 @@ Language proposals are welcome. Zig++ is made of them.
 
 ## Documentation
 
+[zigpp.lol](https://zigpp.lol/) has this book along with the language reference
+and the standard library documentation of the newest release.
+
 If you are looking at this README file in a source tree, please refer to the
 **Release Notes**, **Language Reference**, or **Standard Library
 Documentation** corresponding to the version of Zig that you are using by
@@ -171,8 +179,12 @@ running `zig std`, which will open a browser tab.
 
 ## Installation
 
-Zig++ does not have pre-built binaries yet, so build it from source. The links
-below are for upstream Zig.
+Zig++ publishes a release on every push to master: see
+[zigpp.lol/downloads.html](https://zigpp.lol/downloads.html) for the archives
+and their SHA-256 checksums, and [Installing](https://zigpp.lol/installing.html)
+for the archive layout. To build it yourself, see
+[Building from Source](#building-from-source). The links below are for upstream
+Zig.
 
  * [download a pre-built binary](https://ziglang.org/download/)
  * [install from a package manager](https://ziglang.org/learn/getting-started/#managers)

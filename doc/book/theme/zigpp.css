@@ -1,0 +1,85 @@
+/* Zig++ brand colours, taken from the logo by doc/assets/make-assets.py.
+ *
+ * The dominant colours of the logo are #0250f2 (blue, 9.1%), #f714f2
+ * (magenta, 6.8%), #02c8fb (cyan, 6.7%), #b202f4 (violet, 6.6%), and #02e5fc
+ * (light cyan, 6.2%). Blue is the accent, and the link colours are chosen for
+ * contrast: #0250f2 reads at 6.1:1 on white, and cyan at 9.4:1 on the dark
+ * themes' backgrounds.
+ *
+ * Only the accent variables are set, per theme, so mdbook's light and dark
+ * themes keep their own backgrounds, text, and code colours. This file is
+ * loaded after mdbook's stylesheets, so these rules win. */
+
+:root {
+    --zigpp-blue: #0250f2;
+    --zigpp-cyan: #02c8fb;
+    --zigpp-magenta: #f714f2;
+    --zigpp-violet: #b202f4;
+    --zigpp-gradient: linear-gradient(90deg, var(--zigpp-cyan), var(--zigpp-blue) 50%, var(--zigpp-magenta));
+}
+
+.light,
+html:not(.js) {
+    --links: #0250f2;
+    --sidebar-active: #0250f2;
+}
+
+.rust {
+    --links: #b202f4;
+    --sidebar-active: #b202f4;
+}
+
+.ayu,
+.coal,
+.navy {
+    --links: #02c8fb;
+    --sidebar-active: #02c8fb;
+}
+
+::selection {
+    background: var(--zigpp-blue);
+    color: #ffffff;
+}
+
+/* The book's title in the menu bar carries the logo. The file is copied to the
+ * root of the site by the site workflow, so it is absolute like the other
+ * site-wide assets. */
+#mdbook-menu-bar .menu-title::before {
+    content: "";
+    display: inline-block;
+    width: 22px;
+    height: 22px;
+    margin-right: 7px;
+    vertical-align: -5px;
+    background: url("/logo.png") no-repeat center / contain;
+}
+
+/* Links to the documentation that is not part of the book: the standard
+ * library autodocs and the language reference. Added by theme/zigpp.js under
+ * the table of contents. */
+.zigpp-navigation {
+    margin: 1.25em 10px 1em;
+    padding-top: 0.75em;
+    border-top: 3px solid transparent;
+    border-image: var(--zigpp-gradient) 1;
+    display: flex;
+    flex-direction: column;
+    gap: 0.15em;
+}
+
+.zigpp-navigation-heading {
+    font-size: 0.75em;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    opacity: 0.85;
+}
+
+.zigpp-navigation a {
+    color: var(--links);
+    text-decoration: none;
+}
+
+.zigpp-navigation a:hover {
+    color: var(--sidebar-active);
+    text-decoration: underline;
+}

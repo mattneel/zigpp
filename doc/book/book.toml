@@ -1,0 +1,21 @@
+[book]
+title = "The Zig++ Book"
+authors = ["Matthew Neel"]
+language = "en"
+src = "src"
+description = "What Zig++ adds to Zig, how to install it, GPU programming with std.gpu, and how releases and versions work."
+
+[build]
+# The workflow copies this directory to the root of the published site, so it
+# must not collide with the _site/ directory it assembles.
+build-dir = "_book"
+# A chapter that is missing from src/ is a mistake, not something to create:
+# the workflow generates downloads.md before it builds.
+create-missing = false
+
+[output.html]
+site-url = "/"
+git-repository-url = "https://github.com/mattneel/zigpp"
+edit-url-template = "https://github.com/mattneel/zigpp/edit/master/doc/book/src/{path}"
+additional-css = ["theme/zigpp.css"]
+additional-js = ["theme/zigpp.js"]
