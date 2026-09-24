@@ -1,0 +1,176 @@
+name: Release
+
+# Every push to master publishes a release of that commit for each target, with
+# a download index in the format of ziglang.org's. A pull request that changes
+# the release machinery builds and checks the archives without publishing them.
+on:
+  push:
+    branches: [master]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/scripts/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Releases publish one at a time, in push order.
+concurrency:
+  group: release-${{ github.event.pull_request.number || 'master' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  bootstrap:
+    name: Bootstrap compiler
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install CMake and Ninja
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+
+      - name: Restore the LLVM devkit
+        uses: actions/cache@v6
+        with:
+          path: ~/deps
+          key: devkit-x86_64-linux-musl-${{ hashFiles('ci/x86_64-linux-release.sh') }}
+
+      - name: Build Zig++ from source
+        run: .github/scripts/bootstrap.sh
+
+      - name: Read the version
+        id: version
+        run: echo "version=$(ZIG_LIB_DIR=$PWD/lib build-bootstrap/stage3/bin/zig version)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bootstrap
+          path: build-bootstrap/stage3/bin/zig
+          if-no-files-found: error
+
+  package:
+    name: Package ${{ matrix.target }}
+    needs: bootstrap
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-linux-musl, aarch64-linux-musl, aarch64-macos-none, x86_64-windows-gnu]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: bootstrap
+          path: build-bootstrap/stage3/bin
+
+      - name: Restore the LLVM devkit
+        uses: actions/cache@v6
+        with:
+          path: ~/deps
+          key: devkit-${{ matrix.target }}-${{ hashFiles('ci/x86_64-linux-release.sh') }}
+
+      - name: Build and pack
+        run: |
+          chmod +x build-bootstrap/stage3/bin/zig
+          .github/scripts/package.sh ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/zig-*
+          if-no-files-found: error
+          # The archives are already compressed.
+          compression-level: 0
+
+  check:
+    name: Check ${{ matrix.target }}
+    needs: [bootstrap, package]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: aarch64-macos-none
+            runner: macos-15
+          - target: x86_64-windows-gnu
+            runner: windows-2025
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist
+
+      - name: Unpack
+        shell: bash
+        run: |
+          cd dist
+          for archive in zig-*; do
+            case $archive in
+              *.zip) 7z x -y "$archive" >/dev/null ;;
+              *.tar.xz) tar -xJf "$archive" ;;
+            esac
+          done
+          ls
+
+      - name: Smoke test
+        shell: bash
+        env:
+          VERSION: ${{ needs.bootstrap.outputs.version }}
+        run: .github/scripts/smoke.sh "$(ls -d dist/zig-*/ | head -n 1)" "$VERSION"
+
+  publish:
+    name: Publish
+    needs: [bootstrap, check]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.bootstrap.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      # The tag names the base version without the build metadata: `+` is legal
+      # in a tag, but awkward in URLs. build.zig and CMake ignore zigpp-* tags
+      # when they derive the version. A re-run of a run whose release already
+      # exists replaces its assets, so a publish that failed halfway can be
+      # completed.
+      - name: Publish the release
+        run: |
+          tag="zigpp-${VERSION%%+*}"
+          .github/scripts/index.py dist "$VERSION" "$tag" "${{ github.repository }}"
+          (cd dist && sha256sum zig-* index.json > SHA256SUMS)
+          if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$tag" --repo "${{ github.repository }}" --clobber \
+              dist/zig-* dist/index.json dist/SHA256SUMS
+          else
+            gh release create "$tag" \
+              --repo "${{ github.repository }}" \
+              --target "${{ github.sha }}" \
+              --title "Zig++ $VERSION" \
+              --generate-notes \
+              dist/zig-* dist/index.json dist/SHA256SUMS
+          fi
