@@ -46,8 +46,9 @@ if("${ZIG_VERSION}" STREQUAL "")
     set(RESOLVED_ZIG_VERSION "${ZIG_VERSION_MAJOR}.${ZIG_VERSION_MINOR}.${ZIG_VERSION_PATCH}")
     find_program(GIT_EXE NAMES git NAMES_PER_DIR)
     if(GIT_EXE AND EXISTS "${PROJECT_SOURCE_DIR}/.git")
+        # The tags of Zig++ releases name the build they publish, not a base version.
         execute_process(
-            COMMAND ${GIT_EXE} -C "${PROJECT_SOURCE_DIR}" describe --match *.*.* --tags --abbrev=9
+            COMMAND ${GIT_EXE} -C "${PROJECT_SOURCE_DIR}" describe --match *.*.* --exclude zigpp-* --tags --abbrev=9
             RESULT_VARIABLE EXIT_STATUS
             OUTPUT_VARIABLE GIT_DESCRIBE
             OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -63,14 +64,15 @@ if("${ZIG_VERSION}" STREQUAL "")
             elseif(GIT_DESCRIBE MATCHES "^v?([0-9]+\\.[0-9]+\\.[0-9]+)-([0-9]+)-g(.+)$")
                 # Untagged pre-release. The Zig version is updated to include the number of commits
                 # since the last tagged version and the commit hash. The version is formatted in
-                # accordance with the https://semver.org specification.
+                # accordance with the https://semver.org specification, and its build metadata
+                # says that this is Zig++.
                 set(GIT_TAG ${CMAKE_MATCH_1})
                 set(GIT_COMMITS_AFTER_TAG ${CMAKE_MATCH_2})
                 set(GIT_COMMIT ${CMAKE_MATCH_3})
                 if(NOT RESOLVED_ZIG_VERSION VERSION_GREATER GIT_TAG)
                     message(SEND_ERROR "Zig version (${RESOLVED_ZIG_VERSION}) must be greater than tagged ancestor (${GIT_TAG}).")
                 endif()
-                set(RESOLVED_ZIG_VERSION "${RESOLVED_ZIG_VERSION}-dev.${GIT_COMMITS_AFTER_TAG}+${GIT_COMMIT}")
+                set(RESOLVED_ZIG_VERSION "${RESOLVED_ZIG_VERSION}-dev.${GIT_COMMITS_AFTER_TAG}+zigpp.${GIT_COMMIT}")
             else()
                 message(WARNING "Failed to parse version from output of `git describe`.")
             endif()
