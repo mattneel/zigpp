@@ -53,6 +53,18 @@ jobs:
       - name: Run the behavior tests
         run: build-bootstrap/stage3/bin/zig test test/behavior.zig
 
+      # Debug builds for x86_64 Linux use the self-hosted back end unless -fllvm
+      # asks for LLVM, which release builds and most other targets use.
+      - name: Test the standard library with LLVM
+        run: build-bootstrap/stage3/bin/zig test lib/std/std.zig -lc -fllvm
+
+      - name: Run the behavior tests with LLVM
+        run: build-bootstrap/stage3/bin/zig test test/behavior.zig -fllvm
+
+      # Zig++ against C that the Clang in Zig++ compiled.
+      - name: Run the C ABI tests
+        run: build-bootstrap/stage3/bin/zig build test-c-abi -Dskip-non-native -Dskip-release
+
       # -Denable-llvm adds the cases that compile with the LLVM backend, which
       # the bootstrap compiler has.
       - name: Run the compiler test cases
