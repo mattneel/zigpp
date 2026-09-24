@@ -18,3 +18,9 @@ zig-out/
 /docgen_tmp/
 /dist/
 /smoke-test/
+
+# The site: the workflow assembles _site/, mdbook builds doc/book/_book/, and
+# the Python scripts under .github/scripts/ leave bytecode beside themselves.
+/_site/
+/doc/book/_book/
+__pycache__/
