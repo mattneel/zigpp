@@ -1,0 +1,37 @@
+name: metal-probe
+
+on:
+  push:
+    branches: [metal-probe]
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-14, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: .github/metal-probe
+      - name: Hardware
+        run: |
+          uname -m
+          sw_vers
+          sysctl -n machdep.cpu.brand_string
+          sysctl -n hw.model hw.ncpu hw.memsize
+          system_profiler SPDisplaysDataType
+      - name: Offline Metal toolchain
+        run: |
+          xcode-select -p
+          xcrun --sdk macosx --find metal || true
+          xcrun --sdk macosx metal --version || echo "the offline Metal compiler is not installed"
+      - name: Metal compute
+        run: |
+          swiftc -O .github/metal-probe/probe.swift -o probe
+          ./probe
