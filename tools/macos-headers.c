@@ -190,6 +190,7 @@
 #include <libkern/OSTypes.h>
 #include <MacTypes.h>
 #include <os/lock.h>
+#include <os/os_sync_wait_on_address.h> // Used by libc++ when targeting macOS 14.4 or later
 #include <simd/simd.h>
 #include <xpc/xpc.h>
 #include <CommonCrypto/CommonCrypto.h>
