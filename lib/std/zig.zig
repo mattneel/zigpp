@@ -56,6 +56,7 @@ pub const c_translation = struct {
 
 pub const default_local_zig_cache_basename = ".zig-cache";
 pub const build_zig_basename = "build.zig";
+pub const build_zig_zon_basename = "build.zig.zon";
 
 pub const SrcHasher = std.crypto.hash.Blake3;
 pub const SrcHash = [16]u8;
@@ -846,6 +847,11 @@ pub const EnvVar = enum {
     ZIG_DEBUG_CMD,
     ZIG_IS_DETECTING_LIBC_PATHS,
     ZIG_IS_AVOIDING_CALLING_ITSELF,
+    /// Set to "off" to run the `zig` that was invoked instead of the exact
+    /// version that the enclosing project's build.zig.zon pins. `zig any`
+    /// sets it for the version it runs, so that the compiler that was asked
+    /// for by name does not dispatch to the project's pin instead.
+    ZIG_ANY,
 
     // C toolchain integration
     NIX_CFLAGS_COMPILE,

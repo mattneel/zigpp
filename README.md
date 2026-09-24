@@ -24,6 +24,10 @@ the compiler was written by upstream Zig contributors.
 - **LLVM forever**, and a blessed path to PTX: `std.gpu` runs Zig++ and its
   standard library on NVIDIA GPUs. See [LLVM Is Forever](#llvm-is-forever).
 - **AI in the toolchain.** See [AI Policy](#ai-policy).
+- **Any Zig version, automatically.** A project's `build.zig.zon` can pin the
+  exact compiler version it is built with, and `zig` runs that version instead
+  of itself, downloading it on first use. See
+  [Any Zig Version](#any-zig-version).
 - **A BDFL and one rule: talk about code.** See [Governance](#governance).
 
 **Does Zig++ compile to Zig, the way TypeScript compiles to JavaScript?** No.
@@ -191,6 +195,56 @@ relative to itself:
 In other words, you can **unpack a release of Zig anywhere**, and then begin
 using it immediately. There is no need to install it globally, although this
 mechanism supports that use case too (i.e. `/usr/bin/zig` and `/usr/lib/zig/`).
+
+## Any Zig Version
+
+A project can pin the exact compiler version it is built with:
+
+```zig
+// build.zig.zon
+.minimum_zig_version = "0.15.1",
+```
+
+When it does, any `zig` command in that project runs that version instead of
+the `zig` that was invoked. `zig init` writes the version that created the
+project, so a new project keeps building with the compiler that made it.
+
+The version names the exact compiler, so it can be a Zig++ release
+(`0.17.0-dev.2361+zigpp.5b96e6d21`), an upstream Zig release (`0.15.1`), or an
+upstream dev build (`0.16.0-dev.1234+abcdef012`). Zig++ downloads it into
+`<global cache>/any/<version>/` the first time it is needed, verifies it,
+unpacks it there, and runs it with the same arguments. An install is never
+visible half-finished, and concurrent `zig` invocations that need the same
+version end up with one install of it.
+
+An upstream Zig release is verified against the SHA-256 of the upstream
+download index, and every upstream archive against the minisign signature that
+ziglang.org publishes next to it, which is signed with the Zig Software
+Foundation's key. Zig++ releases are verified against the SHA-256 of their
+GitHub release index.
+
+ziglang.org keeps only the recent dev builds, so an archive it no longer has
+-- an older dev build that a project pins, say -- is downloaded from the
+[community mirrors](https://ziglang.org/download/community-mirrors.txt), whose
+copy has to pass the same signature check.
+
+Run a version explicitly, list what is installed, or turn the dispatch off:
+
+```sh
+zig any 0.15.1 version   # run that exact version
+zig any list             # installed versions, one per line
+ZIG_ANY=off zig version  # always the zig that was invoked
+```
+
+`zig any <version>` runs the version that was asked for, whatever the enclosing
+project pins: the compiler it starts is told with `ZIG_ANY=off` not to dispatch
+to the project's pin.
+
+Installed versions live in `<global cache>/any/`, the `global_cache_dir` that
+`zig env` reports. Zig++ releases come from
+[github.com/mattneel/zigpp](https://github.com/mattneel/zigpp); upstream
+versions come from [ziglang.org](https://ziglang.org/download), and from the
+community mirrors when ziglang.org no longer has them.
 
 ## Building from Source
 
