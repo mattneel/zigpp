@@ -3789,6 +3789,7 @@ pub const Intrinsic = enum {
     @"amdgcn.workgroup.id.y",
     @"amdgcn.workgroup.id.z",
     @"amdgcn.dispatch.ptr",
+    @"amdgcn.s.barrier",
 
     // NVPTX
     @"nvvm.read.ptx.sreg.tid.x",
@@ -3800,6 +3801,7 @@ pub const Intrinsic = enum {
     @"nvvm.read.ptx.sreg.ctaid.x",
     @"nvvm.read.ptx.sreg.ctaid.y",
     @"nvvm.read.ptx.sreg.ctaid.z",
+    @"nvvm.barrier.cta.sync.aligned.all",
 
     // WebAssembly
     @"wasm.memory.size",
@@ -5102,6 +5104,11 @@ pub const Intrinsic = enum {
             },
             .attrs = &.{ .nocallback, .nofree, .nosync, .nounwind, .speculatable, .willreturn, .{ .memory = .all(.none) } },
         },
+        .@"amdgcn.s.barrier" = .{
+            .ret_len = 0,
+            .params = &.{},
+            .attrs = &.{ .convergent, .nocallback, .nofree, .nounwind, .willreturn },
+        },
 
         .@"nvvm.read.ptx.sreg.tid.x" = .{
             .ret_len = 1,
@@ -5167,6 +5174,14 @@ pub const Intrinsic = enum {
                 .{ .kind = .{ .type = .i32 } },
             },
             .attrs = &.{ .nounwind, .readnone },
+        },
+
+        .@"nvvm.barrier.cta.sync.aligned.all" = .{
+            .ret_len = 0,
+            .params = &.{
+                .{ .kind = .{ .type = .i32 } },
+            },
+            .attrs = &.{ .convergent, .nocallback, .nounwind },
         },
 
         .@"wasm.memory.size" = .{
@@ -8249,9 +8264,21 @@ pub const MemoryAccessKind = enum(u1) {
     }
 };
 
-pub const SyncScope = enum(u1) {
+/// The value of each tag is its ID in the synchronization scope names that the bitcode lists, and
+/// `name` is its name in LLVM.
+pub const SyncScope = enum(u2) {
     singlethread,
     system,
+    /// The threads of an AMDGPU work group.
+    workgroup,
+
+    pub fn name(sync_scope: SyncScope) []const u8 {
+        return switch (sync_scope) {
+            .singlethread => "singlethread",
+            .system => "",
+            .workgroup => "workgroup",
+        };
+    }
 
     pub fn format(sync_scope: SyncScope, w: *Writer) Writer.Error!void {
         return Prefixed.format(.{ .sync_scope = sync_scope, .prefix = "" }, w);
@@ -8262,13 +8289,8 @@ pub const SyncScope = enum(u1) {
         prefix: []const u8,
 
         pub fn format(p: Prefixed, w: *Writer) Writer.Error!void {
-            switch (p.sync_scope) {
-                .system => return,
-                .singlethread => {
-                    var vecs: [2][]const u8 = .{ p.prefix, "syncscope(\"singlethread\")" };
-                    return w.writeVecAll(&vecs);
-                },
-            }
+            if (p.sync_scope == .system) return;
+            try w.print("{s}syncscope(\"{s}\")", .{ p.prefix, p.sync_scope.name() });
         }
     };
 
@@ -8317,7 +8339,7 @@ const MemoryAccessInfo = packed struct(u32) {
     success_ordering: AtomicOrdering,
     failure_ordering: AtomicOrdering = .none,
     alignment: Alignment = .default,
-    _: u13 = undefined,
+    _: u12 = undefined,
 };
 
 pub const FastMath = packed struct(u8) {
@@ -15790,6 +15812,21 @@ pub fn toBitcode(self: *Builder, allocator: Allocator, producer: Producer) bitco
             });
 
             try operand_bundle_tags_block.end();
+        }
+
+        // SYNC_SCOPE_NAMES_BLOCK
+        {
+            const SyncScopeNamesBlock = ir.ModuleBlock.SyncScopeNamesBlock;
+            var sync_scope_names_block = try module_block.enterSubBlock(SyncScopeNamesBlock, true);
+
+            // The reader numbers the names in order, which must match the tags of `SyncScope`.
+            for (std.enums.values(SyncScope)) |sync_scope| {
+                try sync_scope_names_block.writeAbbrev(SyncScopeNamesBlock.SyncScopeName{
+                    .name = sync_scope.name(),
+                });
+            }
+
+            try sync_scope_names_block.end();
         }
 
         // Block info

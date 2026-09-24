@@ -68,6 +68,7 @@ fn verifyBody(self: *Verify, body: []const Air.Inst.Index) Error!void {
             .work_item_id,
             .work_group_size,
             .work_group_id,
+            .work_group_barrier,
             => try self.verifyInstOperands(inst, .{ .none, .none, .none }),
 
             .trap, .unreach => {

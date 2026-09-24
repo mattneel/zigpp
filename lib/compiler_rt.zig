@@ -30,15 +30,22 @@ pub inline fn symbol(comptime func: *const anyopaque, comptime name: []const u8)
 /// provided by system/dynamic libc. Eventually we should be more disciplined about this on a
 /// per-symbol, per-target basis: https://github.com/ziglang/zig/issues/11883
 ///
-/// NVPTX code is never linked against a separate compiler-rt: the compiler bundles compiler-rt
-/// into every NVPTX module, and each routine is only needed by callers in that same module.
+/// GPU code is never linked against a separate compiler-rt: the compiler bundles compiler-rt into
+/// every NVPTX and AMDGPU module, and each routine is only needed by callers in that same module.
 /// Internal linkage lets the unused routines be discarded before code generation.
-pub const linkage: std.builtin.GlobalLinkage = if (builtin.is_test or builtin.cpu.arch.isNvptx())
+pub const linkage: std.builtin.GlobalLinkage = if (builtin.is_test or bundled)
     .internal
 else if (ofmt_c)
     .strong
 else
     .weak;
+
+/// Whether this compiler-rt is compiled into a GPU module, which must match
+/// `bundlesCompilerRt` in the compiler.
+const bundled = switch (builtin.cpu.arch) {
+    .nvptx, .nvptx64, .amdgcn => true,
+    else => false,
+};
 
 /// Determines the symbol's visibility to other objects.
 /// For WebAssembly this allows the symbol to be resolved to other modules, but will not

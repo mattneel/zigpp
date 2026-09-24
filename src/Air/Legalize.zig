@@ -1026,6 +1026,7 @@ fn legalizeBody(l: *Legalize, body_start: usize, body_len: usize) Error!void {
             .work_item_id,
             .work_group_size,
             .work_group_id,
+            .work_group_barrier,
             .legalize_vec_elem_val,
             .legalize_vec_store_elem,
             .legalize_compiler_rt_call,

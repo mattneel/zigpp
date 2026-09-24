@@ -2,11 +2,13 @@
 //! plus kernels that cover the parts of `std.gpu` and the standard library that the port to
 //! `std.gpu` adds.
 //!
-//! `main.zig` compiles this file to PTX assembly twice, with `.debug` and with `.fast`, and runs
-//! every kernel of both images on a GPU through `std.gpu.cuda`. The host compares the results
-//! against values computed here in the test process.
+//! `build.zig` compiles this file twice for each GPU vendor, with `.debug` and with `.fast`: to
+//! PTX assembly, which `main.zig` runs through `std.gpu.cuda`, and to AMD code objects, which it
+//! runs through `std.gpu.hip`. The host compares the results against values computed in the test
+//! process.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const gpu = std.gpu;
 const allocators = gpu.allocators;
 
@@ -203,8 +205,9 @@ export fn warpMinKernel(input: [*]const u32, output: [*]u32, n: u32) callconv(.k
 }
 
 /// Writes the mask of the threads of every warp whose element is above 100, with the bit of a
-/// lane set when its element is above 100: one mask per warp, in `output`.
-export fn ballotKernel(input: [*]const u32, output: [*]u32, n: u32) callconv(.kernel) void {
+/// lane set when its element is above 100: one mask per warp, in `output`, which has room for
+/// the masks of warps of up to 64 threads.
+export fn ballotKernel(input: [*]const u32, output: [*]u64, n: u32) callconv(.kernel) void {
     const mask = gpu.ballot(warpLoad(input, gpu.globalId(.x), n) > 100);
     if (gpu.laneId() == 0) output[warpId()] = mask;
 }
@@ -1346,10 +1349,11 @@ export fn parseFloatKernel(
 const device_heap_list_len = 500;
 
 /// Grows a list of `u64` on the device heap of the driver, with `std.gpu.allocators.device_heap`,
-/// and writes its length and the sum of its elements, then allocates memory aligned to 128 bytes,
+/// and writes its length and the sum of its elements, then allocates memory aligned to 64 bytes,
 /// which is more than the alignment of the heap blocks, fills it, and writes whether it came back
-/// intact from the allocator.
-export fn deviceHeapKernel(list_len: *u32, list_sum: *u64, aligned_ok: *u32) callconv(.kernel) void {
+/// intact from the allocator. Only the CUDA driver has a device heap, so only the PTX images have
+/// this kernel.
+fn deviceHeapKernel(list_len: *u32, list_sum: *u64, aligned_ok: *u32) callconv(.kernel) void {
     if (gpu.globalId(.x) != 0) return;
     const allocator = allocators.device_heap;
 
@@ -1381,6 +1385,10 @@ export fn deviceHeapKernel(list_len: *u32, list_sum: *u64, aligned_ok: *u32) cal
         if (byte != @as(u8, @truncate(index * 7))) intact = false;
     }
     aligned_ok.* = @intFromBool(intact and @intFromPtr(aligned.ptr) % 64 == 0);
+}
+
+comptime {
+    if (builtin.cpu.arch.isNvptx()) @export(&deviceHeapKernel, .{ .name = "deviceHeapKernel" });
 }
 
 const bump_heap_size = 8 * 1024;

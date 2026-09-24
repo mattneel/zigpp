@@ -693,7 +693,7 @@ fn lowerPtr(
                     assert(base_ty.isSlice(zcu));
                     break :off switch (field.index) {
                         Value.slice_ptr_index => 0,
-                        Value.slice_len_index => @divExact(zcu.getTarget().ptrBitWidth(), 8),
+                        Value.slice_len_index => Type.sliceLenOffset(zcu.getTarget(), base_ty.ptrAddressSpace(zcu)),
                         else => unreachable,
                     };
                 },

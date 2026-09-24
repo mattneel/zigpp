@@ -598,7 +598,10 @@ pub const Object = struct {
         const optimize_mode = comp.root_mod.optimize_mode;
 
         const opt_level: bindings.CodeGenOptLevel = if (optimize_mode == .debug)
-            .None
+            // The fast register allocator of LLVM's unoptimized AMDGPU code generation miscompiles
+            // divergent loops: the lanes that leave a loop early see clobbered registers. Debug
+            // builds keep their unoptimized IR either way.
+            if (comp.root_mod.resolved_target.result.cpu.arch == .amdgcn) .Less else .None
         else
             .Aggressive;
 
@@ -639,11 +642,11 @@ pub const Object = struct {
         );
         errdefer target_machine.dispose();
 
-        if (comp.root_mod.resolved_target.result.cpu.arch.isNvptx()) {
-            // compiler-rt is bundled into NVPTX modules with internal linkage (see
+        if (target_util.bundlesCompilerRt(&comp.root_mod.resolved_target.result)) {
+            // compiler-rt is bundled into GPU modules with internal linkage (see
             // `target_util.bundlesCompilerRt`). Discard the routines that this module does not
             // reference before code generation, including in Debug mode: LLVM cannot lower some
-            // of them for NVPTX, and the CUDA driver would have to compile all of them.
+            // of them for GPUs, and the driver would have to compile all of them.
             const pass_options: *bindings.PassBuilderOptions = .create();
             defer pass_options.dispose();
             if (module.runPasses("globaldce", target_machine, pass_options)) |err| {
@@ -1518,10 +1521,13 @@ pub const Object = struct {
             },
 
             .pointer => {
-                const ptr_size = Type.ptrAbiSize(zcu.getTarget());
-                const ptr_align = Type.ptrAbiAlignment(zcu.getTarget());
+                const address_space = ty.ptrAddressSpace(zcu);
+                const ptr_size = Type.ptrAbiSize(target, address_space);
+                const ptr_align = Type.ptrAbiAlignment(target, address_space);
 
                 if (ty.isSlice(zcu)) {
+                    const len_size = Type.ptrAbiSize(target, .generic);
+                    const len_align = Type.ptrAbiAlignment(target, .generic);
                     const debug_ptr_type = try o.builder.debugMemberType(
                         try o.builder.metadataString("ptr"),
                         null, // file
@@ -1539,9 +1545,9 @@ pub const Object = struct {
                         ty_fwd_ref,
                         0, // line
                         try o.getDebugType(pt, .usize),
-                        ptr_size * 8,
-                        ptr_align.toByteUnits().? * 8,
-                        ptr_size * 8,
+                        len_size * 8,
+                        len_align.toByteUnits().? * 8,
+                        Type.sliceLenOffset(target, address_space) * 8,
                     );
 
                     return o.builder.debugStructType(
@@ -1550,8 +1556,8 @@ pub const Object = struct {
                         o.debug_compile_unit.unwrap().?, // scope
                         0, // line
                         null, // underlying type
-                        ptr_size * 2 * 8,
-                        ptr_align.toByteUnits().? * 8,
+                        Type.sliceAbiSize(target, address_space) * 8,
+                        Type.sliceAbiAlignment(target, address_space).toByteUnits().? * 8,
                         try o.builder.metadataTuple(&.{
                             debug_ptr_type,
                             debug_len_type,
@@ -3848,7 +3854,7 @@ pub const Object = struct {
                         assert(agg_ty.isSlice(zcu));
                         break :off switch (field.index) {
                             Value.slice_ptr_index => 0,
-                            Value.slice_len_index => @divExact(zcu.getTarget().ptrBitWidth(), 8),
+                            Value.slice_len_index => Type.sliceLenOffset(zcu.getTarget(), agg_ty.ptrAddressSpace(zcu)),
                             else => unreachable,
                         };
                     },

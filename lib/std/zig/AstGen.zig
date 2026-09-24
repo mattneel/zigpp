@@ -2896,6 +2896,7 @@ fn addEnsureResult(gz: *GenZir, maybe_unused_result: Zir.Inst.Ref, statement: As
                 .disable_intrinsics,
                 .set_float_mode,
                 .branch_hint,
+                .work_group_barrier,
                 => break :b true,
                 else => break :b false,
             },
@@ -9212,6 +9213,7 @@ fn builtinCall(
         .breakpoint              => return rvalue(gz, ri, try gz.addNodeExtended(.breakpoint,              node), node),
         .disable_instrumentation => return rvalue(gz, ri, try gz.addNodeExtended(.disable_instrumentation, node), node),
         .disable_intrinsics      => return rvalue(gz, ri, try gz.addNodeExtended(.disable_intrinsics,      node), node),
+        .work_group_barrier      => return rvalue(gz, ri, try gz.addNodeExtended(.work_group_barrier,      node), node),
 
         .type_info   => return simpleUnOpType(gz, scope, ri, node, params[0], .type_info),
         .size_of     => return simpleUnOpType(gz, scope, ri, node, params[0], .size_of),

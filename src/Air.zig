@@ -999,6 +999,11 @@ pub const Inst = struct {
         /// Uses the `pl_op` field, payload is the dimension to get the work group id for.
         /// Operand is unused and set to Ref.none
         work_group_id,
+        /// Waits until every work item of the work group has reached this instruction, with the
+        /// memory accesses before and after it ordered for the whole group. Implements
+        /// @workGroupBarrier. Result type is always void.
+        /// Uses the `no_op` field.
+        work_group_barrier,
 
         // The remaining instructions are not emitted by Sema. They are only emitted by `Legalize`,
         // depending on the enabled features. As such, backends can consider them `unreachable` if
@@ -1798,6 +1803,7 @@ pub fn typeOfIndex(air: *const Air, inst: Air.Inst.Index, ip: *const InternPool)
         => return .noreturn,
 
         .breakpoint,
+        .work_group_barrier,
         .dbg_stmt,
         .dbg_empty_stmt,
         .dbg_var_ptr,
@@ -1937,6 +1943,7 @@ pub fn mustLower(air: Air, inst: Air.Inst.Index, ip: *const InternPool) bool {
         .br,
         .trap,
         .breakpoint,
+        .work_group_barrier,
         .call,
         .call_always_tail,
         .call_never_tail,

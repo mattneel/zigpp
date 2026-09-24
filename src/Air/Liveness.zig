@@ -481,6 +481,7 @@ fn analyzeInst(
         .work_item_id,
         .work_group_size,
         .work_group_id,
+        .work_group_barrier,
         => return analyzeOperands(a, pass, data, inst, .{ .none, .none, .none }),
 
         .inferred_alloc, .inferred_alloc_comptime => unreachable,

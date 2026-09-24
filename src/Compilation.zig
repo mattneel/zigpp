@@ -1785,6 +1785,8 @@ pub fn create(gpa: Allocator, arena: Allocator, io: Io, diag: *CreateDiagnostic,
             if (options.skip_linker_dependencies) break :s .none;
             const want = options.want_compiler_rt orelse (is_exe_or_dyn_lib or target_util.bundlesCompilerRt(target));
             if (!want) break :s .none;
+            // These targets compile compiler-rt into the module itself; see `bundlesCompilerRt`.
+            if (target_util.bundlesCompilerRt(target)) break :s if (have_zcu and use_llvm) .zcu else .none;
             const need_llvm = switch (target_util.canBuildLibCompilerRt(target)) {
                 .no => break :s .none, // impossible to build
                 .yes => false,

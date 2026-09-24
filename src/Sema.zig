@@ -1437,6 +1437,11 @@ fn analyzeBodyInner(
                         i += 1;
                         continue;
                     },
+                    .work_group_barrier => {
+                        try sema.zirWorkGroupBarrier(block, extended);
+                        i += 1;
+                        continue;
+                    },
                     .disable_instrumentation => {
                         try sema.zirDisableInstrumentation();
                         i += 1;
@@ -5231,6 +5236,18 @@ fn zirBreakpoint(sema: *Sema, block: *Block, extended: Zir.Inst.Extended.InstDat
     if (block.isComptime())
         return sema.fail(block, src, "encountered @breakpoint at comptime", .{});
     _ = try block.addNoOp(.breakpoint);
+}
+
+fn zirWorkGroupBarrier(sema: *Sema, block: *Block, extended: Zir.Inst.Extended.InstData) CompileError!void {
+    const src_node: std.zig.Ast.Node.Offset = @fromBackingInt(@intCast(@as(i32, @bitCast(extended.operand))));
+    const src = block.nodeOffset(src_node);
+    const target = sema.pt.zcu.getTarget();
+    switch (target.cpu.arch) {
+        .amdgcn, .spirv64, .spirv32, .nvptx, .nvptx64 => {},
+        else => return sema.fail(block, src, "builtin only available on GPU targets; targeted architecture is {s}", .{@tagName(target.cpu.arch)}),
+    }
+    try sema.requireRuntimeBlock(block, src, null);
+    _ = try block.addNoOp(.work_group_barrier);
 }
 
 fn zirLoop(sema: *Sema, parent_block: *Block, inst: Zir.Inst.Index) CompileError!Air.Inst.Ref {

@@ -1943,6 +1943,7 @@ fn genInst(cg: *CodeGen, inst: Air.Inst.Index) InnerError!void {
         .work_item_id,
         .work_group_size,
         .work_group_id,
+        .work_group_barrier,
         .spirv_runtime_array_len,
         => unreachable,
     };

@@ -1632,6 +1632,7 @@ pub const Inst = struct {
                     .breakpoint,
                     .disable_instrumentation,
                     .disable_intrinsics,
+                    .work_group_barrier,
                     => true,
                     else => false,
                 },
@@ -2136,6 +2137,9 @@ pub const Inst = struct {
         /// Implements the `@workGroupId` builtin.
         /// `operand` is payload index to `UnNode`.
         work_group_id,
+        /// Implements the `@workGroupBarrier` builtin.
+        /// `operand` is `src_node: Ast.Node.Offset`.
+        work_group_barrier,
         /// Implements the `@inComptime` builtin.
         /// `operand` is `src_node: Ast.Node.Offset`.
         in_comptime,
@@ -4433,6 +4437,7 @@ fn findTrackableInner(
                 .work_item_id,
                 .work_group_size,
                 .work_group_id,
+                .work_group_barrier,
                 .in_comptime,
                 .restore_err_ret_index,
                 .closure_get,

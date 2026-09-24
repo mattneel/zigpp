@@ -125,9 +125,13 @@ pub fn BumpAllocator(comptime size: usize) type {
         }
 
         /// The offset lives in the first suitably aligned bytes of the buffer, since the buffer
-        /// itself may have any alignment.
+        /// itself may have any alignment. The pointer comes from indexing rather than from
+        /// `@ptrFromInt`, because shared memory starts at address 0 on AMD GPUs, where the first
+        /// shared variable is, and address 0 is not a valid pointer to Zig.
         fn offsetPtr(self: Self) *addrspace(.shared) Offset {
-            return @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(self.buffer), @alignOf(Offset)));
+            const address = @intFromPtr(self.buffer);
+            const padding = std.mem.alignForward(usize, address, @alignOf(Offset)) - address;
+            return @ptrCast(@alignCast(&self.buffer[padding]));
         }
 
         /// `buffer` in the generic address space, which the allocations are returned in.
