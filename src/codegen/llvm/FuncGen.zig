@@ -9,9 +9,13 @@ liveness: Air.Liveness,
 wip: Builder.WipFunction,
 is_naked: bool,
 fuzz: ?Fuzz,
-/// Whether this function is an `air64` kernel, and is therefore checked for the wide floats
-/// that the target cannot have (see `air64CheckFloats`).
-air64_kernel_floats: bool = false,
+/// Whether this function is an `air64` kernel. The restrictions of the target — no wide floats,
+/// no atomic on a pointer without an address space, no ordering stronger than `.monotonic` — are
+/// the restrictions of a *kernel*, and apply only here: a module of this target also carries the
+/// routines of a bundled compiler-rt, whose generic-pointer atomics and `f64`/`f80` conversions
+/// no kernel can call, and which the AIR pass drops (GlobalDCE) before Apple's compiler sees the
+/// module. Applying them to everything rejected every module.
+air64_kernel: bool = false,
 
 file: Builder.Metadata,
 scope: Builder.Metadata,
@@ -333,7 +337,7 @@ pub fn genMainBody(fg: *FuncGen) TodoError!void {
         // `std.math.frexp`), and those contain `f64` and `f80` conversions that no kernel can
         // call: the AIR pass drops what nothing calls before Apple sees the module, so checking
         // them would reject every module of this target.
-        fg.air64_kernel_floats = true;
+        fg.air64_kernel = true;
         try fg.recordAirKernel(fn_info);
     }
 
@@ -503,7 +507,7 @@ fn genBody(self: *FuncGen, body: []const Air.Inst.Index, coverage_point: Air.Cov
     for (body) |inst| {
         if (self.liveness.isUnused(inst) and !self.air.mustLower(inst, ip)) continue;
 
-        if (self.air64_kernel_floats) try self.air64CheckFloats(inst);
+        if (self.air64_kernel) try self.air64CheckFloats(inst);
 
         const val: Builder.Value = switch (air_tags[@backingInt(inst)]) {
             // zig fmt: off
@@ -5524,7 +5528,7 @@ fn airCmpxchg(
 
     self.maybeMarkAllowZeroAccess(ptr_ty.ptrInfo(zcu));
 
-    if (zcu.getTarget().cpu.arch == .air64) {
+    if (self.air64_kernel) {
         // AIR has no `cmpxchg` instruction: Zig's compare-exchange is a call to Apple's
         // `air.atomic.*.cmpxchg.weak`, which takes the expected value by pointer and updates it
         // (doc/proposals/metal.md section 2.6). AIR has only the weak form, and Apple's
@@ -5912,7 +5916,7 @@ fn air64Cmpxchg(
 fn airAtomicRmw(self: *FuncGen, inst: Air.Inst.Index) TodoError!Builder.Value {
     const o = self.object;
     const zcu = o.zcu;
-    if (zcu.getTarget().cpu.arch == .air64) return self.air64AtomicRmw(inst);
+    if (self.air64_kernel) return self.air64AtomicRmw(inst);
     const pl_op = self.air.instructions.items(.data)[@backingInt(inst)].pl_op;
     const extra = self.air.extraData(Air.AtomicRmw, pl_op.payload).data;
     const ptr = try self.resolveInst(pl_op.operand);
@@ -5978,7 +5982,7 @@ fn airAtomicRmw(self: *FuncGen, inst: Air.Inst.Index) TodoError!Builder.Value {
 fn airAtomicLoad(self: *FuncGen, inst: Air.Inst.Index) TodoError!Builder.Value {
     const o = self.object;
     const zcu = o.zcu;
-    if (zcu.getTarget().cpu.arch == .air64) return self.air64AtomicLoad(inst);
+    if (self.air64_kernel) return self.air64AtomicLoad(inst);
     const atomic_load = self.air.instructions.items(.data)[@backingInt(inst)].atomic_load;
     const ptr = try self.resolveInst(atomic_load.ptr);
     const ptr_ty = self.typeOf(atomic_load.ptr);
@@ -6031,7 +6035,7 @@ fn airAtomicStore(
     const ptr_ty = self.typeOf(bin_op.lhs);
     const operand_ty = ptr_ty.childType(zcu);
     if (!operand_ty.hasRuntimeBits(zcu)) return .none;
-    if (zcu.getTarget().cpu.arch == .air64) return self.air64AtomicStore(inst, ordering);
+    if (self.air64_kernel) return self.air64AtomicStore(inst, ordering);
     const ptr = try self.resolveInst(bin_op.lhs);
     var element = try self.resolveInst(bin_op.rhs);
     const llvm_abi_ty = try self.getAtomicAbiType(operand_ty, false);

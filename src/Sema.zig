@@ -5243,7 +5243,7 @@ fn zirWorkGroupBarrier(sema: *Sema, block: *Block, extended: Zir.Inst.Extended.I
     const src = block.nodeOffset(src_node);
     const target = sema.pt.zcu.getTarget();
     switch (target.cpu.arch) {
-        .amdgcn, .spirv64, .spirv32, .nvptx, .nvptx64 => {},
+        .air64, .amdgcn, .spirv64, .spirv32, .nvptx, .nvptx64 => {},
         else => return sema.fail(block, src, "builtin only available on GPU targets; targeted architecture is {s}", .{@tagName(target.cpu.arch)}),
     }
     try sema.requireRuntimeBlock(block, src, null);
@@ -25549,7 +25549,7 @@ fn zirWorkItem(
 
     switch (target.cpu.arch) {
         // TODO: Allow for other GPU targets.
-        .amdgcn, .spirv64, .spirv32, .nvptx, .nvptx64 => {},
+        .air64, .amdgcn, .spirv64, .spirv32, .nvptx, .nvptx64 => {},
         else => {
             return sema.fail(block, builtin_src, "builtin only available on GPU targets; targeted architecture is {s}", .{@tagName(target.cpu.arch)});
         },
