@@ -1346,6 +1346,69 @@ pub fn getResolvedCwd(io: Io, gpa: Allocator) std.process.CurrentPathAllocError!
     return resolved;
 }
 
+/// Whether `a` and `b` name the same file on the file system. Paths that are
+/// the same bytes are the same name, whatever is at them. Otherwise both are
+/// canonicalized, so that one of them reaching a file through a symlink -- a
+/// global cache reached through a symlink, say -- still compares equal to the
+/// file it points at; a path that is not canonicalizable, because nothing is
+/// at it, is not the same file as another path.
+///
+/// This answers "is this path the file that is at that path", not "do these
+/// two names refer to the same inode": a hard link to a file is a different
+/// name for it, and is not the same path.
+pub fn isSameFile(io: Io, gpa: Allocator, a: []const u8, b: []const u8) bool {
+    if (mem.eql(u8, a, b)) return true;
+    const canonical_a = Dir.realPathFileAbsoluteAlloc(io, a, gpa) catch return false;
+    defer gpa.free(canonical_a);
+    const canonical_b = Dir.realPathFileAbsoluteAlloc(io, b, gpa) catch return false;
+    defer gpa.free(canonical_b);
+    if (builtin.os.tag == .windows) return std.ascii.eqlIgnoreCase(canonical_a, canonical_b);
+    return mem.eql(u8, canonical_a, canonical_b);
+}
+
+test isSameFile {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var path_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPath(io, &path_buffer);
+    const dir_path = path_buffer[0..dir_path_len];
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "zig", .data = "the installed compiler" });
+    const installed_exe = try Dir.path.join(gpa, &.{ dir_path, "zig" });
+    defer gpa.free(installed_exe);
+
+    // The same path, byte for byte.
+    try std.testing.expect(isSameFile(io, gpa, installed_exe, installed_exe));
+
+    // A path that reaches the file through a symlinked directory.
+    const link_path = try Dir.path.join(gpa, &.{ dir_path, "..", "link-to-the-cache" });
+    defer gpa.free(link_path);
+    Dir.cwd().deleteTree(io, link_path) catch {};
+    try Dir.cwd().symLink(io, dir_path, link_path, .{ .is_directory = true });
+    defer Dir.cwd().deleteTree(io, link_path) catch {};
+    const via_link = try Dir.path.join(gpa, &.{ link_path, "zig" });
+    defer gpa.free(via_link);
+    try std.testing.expect(isSameFile(io, gpa, installed_exe, via_link));
+    try std.testing.expect(isSameFile(io, gpa, via_link, installed_exe));
+
+    // Another file, and a path that is not there at all, are not the same.
+    try tmp.dir.writeFile(io, .{ .sub_path = "other", .data = "another compiler" });
+    const other_exe = try Dir.path.join(gpa, &.{ dir_path, "other" });
+    defer gpa.free(other_exe);
+    try std.testing.expect(!isSameFile(io, gpa, installed_exe, other_exe));
+    const missing = try Dir.path.join(gpa, &.{ dir_path, "missing" });
+    defer gpa.free(missing);
+    try std.testing.expect(!isSameFile(io, gpa, installed_exe, missing));
+    try std.testing.expect(!isSameFile(io, gpa, missing, other_exe));
+    // The same name is the same name, whether or not anything is at it.
+    try std.testing.expect(isSameFile(io, gpa, missing, missing));
+}
+
 pub const Directories = struct {
     /// The string returned by `introspect.getResolvedCwd`. This is typically an absolute path,
     /// but on WASI is the empty string "" instead, because WASI does not have absolute paths.
