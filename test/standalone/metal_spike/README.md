@@ -1,139 +1,151 @@
 # Zig++ → AIR → metallib → GPU spike
 
-End-to-end spike: Zig device code written against raw AIR intrinsics, rewritten into Apple's
-AIR conventions, wrapped into a `.metallib`, and executed on an Apple GPU.
+End-to-end spike for [issue #11](https://github.com/mattneel/zigpp/issues/11): Zig device
+code is compiled by Zig++, rewritten into Apple's AIR conventions, downgraded to the LLVM 14
+bitcode format Apple's reader wants, wrapped in a `.metallib`, and run on an Apple GPU from a
+Zig++ host program that talks to Metal through the Objective-C runtime. No SDK, no Objective-C
+compiler, no Metal toolchain needed on the machine that does the compiling.
 
-| stage | file | what it does |
-|---|---|---|
-| 1 | `air-rewrite.cpp` | rewrites a Zig++ bitcode module (compiled for the nvptx64 stand-in target) into Apple's AIR conventions |
-| 2 | the metallib writer (sibling task, same directory) | wraps the downgraded LLVM-14 module in a `.metallib` container |
-| 3 | `host.zig` | macOS program that loads the container and runs the kernels on the GPU |
+The design document with every convention this spike pinned is `doc/proposals/metal.md`.
 
-Kernel names are part of the contract and never change: `vadd`, `reduce`, `parsef`.
+## Status
 
-## 1. air-rewrite
+Measured on an Apple M4 (macOS 26.6.2, Metal 4) with the Zig++ at `56013e0da` (LLVM 23.1.2):
 
-```
-air-rewrite <input.bc> -o <output.bc> --spec <spec> [--air 2.8] [--metal 4.0]
-            [--deploy 26.0.0] [--sdk 26.5.0] [--opt O3|O0] [--ident <string>]
-            [--source-name <path>]
-```
+| pipeline | result |
+|---|---|
+| Apple MSL → `xcrun metal` AIR → `llvm-downgrade 14.0` → `xcrun metallib` → GPU | `vadd` 0/4096 mismatches; `reduce` sums exact, counter 4 |
+| Apple MSL → AIR → downgrade → the spike's own metallib writer → GPU | `vadd` 0/4096 mismatches |
+| **Zig++ kernel → `air-rewrite` → `llvm-downgrade` → the spike's writer → the spike's host** | **`vadd` PASS, `reduce` PASS** |
+| the `parsef` kernel (`std.fmt.parseFloat(f32, …)`) | module is valid AIR (`xcrun air-opt` accepts it), Apple's compiler service crashes compiling it — see "Open items" |
 
-`--spec` is the kernel argument spec documented at the top of `spike/kernels.spec`:
-`kernel <name>` followed by one `buffer <index> <read|write|read_write> <air.arg_type_name>
-<size> <align> <name>` or `builtin <index> <air builtin name> <air.arg_type_name> <name>`
-line per argument, in IR parameter order. A module whose kernel signature disagrees with the
-spec (argument count, non-pointer buffer argument, non-integer builtin argument, a
-`ptx_kernel` function missing from the spec) is rejected.
+Files: `kernels.zig` + `air.zig` (the kernels and the AIR intrinsic declarations they use),
+`kernels.spec` (kernel argument spec), `air-rewrite.cpp` (bitcode → AIR conventions),
+`metallib.zig` (the container writer/reader), `host.zig` (the macOS host), `run.sh` (the
+recipe below).
 
-Build (build directory outside the repository, `-DNDEBUG` is required because the LLVM
-archives are a release build):
+## The pipeline
 
-```sh
-env PATH=/usr/bin:/bin cmake -B /tmp/metal-spike/air-rewrite-build \
-    -S test/standalone/metal_spike -G Ninja \
-    -DLLVM_DIR=/home/autark/src/zig/zigpp-bootstrap/out/host/lib/cmake/llvm \
-    -DCMAKE_CXX_FLAGS=-DNDEBUG
-env PATH=/usr/bin:/bin cmake --build /tmp/metal-spike/air-rewrite-build
-```
-
-Rewriting steps, in order:
-
-1. Read the spec, check it against the module's kernels.
-2. Set the AIR triple (`air64_v<major><minor>` for AIR >= 2.6, else `air64`, plus
-   `-apple-macosx<deploy>`) and Apple's AIR data layout.
-3. Sanitize: drop nvptx `target-cpu`/`target-features` and `!nvvm.annotations`, give kernels
-   the C calling convention (the Zig input is `ptx_kernel`), `convergent nounwind`,
-   `local_unnamed_addr`, spec-derived parameter attributes; internalize private/linkonce
-   helper functions and threadgroup globals; strip parameter attributes from `air.*`
-   declarations and normalize them to `convergent nounwind` (barrier/SIMD) resp. `nounwind`
-   (atomics).
-4. Attach the AIR metadata (`!air.version`, `!air.language_version`, `!air.compile_options`,
-   `!air.kernel` with one kernel node per kernel, `!llvm.module.flags`, and
-   `!air.source_file_name`/`!llvm.ident` when asked) plus the `!arg_eltypes` hints the
-   typed-pointer downgrade needs.
-5. Run the LLVM middle end: `default<O3>` (with an `optnone`-respecting pipeline) at `--opt
-   O3`, or `GlobalDCE` + `StripDeadPrototypes` at `--opt O0` so the output stays close to the
-   input.
-6. Re-normalize the kernel signatures from the spec, retype buffer GEPs, verify, write.
-
-`air-rewrite` writes an ordinary LLVM bitcode file, i.e. it *includes* the
-`0b17c0de` module-section wrapper header (`llvm-bcanalyzer -dump` shows
-`BITCODE_WRAPPER_HEADER` as the first record). The container step strips it; a bare module
-works in the container too.
-
-Verification (LLVM 23 tools, Apple references in `/tmp/metal-spike`):
+Kernels are compiled for the **nvptx64 stand-in target**, whose LLVM address spaces are
+already AIR's (`.global` = 1, `.constant` = 2, `.shared` = 3); `air-rewrite` then retypes the
+entries to Apple's kernel conventions. That is the "least machinery" route: no new backend,
+no new target, and every rewrite it performs is a rewrite the real target must emit.
 
 ```sh
-air-rewrite spike/kernels_rf.bc -o spike/kernels_air.bc --spec spike/kernels.spec --opt O3
-llvm-dis spike/kernels_air.bc -o spike/kernels_air.ll
-llvm-downgrade --bitcode-version=14.0 spike/kernels_air.bc -o spike/kernels_air14.bc
+# 1. kernels -> modern LLVM bitcode
+#    ZIG_LIB_DIR must match the compiler binary's source tree (see Notes).
+ZIG_LIB_DIR=/home/autark/src/zig/zig-amdgpu/lib /tmp/zig-amdgpu-final/bin/zig build-obj \
+    test/standalone/metal_spike/kernels.zig -target nvptx64-cuda -fno-compiler-rt \
+    -OReleaseFast -fno-emit-bin -femit-llvm-bc=kernels.bc
+
+# 2. modern bitcode -> AIR conventions (triple, layout, !air.kernel, attributes, arg types)
+air-rewrite kernels.bc -o kernels.air.bc --spec kernels.spec --opt O3
+
+# 3. AIR -> LLVM 14 bitcode (typed pointers, what Apple's reader accepts)
+llvm-downgrade kernels.air.bc --bitcode-version=14.0 -o kernels.air14.bc
+
+# 4. bitcode -> .metallib (one library, one function group per kernel name)
+metallib write --bitcode kernels.air14.bc --name vadd --name reduce --name parsef \
+    --air 2.8 --metal 4.0 --format 1.2.9 --platform 26.0.0 --uuid -o kernels.metallib
 ```
 
-Observed on the spike module:
-
-* triple `air64_v28-apple-macosx26.0.0` and Apple's data layout;
-* `define void @vadd(ptr addrspace(1) readonly %0, ptr addrspace(1) readonly %1,
-  ptr addrspace(1) %2, i32 %3) local_unnamed_addr`, likewise `@reduce` and `@parsef`;
-* `@kernels.scratch = internal unnamed_addr addrspace(3) global [8 x float] undef, align 4`;
-* 4 defined functions: the three kernels plus `fmt.parse_float.convert_slow.convertSlow__func_7`
-  (cost 3660, above the GPU inline threshold), and no `fmt.parse_float.*` helpers besides it —
-  they are inlined into `@parsef`;
-* no `target-features`, no `ptx_kernel`, no `double` instructions;
-* `!air.kernel = !{!4, !11, !20}`, each `!{ptr @fn, !{}, !{argument nodes}}`, matching
-  `vadd.ll`/`reduce.ll`/`ref2.ll:138`.
-
-Conventions this tool adds that Apple's reference modules do not literally show (there is no
-Apple compiler on Linux to check them against):
-
-* the middle end runs with the *input* module's target machine (nvptx64, the stand-in target),
-  because inline costs come from the target's cost model and the generic model leaves the
-  outlined `fmt.parse_float.*` helpers un-inlined;
-* kernel parameter attributes are re-derived from the spec after the pipeline (O3 infers
-  `writeonly`/`nofree`/`captures` of its own), keeping only the access mode;
-* buffer GEPs are retyped from Zig's `[N x i8]` form to the spec's element type (`float`,
-  `i32`, `i8`); the rewrite only fires when the element sizes match, so addresses cannot
-  change, and it makes the walks agree with `air.arg_type_name`/`air.arg_type_size`. It
-  follows the parameter's own uses, which is what O3's SROA leaves behind: at `--opt O0` the
-  Zig ABI's staging alloca still exists, so those GEPs keep the `[N x i8]` form;
-* threadgroup (`addrspace(3)`) globals are `internal` (Zig emits `private`), matching
-  `reduce.ll:8`;
-* `!arg_eltypes` hints are emitted for kernel buffer parameters (from the spec) and for `air.*`
-  declarations whose name encodes the element type (e.g. `air.atomic.global.add.u.i32`). The
-  typed-pointer downgrade infers most pointees from loads/stores/GEPs, but a pointer that is
-  only handed to an intrinsic (reduce's counter, and the declarations' own pointer parameters)
-  has no element type in the IR and would otherwise become `{} addrspace(1)*`;
-* `air.compile.fast_math_enable` is only emitted when the module's FP instructions actually
-  carry fast-math flags (Zig's nvptx output does not), so the option cannot disagree with
-  precise FP operations; `denorms_disable`/`framebuffer_fetch_enable` stay as driver defaults.
-
-Remaining differences from Apple's reference modules: `air.compile_options` lacks
-`fast_math_enable` (above); `SDK Version` is `[3 x i32] [26, 5, 0]` where the references print
-`[2 x i32] [26, 5]`; `!llvm.ident` and `!air.source_file_name` are only emitted when
-`--ident`/`--source-name` are given; the kernels carry no `approx-func-fp-math`,
-`no-infs-fp-math`, `no-nans-fp-math`, `no-signed-zeros-fp-math`, `no-trapping-math`,
-`unsafe-fp-math`, `min-legal-vector-width`, `no-builtins` or `stack-protector-buffer-size`
-attributes; FP arithmetic is precise (`fadd float`, no `fast`) and buffer walks use the
-kernel argument pointers directly rather than `!tbaa`/`!alias.scope`/`air-alias-scopes`
-metadata; the `addrspace(3)` scratch GEP keeps Zig's `[4 x i8]` element type; `noredzone` is
-left in place.
-
-## 3. host.zig — macOS host
-
-`host.zig` is the aarch64-macos program that loads a `.metallib` and runs the three spike kernels
-on the Mac's GPU. It is cross-compiled from Linux with no SDK and no Objective-C compiler: it
-resolves libobjc, libSystem and the Metal framework at run time with `dlopen`, and sends every
-Objective-C message through `objc_msgSend` cast to the exact method signature (arm64 has no
-variadic `objc_msgSend`).
+`run.sh` runs exactly these four steps. On the Mac:
 
 ```sh
-# cross-compile on Linux
-zig build-exe test/standalone/metal_spike/host.zig -target aarch64-macos -O ReleaseSafe \
-    -femit-bin=/tmp/metal-spike/host-macos
-# on the Mac
-./host-macos --selftest          # checks libobjc/Metal/the device resolve; no metallib needed
-./host-macos <path-to.metallib>  # runs vadd, reduce, parsef; prints --- PASS/FAIL/SKIP per test
+./host kernels.metallib
 ```
 
-A kernel that the `.metallib` does not contain is reported as `--- SKIP`, not a failure, so a
-partial pipeline can be tested. Exit status is 0 when no test failed (skips are fine).
+which prints, for the Zig++-produced library:
+
+```
+metal spike: /tmp/spike/k5_wrapped.metallib on Apple M4, registryID 0x1000003c9
+--- PASS: vadd: 4096 f32, 64 threadgroups of 64 threads, c[i] == a[i] + b[i]
+--- PASS: reduce: 4 threadgroups of 256 threads over 1024 f32, every group sum 1920 and counter 4
+--- FAIL: parsef: newComputePipelineStateWithFunction:error: failed: Compilation failed due to an interrupted connection: XPC_ERROR_CONNECTION_INTERRUPTED. This error occurred after multiple retries.
+metal spike: FAIL: 2 passed, 1 failed, 0 skipped
+```
+
+## What had to be rewritten (the conventions the real target must emit)
+
+`air-rewrite` performs, in order:
+
+1. **Triple and data layout** — `air64_v28-apple-macosx26.0.0` and
+   `e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-…-n8:16:32`
+   (AIR 2.8 pointers are 64-bit in *every* address space, unlike the stand-in target's).
+2. **Sanitizing** — drop `"target-cpu"`/`"target-features"` attributes, `nvvm.annotations`,
+   unused target globals, the `%Target.*` runtime data; set the kernel calling convention to C;
+   add `convergent nounwind`; normalize `air.*` declarations to Apple's parameter shapes.
+3. **Kernel argument conventions** — buffer parameters keep their `addrspace(1)`/`addrspace(2)`
+   pointers; each kernel's used builtins become **trailing value parameters** (`i32` for `uint`
+   builtins) in a fixed order; GEPs are retyped to the buffer's element type from the spec.
+4. **Metadata** — `!air.version`, `!air.language_version`, `!air.compile_options`,
+   `!llvm.module.flags` (SDK version, `air.max_*`, wchar/frame-pointer) and `!air.kernel` with
+   one node per kernel: `!air.kernel = !{!k1, !k2, !k3}` where
+   `!k1 = !{ptr @vadd, !{}, !{…arg nodes…}}`. Apple's reader *rejects* an extra level of nesting
+   here (`air-opt` reports `metadata AIKernelFunction is corrupted`) and rejects pointer
+   arguments with an unknown pointee.
+5. **Typed-pointer hints** — `!arg_eltypes` on declarations whose pointer parameters have no
+   load/store/GEP to learn the pointee from (`air.atomic.global.add.u.i32` in the reduction),
+   because the downgrader otherwise emits `{} addrspace(1)*` and Apple rejects that signature.
+6. **LLVM middle end** — the O3 pipeline over the AIR module inlines the outlined std
+   helpers, runs SROA/GlobalDCE and leaves exactly what the AIR backend sees.
+
+The kernels themselves are written against raw AIR intrinsics declared in `air.zig`
+(`air.wg.barrier`, `air.simd_sum.f32`, `air.atomic.global.add.u.i32`), i.e. the shapes
+`std.gpu` must lower to for a Metal target; `kernels.spec` stands in for the type information
+the real compiler derives from the Zig type system.
+
+## Container facts the spike measured
+
+* Apple's reader/compiler accepts a module that **exactly** follows the conventions above;
+  anything off by a level (metadata nesting, missing pointee type) is rejected with a terse
+  diagnostic or a compiler crash, so `air-rewrite`'s checks are not cosmetic.
+* The writer stores the module bytes **verbatim**, including the 20-byte
+  `0b17c0de`-prefixed module section header that `air-rewrite` (like Apple's `metal -c`) puts in
+  front of the bitcode. A module stored *without* that header loaded for some modules but failed
+  for others (`unable to copy bitcode for function`), so the spike keeps Apple's form.
+* The function list is what `newFunctionWithName:` resolves against: three function groups with
+  the same module bytes resolve `vadd`, `reduce` and `parsef` from one library.
+* File version 1.2.9, platform 26.0.0, `TYPE` = 2 (kernel), SHA-256 of the module in `HASH`,
+  `MDSZ` = module length, `VERS` = (AIR major, AIR minor, MSL major, MSL minor).
+
+## Host facts the spike measured
+
+* `objc_msgSend` through exactly-typed function pointers, `dispatch_data_create` for the library
+  data, `MTLResourceStorageModeShared` buffers read back through `contents` after
+  `waitUntilCompleted`, and `NSError**` on every `error:` selector — without it failures are
+  silent nulls.
+* The Metal *runtime* is all that is needed to load and run: the Metal toolchain
+  (`xcodebuild -downloadComponent MetalToolchain`, 688 MB) is only needed to produce reference
+  AIR from MSL, and `xcrun air-opt` is a precise validator for emitted modules.
+
+## Open items
+
+1. **`parsef`** (`std.fmt.parseFloat(f32, …)`): the module passes `xcrun air-opt` and
+   `xcrun metal-opt -O3`, and `vadd`/`reduce` compile from the same library, but creating the
+   pipeline for `parsef` crashes Apple's compiler service
+   (`XPC_ERROR_CONNECTION_INTERRUPTED`). Ruled out by experiment: the `fastcc` convention of the
+   outlined helpers, the f64 slow path (`convert_slow` stubbed out), `llvm.umul.with.overflow.i64`
+   (replaced with `mul` + explicit overflow), `llvm.ctlz.i64` (Apple's frontend emits
+   `air.clz.i64`, and rewriting to that changed nothing), and the container/metadata shape (the
+   other two kernels compile from the very same library). The remaining suspects are the
+   inlined 64-bit Eisel–Lemire path and the `%BiasedFp(f64)`-typed allocas/staging buffer; the
+   next step is to read the Metal compiler's crash report (`~/Library/Logs/DiagnosticReports`,
+   not readable from this account) or bisect the inlined body.
+2. Whether Apple's AIR backend accepts `alloca`-heavy kernels at all, once (1) is answered.
+3. `-fno-compiler-rt` was used for the stand-in compile to keep the module small; the real
+   target bundles compiler-rt for kernels (works in this tree: 588 KB module measured with
+   compiler-rt included).
+
+## Notes
+
+* `ZIG_LIB_DIR` must point at a lib tree that matches the compiler binary's source: pairing the
+  `amdgpu`-tree compiler with master's lib produces `std.lang is corrupt` panics and bogus
+  calling-convention diagnostics (measured). The mangled-but-working combination used here is
+  `/tmp/zig-amdgpu-final/bin/zig` + `/home/autark/src/zig/zig-amdgpu/lib`.
+* The stand-in target needs explicit calling conventions (`callconv(.nvptx_kernel)` on kernels,
+  `.nvptx_device` on `air.*` declarations) because the default `extern`/`export` convention
+  resolution misbehaves for GPU targets in this tree.
+* File transfer to the Mac: base64 the gzipped file, write it with the remote `write_file`
+  device in chunks, then `base64 -D -i x.b64 -o x.gz && gunzip x.gz`; the `-d` spelling of BSD
+  `base64` is unreliable in the remote shell.

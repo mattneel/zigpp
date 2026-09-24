@@ -143,7 +143,10 @@ Module metadata (Apple's own vadd kernel, abridged to the load-bearing nodes):
 compiler promises. `!air.source_file_name = !{!{!"/path/to/file.metal"}}` appears when the
 frontend records sources.
 
-Kernel metadata is *module named metadata*, one node per kernel:
+Kernel metadata is *module named metadata*, one node per kernel — the list holds the kernel
+nodes directly; an extra level of nesting is rejected by Apple's reader
+(`metadata AIKernelFunction is corrupted` from `air-opt`, then `unable to copy bitcode for
+function` from the runtime):
 
 ```llvm
 !air.kernel = !{!K}
@@ -338,12 +341,14 @@ Writer design for the compiler (`src/metallib.zig`, no host dependencies):
 
 Measured, and load-bearing:
 
-* **Store the bitcode raw.** Apple's toolchain wraps a module in a 20-byte section header
-  (`0b17c0de`, `u32 0`, `u32 0x14`, `u32 bitcode_size`, `i32 -1`) and stores that inside the
-  metallib. A metallib built that way from *downgraded* bitcode failed to compile on the M4
-  (`XPC_ERROR_CONNECTION_INTERRUPTED` from `newComputePipelineStateWithFunction:`, twice); the
-  same bitcode stored raw loaded and ran. Metal.jl's writer also stores it raw. `MDSZ` is then
-  just the bitcode length.
+* **Keep the module-section header.** Apple's toolchain prefixes a module with a 20-byte section
+  header (`0b17c0de`, `u32 0`, `u32 0x14`, `u32 bitcode_size`, `i32 -1`) and stores that inside
+  the metallib; `xcrun metal -c` puts the same header in front of a `.air` file, so the
+  compiler's AIR stage should emit it. Measured on the M4: storing the header verbatim in the
+  metallib works (`vadd` and `reduce` ran from the spike's own writer); stripping it worked for
+  Apple's own module but failed for ours (`unable to copy bitcode for function` from
+  `newComputePipelineStateWithFunction:`). `MDSZ` is the whole module, header included.
+  Metal.jl's writer stores whatever bytes it is given.
 * Apple's own files insert an extra `04 00 00 00` after some groups (the next section's size
   field, left over from its writer). Omit it; our layout works.
 * The metallib file version must not exceed what the host supports (§3); the runtime tolerates
@@ -584,27 +589,60 @@ Proven on the M4 (macOS 26.6.2):
 | downgrade → container | `xcrun metallib` | loaded and ran |
 | container → GPU | `newLibraryWithData:` via `objc_msgSend` | `vadd 0/4096 mismatches` |
 | reduction | Apple's MSL reduction kernel | `reduce` threadgroup sums correct, counter = 4 |
-| our own container | the spike's writer, raw module bytes | `vadd 0/4096 mismatches` |
-| Zig++ kernels | `kernels.zig` → `air-rewrite` → `llvm-downgrade` → metallib writer | §12.1 |
+| our own container | the spike's writer, module bytes verbatim | `vadd` and `reduce` PASS |
+| Zig++ kernels | `kernels.zig` → `air-rewrite` → `llvm-downgrade` → the spike's writer, run by the spike's host | `vadd` PASS, `reduce` PASS, `parsef` blocked (§12.1) |
 
 Measured negative results worth knowing:
 
-* a metallib whose module bytes are wrapped in Apple's `0b17c0de` section header (as Apple's own
-  tool writes them) *failed* to compile once produced by our writer
-  (`XPC_ERROR_CONNECTION_INTERRUPTED`), while the raw bitcode of the same module worked;
+* stripping Apple's 20-byte module-section header out of a Zig++ module made the Metal compiler
+  fail with `unable to copy bitcode for function`, while the header left in place works; the
+  same stripping *did* work for a module Apple's own frontend produced, so the header is part of
+  what the compiler should emit (§5);
 * `xcrun metallib` accepts a downgraded module that `xcrun metal` never saw, so the AIR
   conventions — not the frontend — are what the container and the runtime check;
 * LLVM 23's `llvm-dis` reads the downgraded file but shows opaque pointers (the reader upgrades
   them); the typed-pointer form is what is on disk, in the LLVM 14 format;
 * `xcrun air-validate` does not accept a raw AIR module file (it expects a Mach-O/AIR binary),
-  so it is not a validation tool for emitted bitcode;
+  but `xcrun air-opt` does, and its diagnostics are precise enough to debug emitted metadata
+  (`metadata AIKernelFunction is corrupted`) — it is the validator to run in CI;
 * Zig++'s `ZIG_LIB_DIR` must point at a lib tree matching the compiler binary's source; using
   the master lib with an `amdgpu`-tree compiler produces bogus `std.lang is corrupt` panics and
   wrong calling-convention diagnostics.
 
 ### 12.1 Zig++ kernels on the M4
 
-*TBD: filled in from the spike run (see the branch README for the exact commands).*
+`vadd` and `reduce` run correctly on the M4 from a library that is entirely
+Zig++-produced — Zig++ kernel → `air-rewrite` → `llvm-downgrade 14.0` → the spike's metallib
+writer → the spike's host program (Objective-C runtime). Exact output of the host:
+
+```
+metal spike: k5_wrapped.metallib on Apple M4, registryID 0x1000003c9
+--- PASS: vadd: 4096 f32, 64 threadgroups of 64 threads, c[i] == a[i] + b[i]
+--- PASS: reduce: 4 threadgroups of 256 threads over 1024 f32, every group sum 1920 and counter 4
+--- FAIL: parsef: newComputePipelineStateWithFunction:error: failed: Compilation failed due to an
+      interrupted connection: XPC_ERROR_CONNECTION_INTERRUPTED. This error occurred after multiple retries.
+```
+
+The same library's module is accepted by Apple's own validators (`xcrun air-opt` exit 0) and by
+Apple's `metallib` tool. Two conventions broke the build before they were fixed, and both are
+things a compiler must get exactly right:
+
+1. `!air.kernel` must list one kernel node per kernel, directly
+   (`!air.kernel = !{!k1, !k2}`, `!k1 = !{ptr @fn, !stages, !args}`). An extra nesting level
+   makes `xcrun air-opt` report `metadata AIKernelFunction is corrupted`, and the runtime then
+   fails with `unable to copy bitcode for function`.
+2. A pointer passed to an `air.*` function whose element type no load/store/GEP reveals — the
+   reduction's atomic counter — must carry `!arg_eltypes` (`!{i32 0, i32 0}` for parameter 0 =
+   `i32*`), or the downgrader writes `{} addrspace(1)*` and Apple reports
+   `invalid AIR function air.atomic.global.add.u.i32 (i32 ({} addrspace(1)*, i32, i32, i32, i1))`.
+
+`parsef` remains open. Its module passes `xcrun air-opt` and `xcrun metal-opt -O3`, and the two
+other kernels in the same library compile, so the failure is inside Apple's AIR→GPU backend for
+that function. Ruled out by experiment: the `fastcc` convention of the outlined std helpers,
+the `convert_slow` f64 fallback (stubbed out), `llvm.umul.with.overflow.i64` (rewritten to
+`mul` + explicit flag), and `llvm.ctlz.i64` (Apple's own frontend emits `air.clz.i64`; rewriting
+it changed nothing). Remaining suspects: the inlined 64-bit Eisel–Lemire path and the
+`%BiasedFp(f64)`-typed allocas/staging buffer.
 
 ## 13. Reproducing the spike
 
@@ -647,17 +685,31 @@ xcrun metallib kernel.air -o kernel.metallib
 
 ## 14. Open questions
 
-1. Does Apple's backend accept `alloca`/stack traffic and outlined `sret` functions in kernels?
-   The spike's `std.fmt.parseFloat` kernel has both (Zig outlines parse helpers).
-2. Does it accept the dead `f64` **type** in `parseFloat`'s slow path (`BiasedFp(f64)` as an
-   `sret` type), or must the compiler prune value types the device cannot represent?
-3. Are `SDK Version`, `air.max_*` and `w_frame-pointer` module flags required, or merely
+Resolved by the spike:
+
+* `!air.kernel` must hold one kernel node per kernel with no extra nesting — `air-opt` rejects
+  anything else (`metadata AIKernelFunction is corrupted`), and the runtime then fails with
+  `unable to copy bitcode for function` (§12.1).
+* Pointer arguments of `air.*` declarations need `!arg_eltypes` when no instruction reveals the
+  pointee; otherwise the downgrader writes `{} addrspace(1)*` and Apple rejects the signature.
+* Modules keep Apple's 20-byte module-section header (§5).
+* Apple's `metallib` accepts a downgraded module and the runtime runs it, so the LLVM-14 bitcode
+  target is right for AIR 2.8 on macOS 26.6.
+
+Still open:
+
+1. Why Apple's AIR→GPU backend crashes on the `std.fmt.parseFloat` kernel while accepting its
+   module at every mid-end stage, and which construct is responsible (§12.1). Until this is
+   answered, "standard-library code in kernels" is not proven on Metal.
+2. Are `SDK Version`, `air.max_*` and `frame-pointer` module flags required, or merely
    informative? The spike emits them; a negative test was not run.
-4. Do `air.*` declarations need Apple's exact parameter attributes (`captures(none)`), or is the
-   name plus the LLVM type enough?
-5. What exactly does the runtime do with `air.arg_name`/`air.arg_type_name` — reflection only, or
-   argument binding?
-6. Threadgroup pointer width: AIR 2.8's layout says 64-bit for AS 3, but older AIR versions used
+3. Do `air.*` declarations need Apple's exact parameter attributes (`captures(none)`,
+   `convergent`), or is the name plus the LLVM type enough? The spike emits Apple's shapes.
+4. What exactly does the runtime do with `air.arg_name`/`air.arg_type_name` — reflection only,
+   or argument binding? Function lookup is by the metallib's `NAME` tags, not by `!air.kernel`.
+5. Threadgroup pointer width: AIR 2.8's layout says 64-bit for AS 3, but older AIR versions used
    32-bit threadgroup pointers; the target must not assume either across versions.
-7. Whether `metallib` file version 1.2.9 is accepted by a macOS 15 runner (the spike only had an
+6. Whether `metallib` file version 1.2.9 is accepted by a macOS 15 runner (the spike only had an
    M4 on 26.6); the per-host table in §3 is the safe rule.
+7. `fastcc` in kernels: the spike rewrote outlined helpers to `ccc` while debugging; whether AIR
+   accepts `fastcc` was not isolated (Apple's frontend emits `ccc`).
