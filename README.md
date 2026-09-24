@@ -179,12 +179,29 @@ running `zig std`, which will open a browser tab.
 
 ## Installation
 
-Zig++ publishes a release on every push to master: see
+Installing Zig++ is one line. On Linux and macOS:
+
+```sh
+curl -fsSL https://zigpp.lol/ppup | sh
+```
+
+On Windows, in PowerShell:
+
+```powershell
+irm https://zigpp.lol/ppup.ps1 | iex
+```
+
+`ppup` unpacks the newest release, makes it the default `zig`, installs itself,
+and then manages the toolchains you have: `ppup update`,
+`ppup install <version>`, `ppup default <version>`, `ppup list`,
+`ppup uninstall <version>`, and `ppup self uninstall` to undo everything. See
+[Installing](https://zigpp.lol/installing.html) for the whole command list, and
 [zigpp.lol/downloads.html](https://zigpp.lol/downloads.html) for the archives
-and their SHA-256 checksums, and [Installing](https://zigpp.lol/installing.html)
-for the archive layout. To build it yourself, see
-[Building from Source](#building-from-source). The links below are for upstream
-Zig.
+and their SHA-256 checksums. To build it yourself, see
+[Building from Source](#building-from-source).
+
+Zig++ publishes a release on every push to master. The links below are for
+upstream Zig.
 
  * [download a pre-built binary](https://ziglang.org/download/)
  * [install from a package manager](https://ziglang.org/learn/getting-started/#managers)

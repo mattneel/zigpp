@@ -191,6 +191,11 @@ jobs:
           mkdir -p _site
           cp -R doc/book/_book/. _site/
           cp doc/book/theme/*.png doc/book/theme/*.ico doc/book/theme/site.webmanifest _site/
+          # The one-line installers, served from the root of the site:
+          #   curl -fsSL https://zigpp.lol/ppup | sh
+          #   irm https://zigpp.lol/ppup.ps1 | iex
+          cp ppup/ppup _site/ppup
+          cp ppup/ppup.ps1 _site/ppup.ps1
           echo "zigpp.lol" > _site/CNAME
           find _site -maxdepth 2 | sort
 

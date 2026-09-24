@@ -1,0 +1,695 @@
+#!/bin/sh
+#
+# ppup installs and manages Zig++ toolchains.
+#
+#     curl -fsSL https://zigpp.lol/ppup | sh
+#
+# A toolchain is a release archive unpacked into $PPUP_HOME/toolchains/<version>,
+# and the default toolchain is the one $PPUP_HOME/bin/zig points at. The script
+# is installed as $PPUP_HOME/bin/ppup. `ppup help` lists the commands.
+
+set -eu
+
+PPUP_VERSION=0.1.0
+
+# The releases of mattneel/zigpp, and the public copy of this script.
+RELEASES_URL=https://github.com/mattneel/zigpp/releases
+PPUP_URL=https://zigpp.lol/ppup
+
+# The targets Zig++ publishes; see doc/book/src/installing.md.
+TARGETS='x86_64-linux aarch64-linux aarch64-macos x86_64-windows'
+
+# The two lines ppup appends to a shell profile. `ppup self uninstall` removes
+# exactly these again.
+PATH_MARKER='# Zig++ (ppup)'
+
+PROG=ppup
+
+die() {
+    printf '%s: %s\n' "$PROG" "$*" >&2
+    exit 1
+}
+
+warn() {
+    printf '%s: %s\n' "$PROG" "$*" >&2
+}
+
+info() {
+    printf '%s\n' "$*"
+}
+
+usage() {
+    cat <<EOF
+ppup $PPUP_VERSION: install and manage Zig++ toolchains.
+
+Usage: ppup [<command>] [<option>...]
+
+With no command, ppup installs the newest Zig++ release as the default
+toolchain, installs itself as \$PPUP_HOME/bin/ppup, and puts \$PPUP_HOME/bin
+on PATH.
+
+Commands:
+  install <version|latest>
+                    Install a toolchain. It becomes the default if no
+                    toolchain is the default yet. <version> is as in the
+                    archive names, e.g. 0.17.0-dev.2380+zigpp.add158e97.
+  update            Install the newest release and make it the default
+  default [<version>]
+                    Show the default toolchain, or make <version> the default
+  list              List the installed toolchains, marking the default
+  uninstall <version>
+                    Remove a toolchain, unless it is the default
+  self update       Replace ppup with the newest one from $PPUP_URL
+  self uninstall    Remove every toolchain, ppup, and its PATH entry
+  help              Show this help
+  --version         Show the ppup version
+
+Options:
+  --no-modify-path  Leave every shell profile alone. The environment variable
+                    PPUP_NO_MODIFY_PATH=1 does the same.
+
+Environment:
+  PPUP_HOME         Where toolchains live (default: \$HOME/.zigpp)
+
+Releases are published for: $TARGETS
+EOF
+}
+
+# ---------------------------------------------------------------- environment
+
+TMP=
+cleanup() {
+    if [ -n "$TMP" ] && [ -d "$TMP" ]; then
+        rm -rf "$TMP" || true
+    fi
+}
+
+trap 'cleanup' EXIT
+trap 'cleanup; exit 130' HUP INT TERM
+
+if [ -z "${PPUP_HOME:-}" ]; then
+    [ -n "${HOME:-}" ] ||
+        die 'HOME is not set, so the default PPUP_HOME cannot be guessed; set PPUP_HOME'
+    PPUP_HOME=${HOME%/}/.zigpp
+fi
+case $PPUP_HOME in
+    /) die 'PPUP_HOME is /, which would wipe the file system' ;;
+esac
+while [ "${PPUP_HOME%/}" != "$PPUP_HOME" ] && [ "$PPUP_HOME" != "/" ]; do
+    PPUP_HOME=${PPUP_HOME%/}
+done
+
+BIN_DIR=$PPUP_HOME/bin
+TOOLCHAINS_DIR=$PPUP_HOME/toolchains
+
+# Whether ppup may edit a shell profile; --no-modify-path and
+# PPUP_NO_MODIFY_PATH=1 turn that off.
+modify_path=1
+case ${PPUP_NO_MODIFY_PATH:-} in
+    ''|0) ;;
+    *) modify_path=0 ;;
+esac
+
+TARGET=
+EXT=
+SHA256=
+FETCH=
+
+# ------------------------------------------------------------- prerequisites
+
+detect_target() {
+    os=$(uname -s)
+    arch=$(uname -m)
+    case $os in
+        Linux)
+            case $arch in
+                x86_64 | amd64) TARGET=x86_64-linux ;;
+                aarch64 | arm64) TARGET=aarch64-linux ;;
+            esac
+            ;;
+        Darwin)
+            case $arch in
+                arm64 | aarch64) TARGET=aarch64-macos ;;
+            esac
+            ;;
+    esac
+    [ -n "$TARGET" ] ||
+        die "no Zig++ release is published for $os/$arch; releases exist for: $TARGETS"
+    case $TARGET in
+        *windows*) EXT=zip ;;
+        *) EXT=tar.xz ;;
+    esac
+}
+
+check_prerequisites() {
+    if command -v curl >/dev/null 2>&1; then
+        FETCH=curl
+    elif command -v wget >/dev/null 2>&1; then
+        FETCH=wget
+    else
+        die 'neither curl nor wget is installed, and ppup needs one of them to download releases'
+    fi
+
+    command -v tar >/dev/null 2>&1 || die 'tar is not installed'
+
+    # GNU tar runs xz for -J, and libarchive-based tar (macOS, busybox) has
+    # liblzma built in.
+    if ! command -v xz >/dev/null 2>&1 &&
+        ! tar --version 2>&1 | grep -qi 'liblzma\|bsdtar\|libarchive'; then
+        die 'tar cannot unpack .tar.xz archives here: install xz'
+    fi
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        SHA256='sha256sum'
+    elif command -v shasum >/dev/null 2>&1; then
+        SHA256='shasum -a 256'
+    else
+        die 'neither sha256sum nor shasum is installed, and ppup needs one of them to verify downloads'
+    fi
+}
+
+fetch() {
+    # fetch <url> <file>. The connect timeout bounds a host that is not
+    # answering (a deploy in progress, a firewall) without limiting how long a
+    # large archive may take to arrive.
+    case $FETCH in
+        curl) curl -fsSL --connect-timeout 15 --retry 2 --retry-delay 1 -o "$2" "$1" ;;
+        wget) wget -q --timeout=30 --tries=2 -O "$2" "$1" ;;
+    esac
+}
+
+file_sha256() {
+    # shellcheck disable=SC2086  # $SHA256 is a command with an argument.
+    $SHA256 "$1" | cut -d' ' -f1
+}
+
+# --------------------------------------------------------------- destinations
+
+profile_path() {
+    case ${SHELL:-} in
+        */zsh) printf '%s\n' "$HOME/.zshrc" ;;
+        */bash) printf '%s\n' "$HOME/.bashrc" ;;
+        */fish) printf '%s\n' "$HOME/.config/fish/conf.d/ppup.fish" ;;
+        *) printf '%s\n' "$HOME/.profile" ;;
+    esac
+}
+
+# The line that puts $BIN_DIR on PATH, for the shell that owns <profile>.
+path_line_posix() {
+    printf '%s\n' "export PATH=\"$BIN_DIR:\$PATH\""
+}
+
+path_line_fish() {
+    printf 'fish_add_path "%s"\n' "$BIN_DIR"
+}
+
+path_line() {
+    case $1 in
+        *.fish) path_line_fish ;;
+        *) path_line_posix ;;
+    esac
+}
+
+add_to_path() {
+    [ "$modify_path" = 1 ] || return 0
+    [ -n "${HOME:-}" ] || return 0
+
+    profile=$(profile_path)
+    line=$(path_line "$profile")
+
+    if [ -f "$profile" ] && grep -q -F -x -e "$line" "$profile"; then
+        return 0
+    fi
+    case :$PATH: in
+        *:$BIN_DIR:*) return 0 ;;
+    esac
+
+    mkdir -p "$(dirname "$profile")" 2>/dev/null || true
+    {
+        printf '%s\n' "$PATH_MARKER"
+        printf '%s\n' "$line"
+    } >>"$profile" || die "cannot write to $profile"
+    info "added $BIN_DIR to PATH in $profile"
+}
+
+remove_from_path() {
+    [ -n "${HOME:-}" ] || return 0
+
+    marker=$PATH_MARKER
+    line_sh=$(path_line_posix)
+    line_fish=$(path_line_fish)
+
+    for profile in \
+        "$HOME/.zshrc" \
+        "$HOME/.bashrc" \
+        "$HOME/.config/fish/conf.d/ppup.fish" \
+        "$HOME/.profile"; do
+        [ -f "$profile" ] || continue
+        grep -q -F -x -e "$line_sh" -e "$line_fish" "$profile" || continue
+
+        # grep exits 1 when it filters out every line, which is what happens
+        # with a profile that holds nothing but ppup's two lines.
+        status=0
+        grep -v -F -x -e "$marker" -e "$line_sh" -e "$line_fish" "$profile" >"$profile.ppup.tmp" ||
+            status=$?
+        if [ "$status" -gt 1 ]; then
+            rm -f "$profile.ppup.tmp"
+            die "cannot rewrite $profile"
+        fi
+        if [ -s "$profile.ppup.tmp" ]; then
+            mv -f "$profile.ppup.tmp" "$profile"
+        else
+            rm -f "$profile.ppup.tmp" "$profile"
+        fi
+        info "removed the PATH entry from $profile"
+    done
+}
+
+# ------------------------------------------------------------------ toolchains
+
+default_version() {
+    link=$BIN_DIR/zig
+    [ -h "$link" ] || return 1
+    target=$(readlink "$link") || return 1
+    case $target in
+        */toolchains/*/zig)
+            version=${target#*toolchains/}
+            printf '%s\n' "${version%/zig}"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+make_default() {
+    version=$1
+    [ -x "$TOOLCHAINS_DIR/$version/zig" ] ||
+        die "no such toolchain: $version (see: ppup list)"
+
+    mkdir -p "$BIN_DIR"
+    ln -s "../toolchains/$version/zig" "$BIN_DIR/.zig.$$" ||
+        die "cannot write to $BIN_DIR"
+    mv -f "$BIN_DIR/.zig.$$" "$BIN_DIR/zig" || die "cannot write to $BIN_DIR"
+}
+
+# Sets RESOLVED to the installed toolchain named <version>, which may leave out
+# the build metadata: 0.17.0-dev.2380 finds 0.17.0-dev.2380+zigpp.add158e97.
+# Returns 1 when there is no such toolchain, and 2 when that many toolchains
+# match.
+resolve_installed() {
+    RESOLVED=
+    request=$1
+    if [ -x "$TOOLCHAINS_DIR/$request/zig" ]; then
+        RESOLVED=$request
+        return 0
+    fi
+
+    count=0
+    match=
+    for dir in "$TOOLCHAINS_DIR"/*/; do
+        [ -d "$dir" ] || continue
+        name=${dir%/}
+        name=${name##*/}
+        case $name in
+            "$request"+*) ;;
+            *) continue ;;
+        esac
+        count=$((count + 1))
+        match=$name
+    done
+
+    case $count in
+        0) return 1 ;;
+        1)
+            RESOLVED=$match
+            return 0
+            ;;
+        *) return 2 ;;
+    esac
+}
+
+resolve_or_die() {
+    code=0
+    resolve_installed "$1" || code=$?
+    case $code in
+        0) ;;
+        2)
+            die "several installed toolchains match $1; use the full version from 'ppup list'"
+            ;;
+        *)
+            die "no such toolchain: $1 (see: ppup list)"
+            ;;
+    esac
+}
+
+sorted_versions() {
+    # Every installed toolchain, newest first.
+    for dir in "$TOOLCHAINS_DIR"/*/; do
+        [ -d "$dir" ] || continue
+        printf '%s\n' "${dir%/}"
+    done | sed 's|.*/||' | sort -r
+}
+
+# -------------------------------------------------------------------- releases
+
+# resolve <version|latest> sets RELEASE_VERSION, RELEASE_TAG, ARCHIVE_NAME, and
+# ARCHIVE_SHA256, downloading the release's SHA256SUMS into $TMP.
+resolve() {
+    request=$1
+    detect_target
+    case $request in
+        '' | latest)
+            sums_url=$RELEASES_URL/latest/download/SHA256SUMS
+            ;;
+        *)
+            sums_url=$RELEASES_URL/download/zigpp-${request%%+*}/SHA256SUMS
+            ;;
+    esac
+
+    sums=$TMP/SHA256SUMS
+    fetch "$sums_url" "$sums" ||
+        die "cannot download $sums_url (no such release, or no network?)"
+
+    line=$(grep -E '^[0-9a-f]{64}  zig-'"$TARGET"'-.*[.]'"$EXT"'$' "$sums" | head -n 1)
+    if [ -z "$line" ]; then
+        die "$sums_url has no $TARGET archive; Zig++ publishes: $TARGETS"
+    fi
+    # Each line is "<sha256>  <file name>".
+    ARCHIVE_SHA256=${line%% *}
+    ARCHIVE_NAME=${line##* }
+    RELEASE_VERSION=${ARCHIVE_NAME#zig-"$TARGET"-}
+    RELEASE_VERSION=${RELEASE_VERSION%."$EXT"}
+    RELEASE_TAG=zigpp-${RELEASE_VERSION%%+*}
+
+    case $request in
+        '' | latest) ;;
+        *)
+            [ "${RELEASE_VERSION%%+*}" = "${request%%+*}" ] ||
+                die "release $RELEASE_TAG does not contain $request"
+            ;;
+    esac
+}
+
+# install_toolchain <version|latest>; sets INSTALLED_VERSION.
+install_toolchain() {
+    detect_target
+    [ -n "${TMP:-}" ] || {
+        mkdir -p "$PPUP_HOME" || die "cannot create $PPUP_HOME"
+        TMP=$(mktemp -d "$PPUP_HOME/tmp.XXXXXX") || die "cannot create a temporary directory in $PPUP_HOME"
+    }
+
+    resolve "$1"
+    aim=$TOOLCHAINS_DIR/$RELEASE_VERSION
+    if [ -d "$aim" ]; then
+        info "Zig++ $RELEASE_VERSION is already installed"
+        INSTALLED_VERSION=$RELEASE_VERSION
+        return 0
+    fi
+
+    url=$RELEASES_URL/download/$RELEASE_TAG/$ARCHIVE_NAME
+    info "downloading Zig++ $RELEASE_VERSION for $TARGET"
+    fetch "$url" "$TMP/$ARCHIVE_NAME" || die "cannot download $url"
+
+    got=$(file_sha256 "$TMP/$ARCHIVE_NAME")
+    [ "$got" = "$ARCHIVE_SHA256" ] ||
+        die "checksum mismatch for $ARCHIVE_NAME: expected $ARCHIVE_SHA256, got $got"
+
+    mkdir -p "$TMP/unpacked"
+    case $EXT in
+        tar.xz)
+            tar -xJf "$TMP/$ARCHIVE_NAME" -C "$TMP/unpacked" ||
+                die "cannot unpack $ARCHIVE_NAME"
+            ;;
+        zip)
+            command -v unzip >/dev/null 2>&1 || die 'unzip is not installed'
+            unzip -q "$TMP/$ARCHIVE_NAME" -d "$TMP/unpacked" ||
+                die "cannot unpack $ARCHIVE_NAME"
+            ;;
+    esac
+
+    unpacked=$TMP/unpacked/zig-$TARGET-$RELEASE_VERSION
+    if [ ! -d "$unpacked" ]; then
+        # Fall back to the archive's single top-level directory.
+        unpacked=
+        count=0
+        for dir in "$TMP"/unpacked/*/; do
+            [ -d "$dir" ] || continue
+            unpacked=${dir%/}
+            count=$((count + 1))
+        done
+        [ "$count" = 1 ] ||
+            die "$ARCHIVE_NAME does not hold one top-level directory"
+    fi
+    [ -x "$unpacked/zig" ] || die "$ARCHIVE_NAME does not hold a zig executable"
+
+    mkdir -p "$TOOLCHAINS_DIR"
+    mv "$unpacked" "$aim" || die "cannot move the toolchain into $TOOLCHAINS_DIR"
+
+    info "installed Zig++ $RELEASE_VERSION in $aim"
+    INSTALLED_VERSION=$RELEASE_VERSION
+}
+
+install_ppup() {
+    # Install this script as $BIN_DIR/ppup, from the file it runs from or from
+    # the site when it came in on a pipe.
+    mkdir -p "$BIN_DIR"
+    dst=$BIN_DIR/ppup
+
+    if [ -n "${PPUP_SELF:-}" ] && [ -f "$PPUP_SELF" ]; then
+        if [ "$PPUP_SELF" != "$dst" ]; then
+            cp -f "$PPUP_SELF" "$dst" || die "cannot write to $dst"
+        fi
+    elif ! fetch "$PPUP_URL" "$dst.new"; then
+        rm -f "$dst.new"
+        warn "could not download $PPUP_URL, so the ppup command was not installed; zig works, and 'ppup self update' can get it later"
+        return 0
+    else
+        mv -f "$dst.new" "$dst"
+    fi
+    chmod +x "$dst" 2>/dev/null || true
+    info "installed ppup $PPUP_VERSION as $dst"
+}
+
+print_how_to_run() {
+    on_path=0
+    case :$PATH: in
+        *:$BIN_DIR:*) on_path=1 ;;
+    esac
+    if [ "$modify_path" = 1 ] && [ "$on_path" = 0 ]; then
+        info ''
+        info "To use zig in this shell, run:"
+        info "    export PATH=\"$BIN_DIR:\$PATH\""
+    fi
+    info ''
+    info "Run 'zig version' to check the toolchain, or 'ppup help' for the rest."
+}
+
+# -------------------------------------------------------------------- commands
+
+cmd_install() {
+    install_toolchain "$1"
+    install_ppup
+
+    if default=$(default_version); then
+        if [ "$default" != "$INSTALLED_VERSION" ]; then
+            info "Zig++ $INSTALLED_VERSION is not the default: $default is"
+        fi
+    else
+        make_default "$INSTALLED_VERSION"
+        info "Zig++ $INSTALLED_VERSION is now the default toolchain"
+    fi
+
+    add_to_path
+    print_how_to_run
+}
+
+cmd_install_default() {
+    # The `curl | sh` path: newest release, made the default.
+    check_prerequisites
+    install_toolchain latest
+    install_ppup
+    make_default "$INSTALLED_VERSION"
+    info "Zig++ $INSTALLED_VERSION is now the default toolchain"
+    add_to_path
+    print_how_to_run
+}
+
+cmd_update() {
+    check_prerequisites
+    install_toolchain latest
+    install_ppup
+
+    if default=$(default_version) && [ "$default" = "$INSTALLED_VERSION" ]; then
+        info "Zig++ $INSTALLED_VERSION is the newest release, and it is already the default"
+    else
+        make_default "$INSTALLED_VERSION"
+        info "Zig++ $INSTALLED_VERSION is now the default toolchain"
+    fi
+
+    add_to_path
+    print_how_to_run
+}
+
+cmd_default() {
+    if [ $# = 0 ]; then
+        if default=$(default_version); then
+            printf '%s\n' "$default"
+        else
+            info "no default toolchain; set one with: ppup default <version>"
+        fi
+        return 0
+    fi
+
+    resolve_or_die "$1"
+    make_default "$RESOLVED"
+    info "$RESOLVED is now the default toolchain"
+}
+
+cmd_list() {
+    versions=$(sorted_versions)
+    if [ -z "$versions" ]; then
+        info "no toolchains installed; install one with: ppup install <version>"
+        return 0
+    fi
+
+    default=
+    if default=$(default_version); then :; fi
+    for version in $versions; do
+        if [ "$version" = "$default" ]; then
+            printf '* %s (default)\n' "$version"
+        else
+            printf '  %s\n' "$version"
+        fi
+    done
+}
+
+cmd_uninstall() {
+    resolve_or_die "$1"
+    version=$RESOLVED
+    if default=$(default_version) && [ "$default" = "$version" ]; then
+        die "$version is the default toolchain; make another one the default first: ppup default <version>"
+    fi
+
+    rm -rf "${TOOLCHAINS_DIR:?}/$version" || die "cannot remove $TOOLCHAINS_DIR/$version"
+    info "removed Zig++ $version"
+}
+
+cmd_self_update() {
+    check_prerequisites
+    mkdir -p "$BIN_DIR"
+    info "downloading ppup from $PPUP_URL"
+    fetch "$PPUP_URL" "$BIN_DIR/.ppup.new" || die "cannot download $PPUP_URL"
+    if ! grep -q 'PPUP_HOME' "$BIN_DIR/.ppup.new"; then
+        rm -f "$BIN_DIR/.ppup.new"
+        die "$PPUP_URL does not look like ppup; leaving the installed one alone"
+    fi
+    chmod +x "$BIN_DIR/.ppup.new" 2>/dev/null || true
+    mv -f "$BIN_DIR/.ppup.new" "$BIN_DIR/ppup" || die "cannot write to $BIN_DIR/ppup"
+    info "updated $BIN_DIR/ppup"
+}
+
+cmd_self_uninstall() {
+    remove_from_path
+    if [ -d "$PPUP_HOME" ]; then
+        rm -rf "$PPUP_HOME" || die "cannot remove $PPUP_HOME"
+        info "removed $PPUP_HOME"
+    else
+        info "nothing to remove: $PPUP_HOME does not exist"
+    fi
+    info "Zig++ toolchains and ppup are gone; restart your shell to drop the old PATH entry"
+}
+
+# ------------------------------------------------------------------- dispatch
+
+PPUP_SELF=
+if [ -n "${0:-}" ]; then
+    case $0 in
+        */*)
+            if [ -f "$0" ]; then
+                PPUP_SELF=$0
+            fi
+            ;;
+    esac
+fi
+
+command=
+argument=
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        --no-modify-path | -no-modify-path) modify_path=0 ;;
+        --)
+            ;;
+        -h | --help)
+            command=help
+            ;;
+        -V | -v | --version)
+            command=--version
+            ;;
+        -*)
+            die "unknown option: $1 (try: ppup help)"
+            ;;
+        *)
+            if [ -z "$command" ]; then
+                command=$1
+            elif [ -z "$argument" ]; then
+                argument=$1
+            else
+                die "unexpected argument: $1 (try: ppup help)"
+            fi
+            ;;
+    esac
+    shift
+done
+
+case $command in
+    '')
+        cmd_install_default
+        ;;
+    install)
+        [ -n "$argument" ] || die "install needs a version, or 'latest'"
+        check_prerequisites
+        cmd_install "$argument"
+        ;;
+    update)
+        cmd_update
+        ;;
+    default)
+        [ -n "$argument" ] || {
+            cmd_default
+            exit 0
+        }
+        cmd_default "$argument"
+        ;;
+    list)
+        cmd_list
+        ;;
+    uninstall)
+        [ -n "$argument" ] || die "uninstall needs a version (see: ppup list)"
+        cmd_uninstall "$argument"
+        ;;
+    self)
+        case $argument in
+            update)
+                cmd_self_update
+                ;;
+            uninstall)
+                cmd_self_uninstall
+                ;;
+            '')
+                die 'self needs a command: ppup self update, or ppup self uninstall'
+                ;;
+            *)
+                die "unknown self command: $argument (try: ppup help)"
+                ;;
+        esac
+        ;;
+    help)
+        usage
+        ;;
+    --version)
+        info "ppup $PPUP_VERSION"
+        ;;
+    *)
+        die "unknown command: $command (try: ppup help)"
+        ;;
+esac
