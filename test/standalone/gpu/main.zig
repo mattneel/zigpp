@@ -1,26 +1,38 @@
-//! The host side of the `std.gpu` end-to-end test: it loads the two PTX images into the driver
-//! and runs every kernel of `kernels.zig` on a GPU, checking the results against the values that
-//! the same computation produces here, in the test process.
+//! The host side of the `std.gpu` end-to-end test: it loads the kernels of `kernels.zig` into
+//! the driver of a GPU vendor and runs every one of them on a GPU, checking the results against
+//! the values that the same computation produces here, in the test process. `build.zig` builds
+//! this program for each vendor: with `std.gpu.cuda` and PTX images of the kernels, and with
+//! `std.gpu.hip` and AMD code objects of them.
 //!
-//! The test skips itself, with a message and a successful exit, when there is no driver or no
-//! device. Everything else that goes wrong is a test failure: the kernels that fail, the element
-//! of the first mismatches, and the number of checks that passed are printed, and the process
-//! exits with a nonzero status.
+//! The test skips itself, with a message and a successful exit, when there is no driver, no
+//! device, or, on AMD, no code object for the architecture of the device. Everything else that
+//! goes wrong is a test failure: the kernels that fail, the element of the first mismatches, and
+//! the number of checks that passed are printed, and the process exits with a nonzero status.
 
 const std = @import("std");
-const cuda = std.gpu.cuda;
+const builtin = @import("builtin");
+const options = @import("options");
+
+/// The host API of the GPU vendor that this build of the program tests.
+const api = switch (options.backend) {
+    .cuda => std.gpu.cuda,
+    .hip => std.gpu.hip,
+};
+
+/// The start of every message of the program.
+const prefix = "gpu " ++ @tagName(options.backend) ++ ": ";
 
 /// With the argument "assert", the program instead checks that a panic in a kernel stops the
-/// launch with its message, which leaves the context unusable, so it runs in a process of its own.
+/// launch with its message. That leaves a CUDA context unusable, so it runs in a process of its
+/// own.
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const assert_mode = args.len > 1 and std.mem.eql(u8, args[1], "assert");
 
-    var device_name_buffer: [256]u8 = undefined;
-    var driver = cuda.Driver.open() catch |err| switch (err) {
+    var driver = api.Driver.open() catch |err| switch (err) {
         error.DriverNotFound, error.NoDevice => return skip(@errorName(err)),
         else => |open_error| {
-            std.debug.print("gpu_cuda: cannot open the CUDA driver: {s}\n", .{@errorName(open_error)});
+            std.debug.print(prefix ++ "cannot open the driver: {s}\n", .{@errorName(open_error)});
             std.process.exit(1);
         },
     };
@@ -29,16 +41,38 @@ pub fn main(init: std.process.Init) !void {
     const device_count = driver.deviceCount() catch |err| return fail("count the devices", err);
     if (device_count == 0) return skip("no device");
     const device = driver.device(0) catch |err| return fail("open the device", err);
+
+    var device_name_buffer: [256]u8 = undefined;
     const name = device.name(&device_name_buffer) catch "unknown";
-    const capability = device.computeCapability() catch cuda.ComputeCapability{ .major = 0, .minor = 0 };
-    const version = driver.version() catch cuda.Version{ .major = 0, .minor = 0 };
+    var arch_buffer: [256]u8 = undefined;
+    const images: [2]Image = switch (options.backend) {
+        .cuda => .{
+            .{ .name = "debug", .data = @embedFile("kernels_debug") },
+            .{ .name = "fast", .data = @embedFile("kernels_fast") },
+        },
+        // A code object only loads on a device of the architecture that it was compiled for.
+        .hip => images: {
+            const arch = device.archName(&arch_buffer) catch |err| return fail("read the architecture of the device", err);
+            break :images findCodeObjects(arch) orelse {
+                std.debug.print(prefix ++ "skipping, no code object for the {s} of {s}; build with -Damdgpu-arch={s}\n", .{
+                    arch, name, arch,
+                });
+                return;
+            };
+        },
+    };
+    const warp_size = device.attribute(.warp_size) catch |err| return fail("read the warp size of the device", err);
 
     const context = device.retainPrimaryContext() catch |err| return fail("retain the primary context", err);
     defer context.release();
 
     // The kernels that format text and parse JSON need more stack and more buffered output than
-    // the defaults of a context give them.
-    context.setLimit(.stack_size, 256 * 1024) catch |err| switch (err) {
+    // the defaults of a context give them. The AMD runtime takes at most 128 KiB - 16 of stack.
+    const stack_size: usize = switch (options.backend) {
+        .cuda => 256 * 1024,
+        .hip => 64 * 1024,
+    };
+    context.setLimit(.stack_size, stack_size) catch |err| switch (err) {
         error.UnsupportedLimit => {},
         else => return fail("set the stack size", err),
     };
@@ -51,37 +85,44 @@ pub fn main(init: std.process.Init) !void {
         else => return fail("set the device heap size", err),
     };
 
-    if (assert_mode) return testPanicAssert(context);
+    temp_dir = switch (builtin.os.tag) {
+        .windows => init.environ_map.get("TEMP") orelse ".",
+        else => "/tmp",
+    };
+    if (assert_mode) return testPanicAssert(init.io, context, images[0]);
 
-    std.debug.print("gpu_cuda: {s}, CUDA {d}.{d}, compute capability {d}.{d}\n", .{
-        name, version.major, version.minor, capability.major, capability.minor,
-    });
-
-    const images = [_]Image{ debug_image, fast_image };
+    printDevice(&driver, device, name, images[0]);
 
     var failed = false;
     for (images) |image| {
         var error_log: [16 * 1024]u8 = undefined;
         @memset(&error_log, 0);
-        const module = context.loadModule(image.ptx, .{ .error_log = &error_log }) catch |err| {
-            std.debug.print("gpu_cuda: cannot load the {s} module: {s}\n{s}\n", .{
+        const module = context.loadModule(image.data, .{ .error_log = &error_log }) catch |err| {
+            std.debug.print(prefix ++ "cannot load the {s} module: {s}\n{s}\n", .{
                 image.name, @errorName(err), std.mem.sliceTo(&error_log, 0),
             });
             return std.process.exit(1);
         };
         defer module.unload();
 
-        var runner: Runner = .{ .context = context, .module = module, .image = image.name };
+        var runner: Runner = .{
+            .io = init.io,
+            .context = context,
+            .module = module,
+            .image = image.name,
+            .warp_size = @intCast(warp_size),
+        };
         for (tests) |one| {
+            if (one.backend) |only| if (only != options.backend) continue;
             runner.kernel = one.name;
             one.run(&runner);
             if (runner.device_faulted) {
-                std.debug.print("gpu_cuda: {s} PTX: the device faulted, the rest of this image is not tested\n", .{image.name});
+                std.debug.print(prefix ++ "{s} image: the device faulted, the rest of this image is not tested\n", .{image.name});
                 break;
             }
         }
         if (runner.failures != 0) failed = true;
-        std.debug.print("gpu_cuda: {s} PTX: {d} launches, {d} checks passed, {d} failed\n", .{
+        std.debug.print(prefix ++ "{s} image: {d} launches, {d} checks passed, {d} failed\n", .{
             image.name, runner.launches, runner.checks, runner.failures,
         });
     }
@@ -89,31 +130,66 @@ pub fn main(init: std.process.Init) !void {
     if (failed) std.process.exit(1);
 }
 
+fn printDevice(driver: *const api.Driver, device: api.Device, name: []const u8, image: Image) void {
+    const version = driver.version() catch return std.debug.print(prefix ++ "{s}\n", .{name});
+    switch (options.backend) {
+        .cuda => {
+            const capability = device.computeCapability() catch api.ComputeCapability{ .major = 0, .minor = 0 };
+            std.debug.print(prefix ++ "{s}, CUDA {d}.{d}, compute capability {d}.{d}\n", .{
+                name, version.major, version.minor, capability.major, capability.minor,
+            });
+        },
+        .hip => std.debug.print(prefix ++ "{s}, HIP {d}.{d}.{d}, code objects for {s}\n", .{
+            name, version.major, version.minor, version.patch, image.arch,
+        }),
+    }
+}
+
 fn skip(reason: []const u8) void {
-    std.debug.print("gpu_cuda: skipping, no GPU to test on: {s}\n", .{reason});
+    std.debug.print(prefix ++ "skipping, no GPU to test on: {s}\n", .{reason});
 }
 
 fn fail(what: []const u8, err: anyerror) void {
-    std.debug.print("gpu_cuda: cannot {s}: {s}\n", .{ what, @errorName(err) });
+    std.debug.print(prefix ++ "cannot {s}: {s}\n", .{ what, @errorName(err) });
     std.process.exit(1);
 }
 
-/// One PTX image of the kernels, embedded in this program by `build.zig`.
+/// One image of the kernels, embedded in this program by `build.zig`: PTX assembly for CUDA,
+/// which needs a null byte on the end, or a code object for HIP.
 const Image = struct {
     name: []const u8,
-    ptx: [:0]const u8,
+    data: switch (options.backend) {
+        .cuda => [:0]const u8,
+        .hip => []const u8,
+    },
+    /// The architecture of a code object, as `-mcpu` names it.
+    arch: []const u8 = "",
 };
 
-const debug_image: Image = .{ .name = "debug", .ptx = @embedFile("kernels_debug.ptx") };
-const fast_image: Image = .{ .name = "fast", .ptx = @embedFile("kernels_fast.ptx") };
+/// The debug and the fast code object for the architecture that `Device.archName` reports as
+/// `arch`, such as "gfx1036" or "gfx90a:sramecc+:xnack-". Only the names of the architectures
+/// are compared: a code object for other settings of their features fails to load.
+fn findCodeObjects(arch: []const u8) ?[2]Image {
+    const code_objects = @import("code_objects");
+    const device_arch = arch[0 .. std.mem.findScalar(u8, arch, ':') orelse arch.len];
+    inline for (code_objects.all) |entry| {
+        const cpu = entry.arch;
+        const cpu_name = cpu[0 .. std.mem.findAny(u8, cpu, "+-") orelse cpu.len];
+        if (std.mem.eql(u8, cpu_name, device_arch)) return .{
+            .{ .name = "debug", .data = entry.debug, .arch = cpu },
+            .{ .name = "fast", .data = entry.fast, .arch = cpu },
+        };
+    }
+    return null;
+}
 
 /// Launches `outOfBoundsKernel` from the debug image, whose threads past the end of the slice
 /// fail its bounds check, and checks that the launch fails with `error.Assert` and that the driver
 /// reported the panic message of the first failing thread.
-fn testPanicAssert(context: cuda.Context) void {
+fn testPanicAssert(io: std.Io, context: api.Context, debug_image: Image) void {
     var error_log: [16 * 1024]u8 = @splat(0);
-    const module = context.loadModule(debug_image.ptx, .{ .error_log = &error_log }) catch |err| {
-        std.debug.print("gpu_cuda: cannot load the debug module: {s}\n{s}\n", .{ @errorName(err), std.mem.sliceTo(&error_log, 0) });
+    const module = context.loadModule(debug_image.data, .{ .error_log = &error_log }) catch |err| {
+        std.debug.print(prefix ++ "cannot load the debug module: {s}\n{s}\n", .{ @errorName(err), std.mem.sliceTo(&error_log, 0) });
         std.process.exit(1);
     };
     defer module.unload();
@@ -121,7 +197,7 @@ fn testPanicAssert(context: cuda.Context) void {
     const buffer = context.alloc(u32, 64) catch |err| return fail("allocate for outOfBoundsKernel", err);
     defer buffer.free();
 
-    var capture = OutputCapture.begin(2) catch |err| return fail("capture the standard error of outOfBoundsKernel", err);
+    var capture = OutputCapture.begin(io, .stderr) catch |err| return fail("capture the standard error of outOfBoundsKernel", err);
     defer capture.deinit();
     kernel.launch(.linear(64, 64), .{ buffer, @as(u32, 40) }) catch |err| return fail("launch outOfBoundsKernel", err);
     const result = context.synchronize();
@@ -132,12 +208,12 @@ fn testPanicAssert(context: cuda.Context) void {
     if (!asserted or std.mem.indexOf(u8, reported, expected_message) == null or
         std.mem.indexOf(u8, reported, "thread: [40,0,0]") == null)
     {
-        std.debug.print("gpu_cuda: outOfBoundsKernel: expected error.Assert and the message\n  {s}\ngot {any} and:\n{s}\n", .{
+        std.debug.print(prefix ++ "outOfBoundsKernel: expected error.Assert and the message\n  {s}\ngot {any} and:\n{s}\n", .{
             expected_message, result, reported,
         });
         std.process.exit(1);
     }
-    std.debug.print("gpu_cuda: a panic in the debug image stops the launch with its message\n", .{});
+    std.debug.print(prefix ++ "a panic in the debug image stops the launch with its message\n", .{});
 }
 
 /// A test of one example, or of one group of kernels: it launches the kernels and checks the
@@ -146,15 +222,21 @@ const Test = struct {
     /// The name of the example or of the group, for the messages of failed launches.
     name: []const u8,
     run: *const fn (*Runner) void,
+    /// The only backend that has the kernels of the test, if they are not in every image.
+    backend: ?@TypeOf(options.backend) = null,
 };
 
-/// The state of a run of every kernel of one PTX image: the module to look the kernels up in, and
+/// The state of a run of every kernel of one image: the module to look the kernels up in, and
 /// the counts of the summary.
 const Runner = struct {
-    context: cuda.Context,
-    module: cuda.Module,
-    /// The name of the PTX image, "debug" or "fast", for the messages.
+    io: std.Io,
+    context: api.Context,
+    module: api.Module,
+    /// The name of the image, "debug" or "fast", for the messages.
     image: []const u8,
+    /// The number of threads in a warp of the device, which the kernels compiled in as
+    /// `std.gpu.warp_size`.
+    warp_size: u32,
     /// The name of the kernel that the current test launches, for the messages of failed checks.
     kernel: []const u8 = "",
     checks: u64 = 0,
@@ -172,7 +254,7 @@ const Runner = struct {
     /// Launches the kernel `name` and waits for it. A launch or a device failure is reported and
     /// counted here, and the checks of that kernel are skipped, because the kernel did not write
     /// its results.
-    fn run(r: *Runner, name: [:0]const u8, config: cuda.LaunchConfig, args: anytype) void {
+    fn run(r: *Runner, name: [:0]const u8, config: api.LaunchConfig, args: anytype) void {
         r.kernel = name;
         r.reported = 0;
         const function = r.module.function(name) catch |err| return r.reportError(name, "find", err);
@@ -183,7 +265,7 @@ const Runner = struct {
 
     /// Launches a one-dimensional kernel over `n` elements in blocks of `threads` threads.
     fn runLinear(r: *Runner, name: [:0]const u8, n: u32, threads: u32, args: anytype) void {
-        r.run(name, cuda.LaunchConfig.linear(n, threads), args);
+        r.run(name, api.LaunchConfig.linear(n, threads), args);
     }
 
     fn reportError(r: *Runner, name: []const u8, what: []const u8, err: anyerror) void {
@@ -192,13 +274,13 @@ const Runner = struct {
         // A kernel that fails on the device leaves the whole context unusable: every call after
         // it fails with the same error, and nothing of this image can be tested any more.
         if (err == error.IllegalAddress or err == error.IllegalInstruction) r.device_faulted = true;
-        std.debug.print("gpu_cuda: {s} PTX: cannot {s} the kernel {s}: {s}\n", .{
+        std.debug.print(prefix ++ "{s} image: cannot {s} the kernel {s}: {s}\n", .{
             r.image, what, name, @errorName(err),
         });
     }
 
     /// Copies `values` into a new buffer of device memory.
-    fn upload(r: *Runner, comptime T: type, values: []const T) !cuda.Buffer(T) {
+    fn upload(r: *Runner, comptime T: type, values: []const T) !api.Buffer(T) {
         const buffer = try r.context.alloc(T, values.len);
         errdefer buffer.free();
         try buffer.copyFromHost(values);
@@ -239,7 +321,7 @@ const Runner = struct {
         r.failures += 1;
         r.reported += 1;
         if (r.reported > 10) return;
-        std.debug.print("gpu_cuda: {s} PTX: kernel {s}: the output does not contain \"{s}\"\n", .{
+        std.debug.print(prefix ++ "{s} image: kernel {s}: the output does not contain \"{s}\"\n", .{
             r.image, r.kernel, part,
         });
     }
@@ -253,18 +335,18 @@ const Runner = struct {
         r.failures += 1;
         r.reported += 1;
         if (r.reported > 10) return;
-        std.debug.print("gpu_cuda: {s} PTX: kernel {s}: element {d}: expected " ++ expected_fmt ++ ", found " ++ actual_fmt ++ "\n", .{
+        std.debug.print(prefix ++ "{s} image: kernel {s}: element {d}: expected " ++ expected_fmt ++ ", found " ++ actual_fmt ++ "\n", .{
             r.image, r.kernel, index,
         } ++ expected_args ++ actual_args);
     }
 };
 
 /// The grid of a 2D kernel that covers `x` by `y` elements in tiles of `tile` by `tile`.
-fn grid2D(x: u32, y: u32, tile: u32) cuda.Dim3 {
+fn grid2D(x: u32, y: u32, tile: u32) api.Dim3 {
     return .{ .x = (x + tile - 1) / tile, .y = (y + tile - 1) / tile, .z = 1 };
 }
 
-fn block2D(tile: u32) cuda.Dim3 {
+fn block2D(tile: u32) api.Dim3 {
     return .{ .x = tile, .y = tile, .z = 1 };
 }
 
@@ -279,62 +361,109 @@ fn equalValues(comptime T: type, expected: T, actual: T) bool {
     return expected == actual;
 }
 
-// The driver writes the output of `std.gpu.print` to the standard output of this process, and
-// the message of a failed device assertion to its standard error, so a check of that text reads
-// it from a temporary file that the stream is redirected into while the kernel runs.
+// The drivers write the output of `std.gpu.print` to the standard output of this process, and the
+// message of a failed device assertion to its standard error: the CUDA driver with the C standard
+// streams, and `std.gpu.hip` with `std.Io.File.stdout` and `std.Io.File.stderr`. A check of that
+// text reads it from a temporary file that the stream is redirected into while the kernel runs.
 
 extern "c" fn fflush(stream: ?*anyopaque) c_int;
 
+/// The directory of the temporary files of `OutputCapture`, which `main` sets.
+var temp_dir: []const u8 = "/tmp";
+
 const OutputCapture = struct {
-    /// The file descriptor that is redirected: 1 for the standard output, 2 for standard error.
-    fd: c_int,
-    path: [64:0]u8 = undefined,
+    io: std.Io,
+    stream: Stream,
+    path_buffer: [1024]u8 = undefined,
     path_len: usize = 0,
-    file: c_int = -1,
-    saved: c_int = -1,
-    active: bool = false,
+    file: ?std.Io.File = null,
+    /// The file descriptor, or on Windows the handle, that the stream had before.
+    saved: ?Handle = null,
     buffer: [64 * 1024]u8 = undefined,
 
-    /// Redirects the stream `fd` of the process into a temporary file.
-    fn begin(fd: c_int) !OutputCapture {
-        var capture: OutputCapture = .{ .fd = fd };
-        const path = try std.mem.printSentinel(capture.path[0..capture.path.len], "/tmp/zig-gpu-cuda-{d}-{d}.txt", .{ std.c.getpid(), fd }, 0);
+    const Stream = enum { stdout, stderr };
+
+    const Handle = switch (builtin.os.tag) {
+        .windows => @TypeOf(std.os.windows.peb().ProcessParameters.hStdOutput),
+        else => c_int,
+    };
+
+    /// Redirects `stream` of the process into a temporary file.
+    fn begin(io: std.Io, stream: Stream) !OutputCapture {
+        var capture: OutputCapture = .{ .io = io, .stream = stream };
+        errdefer capture.deinit();
+        const pid = switch (builtin.os.tag) {
+            .windows => std.os.windows.GetCurrentProcessId(),
+            else => std.c.getpid(),
+        };
+        const path = try std.fmt.bufPrint(&capture.path_buffer, "{s}{c}zig-gpu-{d}-{t}.txt", .{
+            temp_dir, std.fs.path.sep, pid, stream,
+        });
         capture.path_len = path.len;
-        const path_pointer: [*:0]const u8 = @ptrCast(&capture.path);
-        capture.file = std.c.open(path_pointer, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o600));
-        if (capture.file < 0) return error.OpenFailed;
-        capture.saved = std.c.dup(fd);
-        if (capture.saved < 0 or std.c.dup2(capture.file, fd) < 0) return error.RedirectFailed;
-        capture.active = true;
+        const file = try std.Io.Dir.createFileAbsolute(io, path, .{ .read = true });
+        capture.file = file;
+        switch (builtin.os.tag) {
+            // `std.Io.File.stdout` and `stderr` read the handles from the process parameters.
+            .windows => {
+                const handle = capture.handleSlot();
+                capture.saved = handle.*;
+                handle.* = file.handle;
+            },
+            else => {
+                const saved = std.c.dup(capture.fd());
+                if (saved < 0) return error.RedirectFailed;
+                capture.saved = saved;
+                if (std.c.dup2(file.handle, capture.fd()) < 0) return error.RedirectFailed;
+            },
+        }
         return capture;
     }
 
     /// Restores the stream and returns the text that the driver wrote to it. The host must have
     /// synchronized with the device first, because that is when the driver writes the text.
     fn end(capture: *OutputCapture) []const u8 {
-        // The driver writes the output with the C standard streams, which buffer it.
-        _ = fflush(null);
-        if (std.c.dup2(capture.saved, capture.fd) < 0) return "";
-        capture.active = false;
-        if (std.c.lseek(capture.file, 0, std.c.SEEK.SET) < 0) return "";
-        var total: usize = 0;
-        while (total < capture.buffer.len) {
-            const count = std.c.read(capture.file, capture.buffer[total..].ptr, capture.buffer.len - total);
-            if (count <= 0) break;
-            total += @intCast(count);
-        }
-        return capture.buffer[0..total];
+        capture.restore();
+        const file = capture.file orelse return "";
+        const len = file.readPositionalAll(capture.io, &capture.buffer, 0) catch return "";
+        return capture.buffer[0..len];
     }
 
     fn deinit(capture: *OutputCapture) void {
-        if (capture.active) {
-            _ = fflush(null);
-            _ = std.c.dup2(capture.saved, capture.fd);
-            capture.active = false;
+        capture.restore();
+        if (capture.file) |file| {
+            file.close(capture.io);
+            std.Io.Dir.deleteFileAbsolute(capture.io, capture.path_buffer[0..capture.path_len]) catch {};
+            capture.file = null;
         }
-        if (capture.saved >= 0) _ = std.c.close(capture.saved);
-        if (capture.file >= 0) _ = std.c.close(capture.file);
-        if (capture.path_len != 0) _ = std.c.unlink(@ptrCast(&capture.path));
+    }
+
+    fn restore(capture: *OutputCapture) void {
+        const saved = capture.saved orelse return;
+        capture.saved = null;
+        switch (builtin.os.tag) {
+            .windows => capture.handleSlot().* = saved,
+            else => {
+                // The CUDA driver writes with the C standard streams, which buffer the text.
+                _ = fflush(null);
+                _ = std.c.dup2(saved, capture.fd());
+                _ = std.c.close(saved);
+            },
+        }
+    }
+
+    fn fd(capture: *const OutputCapture) c_int {
+        return switch (capture.stream) {
+            .stdout => 1,
+            .stderr => 2,
+        };
+    }
+
+    fn handleSlot(capture: *const OutputCapture) *Handle {
+        const parameters = std.os.windows.peb().ProcessParameters;
+        return switch (capture.stream) {
+            .stdout => &parameters.hStdOutput,
+            .stderr => &parameters.hStdError,
+        };
     }
 };
 
@@ -361,7 +490,7 @@ const tests = [_]Test{
     .{ .name = "builtin_math", .run = testBuiltinMath },
     .{ .name = "f128", .run = testF128 },
     .{ .name = "parse_float", .run = testParseFloat },
-    .{ .name = "device_heap", .run = testDeviceHeap },
+    .{ .name = "device_heap", .run = testDeviceHeap, .backend = .cuda },
     .{ .name = "bump_allocator", .run = testBumpAllocator },
 };
 
@@ -476,6 +605,8 @@ fn testHistogram(r: *Runner) void {
     defer y_buffer.free();
     const pairs_buffer = r.context.alloc(u32, num_bins_x * num_bins_y) catch |err| return r.reportError("histogram2D", "allocate for", err);
     defer pairs_buffer.free();
+    // New device memory is not necessarily zero: it may hold what an earlier kernel left there.
+    pairs_buffer.zero() catch |err| return r.reportError("histogram2D", "clear the bins of", err);
 
     r.runLinear("histogram2D", n, 256, .{ x_buffer, y_buffer, pairs_buffer, @as(u32, n), @as(u32, num_bins_x), @as(u32, num_bins_y) });
     var pair_counts: [num_bins_x * num_bins_y]u32 = undefined;
@@ -484,72 +615,81 @@ fn testHistogram(r: *Runner) void {
 }
 
 fn testWarp(r: *Runner) void {
-    // A multiple of the warp size, so that every warp of the grid is full, and not a multiple of
-    // the block size, so that the last block is partial and several blocks run.
+    // A multiple of the warp size of every GPU, 32 or 64 threads, so that every warp of the grid
+    // is full, and not a multiple of the block size, so that the last block is partial and several
+    // blocks run.
     const n = less_odd_size;
     const threads = 256;
-    const warps_per_block = threads / 32;
     const blocks = (n + threads - 1) / threads;
+    const max_warps = blocks * threads / 32;
+    const warp_size = r.warp_size;
+    const warps = blocks * threads / warp_size;
 
     var input: [n]u32 = undefined;
     for (&input, 0..) |*value, i| value.* = @intCast((i * 13 + 5) % 100 + 1);
 
     const input_buffer = r.upload(u32, &input) catch |err| return r.reportError("warpSumKernel", "upload to", err);
     defer input_buffer.free();
-    const output_buffer = r.context.alloc(u32, blocks * warps_per_block) catch |err| return r.reportError("warpSumKernel", "allocate for", err);
+    const output_buffer = r.context.alloc(u32, max_warps) catch |err| return r.reportError("warpSumKernel", "allocate for", err);
     defer output_buffer.free();
+    const mask_buffer = r.context.alloc(u64, max_warps) catch |err| return r.reportError("ballotKernel", "allocate for", err);
+    defer mask_buffer.free();
 
     // The threads past the end of the input take part in the warp functions with a zero value, so
     // the results of the last warps are the sum, the vote, or the shuffle of the elements that
     // exist and of those zeros.
     const warpValue = struct {
-        fn of(index: u32) u32 {
-            return if (index < n) (index * 13 + 5) % 100 + 1 else 0;
+        fn of(index: usize) u32 {
+            return if (index < n) @intCast((index * 13 + 5) % 100 + 1) else 0;
         }
     }.of;
 
+    var results_buffer: [max_warps]u32 = undefined;
+    const results = results_buffer[0..warps];
+
     r.runLinear("warpSumKernel", n, threads, .{ input_buffer, output_buffer, @as(u32, n) });
-    var results: [blocks * warps_per_block]u32 = undefined;
-    output_buffer.copyToHost(&results) catch |err| return r.reportError("warpSumKernel", "copy the results of", err);
+    output_buffer.copyToHost(results) catch |err| return r.reportError("warpSumKernel", "copy the results of", err);
     for (results, 0..) |result, warp| {
         var expected: u32 = 0;
-        for (0..32) |lane| expected += warpValue(@intCast(warp * 32 + lane));
+        for (0..warp_size) |lane| expected += warpValue(warp * warp_size + lane);
         r.expect(warp, expected, result);
     }
 
     r.runLinear("warpMaxKernel", n, threads, .{ input_buffer, output_buffer, @as(u32, n) });
-    output_buffer.copyToHost(&results) catch |err| return r.reportError("warpMaxKernel", "copy the results of", err);
+    output_buffer.copyToHost(results) catch |err| return r.reportError("warpMaxKernel", "copy the results of", err);
     for (results, 0..) |result, warp| {
         var expected: u32 = 0;
-        for (0..32) |lane| expected = @max(expected, warpValue(@intCast(warp * 32 + lane)));
+        for (0..warp_size) |lane| expected = @max(expected, warpValue(warp * warp_size + lane));
         r.expect(warp, expected, result);
     }
 
     r.runLinear("warpMinKernel", n, threads, .{ input_buffer, output_buffer, @as(u32, n) });
-    output_buffer.copyToHost(&results) catch |err| return r.reportError("warpMinKernel", "copy the results of", err);
+    output_buffer.copyToHost(results) catch |err| return r.reportError("warpMinKernel", "copy the results of", err);
     for (results, 0..) |result, warp| {
         var expected: u32 = std.math.maxInt(u32);
-        for (0..32) |lane| expected = @min(expected, warpValue(@intCast(warp * 32 + lane)));
+        for (0..warp_size) |lane| expected = @min(expected, warpValue(warp * warp_size + lane));
         r.expect(warp, expected, result);
     }
 
-    r.runLinear("ballotKernel", n, threads, .{ input_buffer, output_buffer, @as(u32, n) });
-    output_buffer.copyToHost(&results) catch |err| return r.reportError("ballotKernel", "copy the results of", err);
-    for (results, 0..) |result, warp| {
-        var expected: u32 = 0;
-        for (0..32) |lane| {
-            if (warpValue(@intCast(warp * 32 + lane)) > 100) expected |= @as(u32, 1) << @intCast(lane);
+    r.runLinear("ballotKernel", n, threads, .{ input_buffer, mask_buffer, @as(u32, n) });
+    var masks_buffer: [max_warps]u64 = undefined;
+    const masks = masks_buffer[0..warps];
+    mask_buffer.copyToHost(masks) catch |err| return r.reportError("ballotKernel", "copy the results of", err);
+    for (masks, 0..) |mask, warp| {
+        var expected: u64 = 0;
+        for (0..warp_size) |lane| {
+            if (warpValue(warp * warp_size + lane) > 100) expected |= @as(u64, 1) << @intCast(lane);
         }
-        r.expect(warp, expected, result);
+        r.expect(warp, expected, mask);
     }
 
     r.runLinear("checkDivergence", n, threads, .{ input_buffer, output_buffer, @as(u32, n) });
-    output_buffer.copyToHost(&results) catch |err| return r.reportError("checkDivergence", "copy the results of", err);
+    output_buffer.copyToHost(results) catch |err| return r.reportError("checkDivergence", "copy the results of", err);
     for (results, 0..) |result, warp| {
-        const first = warpValue(@intCast(warp * 32)) > 50;
+        const first = warpValue(warp * warp_size) > 50;
         var agree = true;
-        for (0..32) |lane| {
-            if ((warpValue(@intCast(warp * 32 + lane)) > 50) != first) agree = false;
+        for (0..warp_size) |lane| {
+            if ((warpValue(warp * warp_size + lane) > 50) != first) agree = false;
         }
         r.expect(warp, @as(u32, @intFromBool(agree)), result);
     }
@@ -559,10 +699,9 @@ fn testWarp(r: *Runner) void {
     r.runLinear("shuffleBroadcastKernel", n, threads, .{ input_buffer, broadcast_buffer, @as(u32, n) });
     var broadcast: [n]u32 = undefined;
     broadcast_buffer.copyToHost(&broadcast) catch |err| return r.reportError("shuffleBroadcastKernel", "copy the results of", err);
-    for (&input, &broadcast, 0..) |value, result, i| {
-        _ = value;
+    for (&broadcast, 0..) |result, i| {
         // Every element of a warp gets the value of the first lane of that warp.
-        r.expect(i, input[i / 32 * 32], result);
+        r.expect(i, input[i / warp_size * warp_size], result);
     }
 
     const shuffled = r.context.alloc(u32, n * 3) catch |err| return r.reportError("shuffleKernel", "allocate for", err);
@@ -575,13 +714,13 @@ fn testWarp(r: *Runner) void {
     for (0..3) |which| {
         r.kernel = "shuffleKernel";
         for (0..n) |i| {
-            const lane = i % 32;
+            const lane = i % warp_size;
             const source = switch (which) {
-                0 => if (lane + 1 < 32) i + 1 else i,
+                0 => if (lane + 1 < warp_size) i + 1 else i,
                 1 => if (lane >= 1) i - 1 else i,
                 else => i ^ 1,
             };
-            r.expect(i, warpValue(@intCast(source)), shuffle_results[which * n + i]);
+            r.expect(i, warpValue(source), shuffle_results[which * n + i]);
         }
     }
 }
@@ -613,7 +752,7 @@ fn testMatrixMul(r: *Runner) void {
     defer c_buffer.free();
 
     var actual: [m * n]f32 = undefined;
-    const naive_config: cuda.LaunchConfig = .{ .grid = grid2D(n, m, 16), .block = block2D(16) };
+    const naive_config: api.LaunchConfig = .{ .grid = grid2D(n, m, 16), .block = block2D(16) };
     r.run("matrixMulNaive", naive_config, .{ a_buffer, b_buffer, c_buffer, @as(u32, m), @as(u32, n), @as(u32, k) });
     c_buffer.copyToHost(&actual) catch |err| return r.reportError("matrixMulNaive", "copy the results of", err);
     r.expectSlice(&expected, &actual);
@@ -625,7 +764,7 @@ fn testMatrixMul(r: *Runner) void {
     // A block of 32 columns of threads and 8 rows: the kernel tiles the output in 32 by 32
     // elements, and a block of 32 by 32 threads needs more registers than the debug build of the
     // kernel has.
-    const large_config: cuda.LaunchConfig = .{ .grid = grid2D(n, m, 32), .block = .{ .x = 32, .y = 8, .z = 1 } };
+    const large_config: api.LaunchConfig = .{ .grid = grid2D(n, m, 32), .block = .{ .x = 32, .y = 8, .z = 1 } };
     r.run("matrixMulLargeTile", large_config, .{ a_buffer, b_buffer, c_buffer, @as(u32, m), @as(u32, n), @as(u32, k) });
     c_buffer.copyToHost(&actual) catch |err| return r.reportError("matrixMulLargeTile", "copy the results of", err);
     r.expectSlice(&expected, &actual);
@@ -648,7 +787,7 @@ fn testConvolution(r: *Runner) void {
     const output_buffer = r.context.alloc(f32, width * height) catch |err| return r.reportError("convolution2D", "allocate for", err);
     defer output_buffer.free();
 
-    const config: cuda.LaunchConfig = .{ .grid = grid2D(width, height, 16), .block = block2D(16) };
+    const config: api.LaunchConfig = .{ .grid = grid2D(width, height, 16), .block = block2D(16) };
     r.run("convolution2D", config, .{
         input_buffer, output_buffer, filter_buffer, @as(u32, width), @as(u32, height), @as(u32, filter_size),
     });
@@ -672,7 +811,7 @@ fn testConvolution(r: *Runner) void {
     }
 
     // The transposition of the same input.
-    const transpose_config: cuda.LaunchConfig = .{ .grid = grid2D(width, height, 16), .block = block2D(16) };
+    const transpose_config: api.LaunchConfig = .{ .grid = grid2D(width, height, 16), .block = block2D(16) };
     const transposed_buffer = r.context.alloc(f32, width * height) catch |err| return r.reportError("transpose", "allocate for", err);
     defer transposed_buffer.free();
     r.run("transpose", transpose_config, .{ input_buffer, transposed_buffer, @as(u32, width), @as(u32, height) });
@@ -739,7 +878,7 @@ fn testStencil(r: *Runner) void {
     defer image_output_buffer.free();
     var image_actual: [width * height]f32 = undefined;
 
-    const config: cuda.LaunchConfig = .{ .grid = grid2D(width, height, 16), .block = block2D(16) };
+    const config: api.LaunchConfig = .{ .grid = grid2D(width, height, 16), .block = block2D(16) };
     r.run("stencil2DLaplace", config, .{ image_buffer, image_output_buffer, @as(u32, width), @as(u32, height) });
     image_output_buffer.copyToHost(&image_actual) catch |err| return r.reportError("stencil2DLaplace", "copy the results of", err);
     for (0..height) |y| {
@@ -972,7 +1111,7 @@ fn testBase64(r: *Runner) void {
     const round_trip_buffer = r.context.alloc(u32, 1) catch |err| return r.reportError("base64RoundTripKernel", "allocate for", err);
     defer round_trip_buffer.free();
 
-    var capture = OutputCapture.begin(1) catch |err| return r.reportError("base64RoundTripKernel", "capture the output of", err);
+    var capture = OutputCapture.begin(r.io, .stdout) catch |err| return r.reportError("base64RoundTripKernel", "capture the output of", err);
     defer capture.deinit();
     r.runLinear("base64RoundTripKernel", 1, 1, .{ round_buffer, @as(u32, round_n), round_trip_buffer });
     const printed = capture.end();
@@ -1245,7 +1384,7 @@ fn testDynamic(r: *Runner) void {
 
 fn testPrintf(r: *Runner) void {
     // One thread, so that the order of the lines is the order of the calls of that thread.
-    var capture = OutputCapture.begin(1) catch |err| return r.reportError("printfKernel", "capture the output of", err);
+    var capture = OutputCapture.begin(r.io, .stdout) catch |err| return r.reportError("printfKernel", "capture the output of", err);
     defer capture.deinit();
     r.runLinear("printfKernel", 1, 1, .{});
     const printed = capture.end();
@@ -1259,7 +1398,7 @@ fn testPrintf(r: *Runner) void {
     // `std.gpu.print` makes possible.
     r.expectContains(printed, "100%");
 
-    var capture_math = OutputCapture.begin(1) catch |err| return r.reportError("mathPrintfKernel", "capture the output of", err);
+    var capture_math = OutputCapture.begin(r.io, .stdout) catch |err| return r.reportError("mathPrintfKernel", "capture the output of", err);
     defer capture_math.deinit();
     r.runLinear("mathPrintfKernel", 1, 1, .{@as(f32, 1.5)});
     const printed_math = capture_math.end();
@@ -1290,7 +1429,7 @@ fn testPrintf(r: *Runner) void {
         r.expect(0, value * value + 2 * value + 1, result);
     }
 
-    var capture_debug = OutputCapture.begin(1) catch |err| return r.reportError("debugComputeKernel", "capture the output of", err);
+    var capture_debug = OutputCapture.begin(r.io, .stdout) catch |err| return r.reportError("debugComputeKernel", "capture the output of", err);
     defer capture_debug.deinit();
     r.runLinear("debugComputeKernel", 1, 1, .{ input_buffer, output_buffer, @as(u32, 1) });
     const printed_debug = capture_debug.end();
