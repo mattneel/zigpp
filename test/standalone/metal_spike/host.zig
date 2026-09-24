@@ -612,7 +612,7 @@ fn testReduce(session: *const Session, report: *Report) !void {
         "reduce: out[{d}]: expected {d} (0x{x:0>8}), got {d} (0x{x:0>8}); {d} of {d} group sums differ; counter {d}, expected {d}",
         .{
             first_group, expected[first_group], floatBits(expected[first_group]), results[first_group], floatBits(results[first_group]),
-            mismatches, group_count, counter, group_count,
+            mismatches,  group_count,           counter,                          group_count,
         },
     );
     if (counter != group_count) return report.fail(
@@ -690,8 +690,8 @@ fn testParse(session: *const Session, report: *Report) !void {
         return report.fail(
             "parsef: \"{s}\": expected {d} (0x{x:0>8}), got {d} (0x{x:0>8}); {d} of {d} numbers differ",
             .{
-                parse_numbers[index], parse_expected[index], floatBits(parse_expected[index]),
-                results[index],                    floatBits(results[index]),           mismatches,
+                parse_numbers[index], parse_expected[index],     floatBits(parse_expected[index]),
+                results[index],       floatBits(results[index]), mismatches,
                 threads,
             },
         );
