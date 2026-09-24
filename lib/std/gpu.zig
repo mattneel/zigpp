@@ -26,17 +26,38 @@
 //! and launches kernels with `cuda.Function.launch`. PTX for an older `-mcpu` also runs on newer
 //! GPUs, because the driver compiles it for the GPU when it is loaded.
 //!
-//! The device-side functions in this namespace are implemented for NVPTX. The indexing functions
-//! use builtins that also exist for other GPU targets.
+//! For AMD GPUs, compile kernels to a code object, the shared library of machine code that the
+//! HIP runtime loads:
+//!
+//! ```
+//! zig build-lib -dynamic -target amdgcn-amdhsa -mcpu=gfx1036 -O ReleaseFast kernels.zig
+//! ```
+//!
+//! In a build script, use `std.Build.addLibrary` with `.linkage = .dynamic` and an
+//! `amdgcn-amdhsa` target, and `Step.Compile.getEmittedBin`. The host program loads the code
+//! object with `hip.Context.loadModule` and launches kernels with `hip.Function.launch`. A code
+//! object only runs on GPUs of the architecture that `-mcpu` names, which `hip.Device.archName`
+//! reports.
+//!
+//! On AMD GPUs, shared memory starts at address 0, and the first shared variable of a kernel is
+//! there. Zig takes address 0 for null: `@ptrFromInt` does not accept it, and an optional pointer
+//! to that variable is null. Index shared variables instead, or `@addrSpaceCast` them to generic
+//! pointers, which are never 0.
+//!
+//! The device-side functions in this namespace are implemented for NVPTX and AMDGPU. The
+//! indexing functions and `syncThreads` use builtins that also exist for SPIR-V.
 
 const std = @import("std.zig");
 const builtin = @import("builtin");
+const output_buffer = @import("gpu/output_buffer.zig");
 
 pub const allocators = @import("gpu/allocators.zig");
 pub const cuda = @import("gpu/cuda.zig");
+pub const hip = @import("gpu/hip.zig");
 
 test {
     _ = cuda;
+    _ = hip;
 }
 
 const arch = builtin.cpu.arch;
@@ -67,6 +88,14 @@ pub inline fn gridDim(comptime dim: Dim) u32 {
             .y => nvvm.@"llvm.nvvm.read.ptx.sreg.nctaid.y"(),
             .z => nvvm.@"llvm.nvvm.read.ptx.sreg.nctaid.z"(),
         },
+        .amdgcn => blocks: {
+            // The dispatch packet has the size of the grid in threads, which need not be a
+            // multiple of the block size: the last block is partial.
+            const packet = amdgcn.@"llvm.amdgcn.dispatch.ptr"();
+            const threads = packet.grid_size[@backingInt(dim)];
+            const block_size = packet.workgroup_size[@backingInt(dim)];
+            break :blocks threads / block_size + @intFromBool(threads % block_size != 0);
+        },
         else => unsupported("gridDim"),
     };
 }
@@ -81,20 +110,35 @@ pub inline fn globalId(comptime dim: Dim) u32 {
 /// All threads of the block must reach the same call; calling it where only some threads of the
 /// block go is undefined behavior.
 pub inline fn syncThreads() void {
-    switch (arch) {
-        .nvptx, .nvptx64 => nvvm.@"llvm.nvvm.barrier.cta.sync.aligned.all"(0),
-        else => unsupported("syncThreads"),
-    }
+    @workGroupBarrier();
 }
 
 /// Number of threads in a warp: the threads that execute together and that the shuffle, vote,
-/// and warp reduction functions operate on.
-pub const warp_size = 32;
+/// and warp reduction functions operate on. AMD calls a warp a wave, which has 64 threads before
+/// GFX10 and 32 threads from GFX10 on, unless the `wavefrontsize64` or `wavefrontsize32` CPU
+/// feature selects the other size.
+pub const warp_size = switch (arch) {
+    .amdgcn => if (builtin.cpu.has(.amdgcn, .wavefrontsize64))
+        64
+    else if (builtin.cpu.has(.amdgcn, .wavefrontsize32) or builtin.cpu.has(.amdgcn, .gfx10_insts))
+        32
+    else
+        64,
+    else => 32,
+};
+
+/// A mask with a bit for each thread of a warp, the one for lane `i` at bit `i`.
+pub const WarpMask = @Int(.unsigned, warp_size);
 
 /// Index of the calling thread within its warp, from 0 to `warp_size - 1`.
 pub inline fn laneId() u32 {
     return switch (arch) {
         .nvptx, .nvptx64 => nvvm.@"llvm.nvvm.read.ptx.sreg.laneid"(),
+        // Counts the lanes below the calling one, 32 lanes of the mask at a time.
+        .amdgcn => lane: {
+            const low = amdgcn.@"llvm.amdgcn.mbcnt.lo"(0xffff_ffff, 0);
+            break :lane if (warp_size == 32) low else amdgcn.@"llvm.amdgcn.mbcnt.hi"(0xffff_ffff, low);
+        },
         else => unsupported("laneId"),
     };
 }
@@ -120,7 +164,7 @@ pub inline fn shflXor(value: anytype, lane_mask: u32) @TypeOf(value) {
     return shuffle(.bfly, value, lane_mask);
 }
 
-/// Returns `value` from the thread in lane `src_lane`.
+/// Returns `value` from the thread in lane `src_lane`, taken modulo `warp_size`.
 pub inline fn shflBroadcast(value: anytype, src_lane: u32) @TypeOf(value) {
     return shuffle(.idx, value, src_lane);
 }
@@ -129,6 +173,7 @@ pub inline fn shflBroadcast(value: anytype, src_lane: u32) @TypeOf(value) {
 pub inline fn all(predicate: bool) bool {
     return switch (arch) {
         .nvptx, .nvptx64 => nvvm.@"llvm.nvvm.vote.all.sync"(full_mask, predicate),
+        .amdgcn => ballot(predicate) == ballot(true),
         else => unsupported("all"),
     };
 }
@@ -137,6 +182,7 @@ pub inline fn all(predicate: bool) bool {
 pub inline fn any(predicate: bool) bool {
     return switch (arch) {
         .nvptx, .nvptx64 => nvvm.@"llvm.nvvm.vote.any.sync"(full_mask, predicate),
+        .amdgcn => ballot(predicate) != 0,
         else => unsupported("any"),
     };
 }
@@ -145,14 +191,22 @@ pub inline fn any(predicate: bool) bool {
 pub inline fn uniform(predicate: bool) bool {
     return switch (arch) {
         .nvptx, .nvptx64 => nvvm.@"llvm.nvvm.vote.uni.sync"(full_mask, predicate),
+        .amdgcn => uniform: {
+            const mask = ballot(predicate);
+            break :uniform mask == 0 or mask == ballot(true);
+        },
         else => unsupported("uniform"),
     };
 }
 
-/// A mask with bit `i` set when `predicate` is true for the thread in lane `i`.
-pub inline fn ballot(predicate: bool) u32 {
+/// A mask with the bit of each thread of the warp for which `predicate` is true.
+pub inline fn ballot(predicate: bool) WarpMask {
     return switch (arch) {
         .nvptx, .nvptx64 => nvvm.@"llvm.nvvm.vote.ballot.sync"(full_mask, predicate),
+        .amdgcn => if (warp_size == 32)
+            amdgcn.@"llvm.amdgcn.ballot.i32"(predicate)
+        else
+            amdgcn.@"llvm.amdgcn.ballot.i64"(predicate),
         else => unsupported("ballot"),
     };
 }
@@ -211,30 +265,41 @@ pub inline fn atomicMax(ptr: anytype, operand: @TypeOf(ptr.*)) @TypeOf(ptr.*) {
 /// Hardware approximations of math functions, like CUDA's `__sinf`. They are much faster than
 /// the builtins, which compute full-precision results, but have absolute rather than relative
 /// error bounds, so they lose precision for results near zero and for large inputs.
-/// The PTX ISA documents their exact error bounds.
+/// The PTX ISA and AMD's instruction set references document their error bounds.
 pub const fast = struct {
-    /// Approximates `@sin(x)` with PTX `sin.approx.f32`.
+    /// Approximates `@sin(x)` with PTX `sin.approx.f32` or AMD `v_sin_f32`.
     pub inline fn sin(x: f32) f32 {
         return switch (arch) {
             .nvptx, .nvptx64 => nvvm.@"llvm.nvvm.sin.approx.f"(x),
+            // LLVM lowers the intrinsic to `v_sin_f32`, scaling the angle to the turns that the
+            // instruction takes.
+            .amdgcn => amdgcn.@"llvm.sin.f32"(x),
             else => unsupported("fast.sin"),
         };
     }
 
-    /// Approximates `@cos(x)` with PTX `cos.approx.f32`.
+    /// Approximates `@cos(x)` with PTX `cos.approx.f32` or AMD `v_cos_f32`.
     pub inline fn cos(x: f32) f32 {
         return switch (arch) {
             .nvptx, .nvptx64 => nvvm.@"llvm.nvvm.cos.approx.f"(x),
+            .amdgcn => amdgcn.@"llvm.cos.f32"(x),
             else => unsupported("fast.cos"),
         };
     }
 };
 
 /// Formats `args` like `std.fmt` and writes the text to the standard output of the host process.
-/// The driver collects the output of all threads and writes it when the host synchronizes with
-/// the device. Each call formats into a 256-byte buffer on the stack and truncates longer text.
-/// In Debug builds, formatting needs more stack than the driver gives each thread by default;
-/// the host raises the limit with `cuda.Context.setLimit(.stack_size, bytes)`.
+/// Each call formats into a 256-byte buffer on the stack and truncates longer text.
+///
+/// On NVIDIA GPUs, the driver collects the output of all threads and writes it when the host
+/// synchronizes with the device. In Debug builds, formatting needs more stack than the driver
+/// gives each thread by default; the host raises the limit with
+/// `cuda.Context.setLimit(.stack_size, bytes)`.
+///
+/// On AMD GPUs, the text goes to a buffer that `hip.Context.loadModule` gives the code object,
+/// and `hip.Context.synchronize` writes the text that the buffer collected. It holds 1 MiB of
+/// text between synchronizations and drops the text beyond that. A code object that some other
+/// host program loads prints nothing.
 pub fn print(comptime fmt: []const u8, args: anytype) void {
     switch (arch) {
         .nvptx, .nvptx64 => {
@@ -250,15 +315,30 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
             const arguments: Arguments = .{ .text = buffer[0..text.len :0] };
             _ = nvptx_syscalls.vprintf("%s", &arguments);
         },
+        .amdgcn => {
+            var buffer: [256]u8 = undefined;
+            const text = std.fmt.bufPrint(&buffer, fmt, args) catch |err| switch (err) {
+                error.NoSpaceLeft => &buffer,
+            };
+            amdgpu_output.write(.print, text);
+        },
         else => unsupported("print"),
     }
 }
 
-/// Stops the kernel launch with `message`, like a failed `assert` in CUDA C++. The driver prints
-/// the message with the block and the thread that stopped, and the launch fails: the host's next
+/// Stops the kernel launch with `message`, like a failed `assert` in CUDA C++, and reports the
+/// message with the block and the thread that stopped. `std.debug.defaultPanic` calls this on
+/// CUDA and AMDHSA, so safety checks and `@panic` in a kernel report their message. The message
+/// is truncated to 255 bytes.
+///
+/// On NVIDIA GPUs, the driver prints the message and the launch fails: the host's next
 /// `cuda.Context.synchronize` returns `error.Assert`, and the context cannot run kernels
-/// afterwards. `std.debug.defaultPanic` calls this on CUDA, so safety checks and `@panic` in a
-/// kernel report their message. The message is truncated to 255 bytes.
+/// afterwards.
+///
+/// On AMD GPUs, the wave of the calling thread stops, and the host's next
+/// `hip.Context.synchronize` writes the message to standard error and returns `error.Assert`.
+/// The context keeps working. Like `print`, this reports nothing when some other host program
+/// loaded the code object; the wave still stops.
 pub fn assertFail(message: []const u8) noreturn {
     switch (arch) {
         .nvptx, .nvptx64 => {
@@ -270,6 +350,10 @@ pub fn assertFail(message: []const u8) noreturn {
             // `message` failed.", and a panic has no location to put in the first three.
             nvptx_syscalls.__assertfail(buffer[0..len :0], "zig", 0, "panic", 1);
             @trap();
+        },
+        .amdgcn => {
+            amdgpu_output.write(.assert, message[0..@min(message.len, 255)]);
+            amdgcn.@"llvm.amdgcn.endpgm"();
         },
         else => unsupported("assertFail"),
     }
@@ -311,6 +395,19 @@ inline fn shuffle32(comptime mode: ShuffleMode, value: u32, lane_operand: u32) u
                 .idx => nvvm.@"llvm.nvvm.shfl.sync.idx.i32"(full_mask, value, lane_operand, c),
             };
         },
+        .amdgcn => {
+            // The same clamping as PTX: a source lane outside the warp is the calling lane.
+            const lane = laneId();
+            const source = switch (mode) {
+                .down => if (lane_operand < warp_size - lane) lane + lane_operand else lane,
+                .up => if (lane_operand <= lane) lane - lane_operand else lane,
+                .bfly => if (lane ^ lane_operand < warp_size) lane ^ lane_operand else lane,
+                .idx => lane_operand % warp_size,
+            };
+            // `ds_bpermute_b32` reads the value of the lane whose number is the address divided
+            // by 4.
+            return amdgcn.@"llvm.amdgcn.ds.bpermute"(source * 4, value);
+        },
         else => unsupported("shuffle"),
     }
 }
@@ -334,13 +431,12 @@ fn unsupported(comptime name: []const u8) noreturn {
 }
 
 /// LLVM intrinsics for NVPTX. LLVM gives these declarations the attributes of the intrinsics,
-/// such as `convergent` for the barrier, shuffle, and vote operations.
+/// such as `convergent` for the shuffle and vote operations.
 const nvvm = struct {
     extern fn @"llvm.nvvm.read.ptx.sreg.nctaid.x"() u32;
     extern fn @"llvm.nvvm.read.ptx.sreg.nctaid.y"() u32;
     extern fn @"llvm.nvvm.read.ptx.sreg.nctaid.z"() u32;
     extern fn @"llvm.nvvm.read.ptx.sreg.laneid"() u32;
-    extern fn @"llvm.nvvm.barrier.cta.sync.aligned.all"(barrier: u32) void;
     extern fn @"llvm.nvvm.shfl.sync.down.i32"(mask: u32, value: u32, delta: u32, c: u32) u32;
     extern fn @"llvm.nvvm.shfl.sync.up.i32"(mask: u32, value: u32, delta: u32, c: u32) u32;
     extern fn @"llvm.nvvm.shfl.sync.bfly.i32"(mask: u32, value: u32, lane_mask: u32, c: u32) u32;
@@ -357,4 +453,60 @@ const nvvm = struct {
 const nvptx_syscalls = struct {
     extern fn vprintf(format: [*:0]const u8, arguments: ?*const anyopaque) i32;
     extern fn __assertfail(message: [*:0]const u8, file: [*:0]const u8, line: u32, function: [*:0]const u8, char_size: usize) void;
+};
+
+/// LLVM intrinsics for AMDGPU. LLVM gives these declarations the attributes of the intrinsics,
+/// such as `convergent` for the lane permutation and the ballot.
+const amdgcn = struct {
+    extern fn @"llvm.amdgcn.dispatch.ptr"() *addrspace(.constant) const DispatchPacket;
+    extern fn @"llvm.amdgcn.mbcnt.lo"(mask: u32, base: u32) u32;
+    extern fn @"llvm.amdgcn.mbcnt.hi"(mask: u32, base: u32) u32;
+    extern fn @"llvm.amdgcn.ds.bpermute"(address: u32, value: u32) u32;
+    extern fn @"llvm.amdgcn.ballot.i32"(predicate: bool) u32;
+    extern fn @"llvm.amdgcn.ballot.i64"(predicate: bool) u64;
+    extern fn @"llvm.amdgcn.endpgm"() noreturn;
+    extern fn @"llvm.sin.f32"(x: f32) f32;
+    extern fn @"llvm.cos.f32"(x: f32) f32;
+};
+
+/// The start of `hsa_kernel_dispatch_packet_t`, the packet that the runtime launched the kernel
+/// with.
+const DispatchPacket = extern struct {
+    header: u16,
+    setup: u16,
+    /// The size of a block in each dimension.
+    workgroup_size: [3]u16,
+    reserved0: u16,
+    /// The number of threads of the whole grid in each dimension.
+    grid_size: [3]u32,
+};
+
+/// The output buffer of `print` and `assertFail` on AMD GPUs; see `output_buffer`.
+const amdgpu_output = struct {
+    /// Null until the host points it at a buffer.
+    var buffer: ?*output_buffer.Header = null;
+
+    comptime {
+        @export(&buffer, .{ .name = output_buffer.symbol });
+    }
+
+    fn write(kind: output_buffer.Kind, text: []const u8) void {
+        const Record = output_buffer.Record;
+        const header = buffer orelse return;
+        const size = std.mem.alignForward(u64, @sizeOf(Record) + text.len, output_buffer.record_alignment);
+        const offset = @atomicRmw(u64, &header.claimed, .Add, size, .monotonic);
+        const capacity = header.capacity;
+        if (offset > capacity or capacity - offset < @sizeOf(Record)) return;
+        const len = @min(text.len, capacity - offset - @sizeOf(Record));
+        const records: [*]u8 = @ptrCast(@as([*]output_buffer.Header, @ptrCast(header)) + 1);
+        const record: *Record = @ptrCast(@alignCast(records + offset));
+        record.* = .{
+            .size = @intCast(size),
+            .len = @intCast(len),
+            .kind = kind,
+            .block = .{ @workGroupId(0), @workGroupId(1), @workGroupId(2) },
+            .thread = .{ @workItemId(0), @workItemId(1), @workItemId(2) },
+        };
+        @memcpy(records[offset + @sizeOf(Record) ..][0..len], text[0..len]);
+    }
 };

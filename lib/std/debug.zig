@@ -555,8 +555,8 @@ pub fn defaultPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
             }
             @trap();
         },
-        .cuda => std.gpu.assertFail(msg),
-        .nvcl, .amdhsa => std.process.abort(),
+        .cuda, .amdhsa => std.gpu.assertFail(msg),
+        .nvcl => std.process.abort(),
         .plan9 => {
             var status: [std.os.plan9.ERRMAX]u8 = undefined;
             const len = @min(msg.len, status.len - 1);

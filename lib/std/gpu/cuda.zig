@@ -45,6 +45,7 @@
 
 const std = @import("../std.zig");
 const builtin = @import("builtin");
+const launch_arguments = @import("launch_arguments.zig");
 const testing = std.testing;
 
 /// Whether the driver library can be loaded here. On Linux, `std.DynLib` loads shared libraries
@@ -1037,13 +1038,13 @@ pub const Function = struct {
     /// it: write the type, as in `@as(u32, 256)`. Each of these is a compile error.
     pub fn launch(function: Function, config: LaunchConfig, args: anytype) Error!void {
         const Arguments = @TypeOf(args);
-        const field_types = comptime argumentTypes(Arguments);
+        const field_types = comptime launch_arguments.argumentTypes(Arguments);
         if (comptime field_types.len == 0) return function.launchRaw(config, null);
 
-        var storage: ArgumentTuple(Arguments) = undefined;
+        var storage: launch_arguments.ArgumentTuple(Buffer, Arguments) = undefined;
         var parameters: [field_types.len]?*anyopaque = undefined;
         inline for (field_types, 0..) |field_type, index| {
-            storage[index] = argumentValue(field_type, index, args[index]);
+            storage[index] = launch_arguments.argumentValue(Buffer, field_type, index, args[index]);
             parameters[index] = @ptrCast(&storage[index]);
         }
         return function.launchRaw(config, @ptrCast(&parameters));
@@ -1067,80 +1068,6 @@ pub const Function = struct {
         ));
     }
 };
-
-/// The types of the elements of the tuple of kernel arguments, or a compile error when `args` is
-/// not a tuple with one element per parameter.
-fn argumentTypes(comptime Arguments: type) []const type {
-    const info = @typeInfo(Arguments);
-    if (info != .@"struct" or !info.@"struct".is_tuple) {
-        @compileError("the kernel arguments must be a tuple with one element per parameter, " ++
-            "such as `.{ buffer, @as(u32, 256) }`, found '" ++ @typeName(Arguments) ++ "'");
-    }
-    return info.@"struct".field_types;
-}
-
-/// The type that holds the copy of a kernel argument that the driver reads. The address of that
-/// copy is what the launch passes to the driver.
-fn ArgumentStorage(comptime T: type, comptime index: usize) type {
-    if (comptime isBuffer(T)) {
-        return DevicePtr;
-    } else if (comptime T == DevicePtr) {
-        return DevicePtr;
-    } else {
-        return switch (@typeInfo(T)) {
-            .comptime_int => @compileError(std.fmt.comptimePrint(
-                "kernel parameter {d} is a comptime_int, which has no type that the driver could pass; write the type, such as `@as(u32, 256)`",
-                .{index},
-            )),
-            .comptime_float => @compileError(std.fmt.comptimePrint(
-                "kernel parameter {d} is a comptime_float, which has no type that the driver could pass; write the type, such as `@as(f32, 1.5)`",
-                .{index},
-            )),
-            .pointer => @compileError(std.fmt.comptimePrint(
-                "kernel parameter {d} is a host pointer or slice ('{s}'), and a kernel cannot read the memory of the host process; put the data in a Buffer and pass that, or pass a DevicePtr",
-                .{ index, @typeName(T) },
-            )),
-            .int, .float, .bool, .vector, .@"enum" => T,
-            .@"struct" => |info| if (info.layout == .@"extern" or info.layout == .@"packed")
-                T
-            else
-                @compileError(std.fmt.comptimePrint(
-                    "kernel parameter {d} has the type '{s}', which is not an extern or packed struct; only those have the layout that a kernel parameter needs",
-                    .{ index, @typeName(T) },
-                )),
-            else => @compileError(std.fmt.comptimePrint(
-                "kernel parameter {d} has the type '{s}', which cannot pass to a kernel; pass a Buffer, a DevicePtr, or a value of an integer, float, bool, enum, vector, extern struct, or packed struct type",
-                .{ index, @typeName(T) },
-            )),
-        };
-    }
-}
-
-/// The value of one kernel argument that the launch passes to the driver: the address of the
-/// memory of a buffer, or the argument itself.
-fn argumentValue(comptime T: type, comptime index: usize, arg: T) ArgumentStorage(T, index) {
-    if (comptime isBuffer(T)) {
-        return arg.ptr;
-    } else {
-        return arg;
-    }
-}
-
-/// The tuple of `ArgumentStorage` types that holds the arguments of a launch. The elements are
-/// contiguous, and the driver is passed the address of each one.
-fn ArgumentTuple(comptime Arguments: type) type {
-    const field_types = comptime argumentTypes(Arguments);
-    var storage_types: [field_types.len]type = undefined;
-    inline for (field_types, 0..) |field_type, index| {
-        storage_types[index] = ArgumentStorage(field_type, index);
-    }
-    return @Tuple(&storage_types);
-}
-
-/// Whether `T` is a `Buffer` of this namespace, which passes to a kernel as its address.
-fn isBuffer(comptime T: type) bool {
-    return @typeInfo(T) == .@"struct" and @hasDecl(T, "Elem") and @TypeOf(T.Elem) == type and T == Buffer(T.Elem);
-}
 
 /// The size of a grid or a block in each of the three dimensions.
 pub const Dim3 = struct {
