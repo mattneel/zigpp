@@ -254,6 +254,27 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
     }
 }
 
+/// Stops the kernel launch with `message`, like a failed `assert` in CUDA C++. The driver prints
+/// the message with the block and the thread that stopped, and the launch fails: the host's next
+/// `cuda.Context.synchronize` returns `error.Assert`, and the context cannot run kernels
+/// afterwards. `std.debug.defaultPanic` calls this on CUDA, so safety checks and `@panic` in a
+/// kernel report their message. The message is truncated to 255 bytes.
+pub fn assertFail(message: []const u8) noreturn {
+    switch (arch) {
+        .nvptx, .nvptx64 => {
+            var buffer: [256]u8 = undefined;
+            const len = @min(message.len, buffer.len - 1);
+            @memcpy(buffer[0..len], message[0..len]);
+            buffer[len] = 0;
+            // The driver prints "file:line: function: block: [..], thread: [..] Assertion
+            // `message` failed.", and a panic has no location to put in the first three.
+            nvptx_syscalls.__assertfail(buffer[0..len :0], "zig", 0, "panic", 1);
+            @trap();
+        },
+        else => unsupported("assertFail"),
+    }
+}
+
 const full_mask: u32 = 0xffff_ffff;
 
 const ShuffleMode = enum { down, up, bfly, idx };
@@ -335,4 +356,5 @@ const nvvm = struct {
 /// Functions that the CUDA driver provides to every PTX module.
 const nvptx_syscalls = struct {
     extern fn vprintf(format: [*:0]const u8, arguments: ?*const anyopaque) i32;
+    extern fn __assertfail(message: [*:0]const u8, file: [*:0]const u8, line: u32, function: [*:0]const u8, char_size: usize) void;
 };

@@ -1228,6 +1228,14 @@ export fn helloKernel(out: [*]u32, len: usize) callconv(.kernel) void {
     out[0] = 42;
 }
 
+/// Stores through a slice of `len` elements at the index of every thread, so in a Debug build the
+/// threads past the end panic on the bounds check. Only the host's "assert" mode launches it,
+/// because a failed assertion leaves the context unusable.
+export fn outOfBoundsKernel(data: [*]u32, len: u32) callconv(.kernel) void {
+    const elements = data[0..len];
+    elements[gpu.globalId(.x)] = 1;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Added kernels: the builtin math functions for f32 and f64
 // ---------------------------------------------------------------------------------------------

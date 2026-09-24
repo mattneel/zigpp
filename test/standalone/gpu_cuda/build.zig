@@ -55,4 +55,9 @@ pub fn build(b: *std.Build) void {
 
     const run = b.addRunArtifact(exe);
     test_step.dependOn(&run.step);
+
+    // A panic in a kernel leaves the context unusable, so it is checked in a process of its own.
+    const run_assert = b.addRunArtifact(exe);
+    run_assert.addArg("assert");
+    test_step.dependOn(&run_assert.step);
 }

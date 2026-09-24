@@ -10,7 +10,12 @@
 const std = @import("std");
 const cuda = std.gpu.cuda;
 
-pub fn main(_: std.process.Init) !void {
+/// With the argument "assert", the program instead checks that a panic in a kernel stops the
+/// launch with its message, which leaves the context unusable, so it runs in a process of its own.
+pub fn main(init: std.process.Init) !void {
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const assert_mode = args.len > 1 and std.mem.eql(u8, args[1], "assert");
+
     var device_name_buffer: [256]u8 = undefined;
     var driver = cuda.Driver.open() catch |err| switch (err) {
         error.DriverNotFound, error.NoDevice => return skip(@errorName(err)),
@@ -46,14 +51,13 @@ pub fn main(_: std.process.Init) !void {
         else => return fail("set the device heap size", err),
     };
 
+    if (assert_mode) return testPanicAssert(context);
+
     std.debug.print("gpu_cuda: {s}, CUDA {d}.{d}, compute capability {d}.{d}\n", .{
         name, version.major, version.minor, capability.major, capability.minor,
     });
 
-    const images = [_]Image{
-        .{ .name = "debug", .ptx = @embedFile("kernels_debug.ptx") },
-        .{ .name = "fast", .ptx = @embedFile("kernels_fast.ptx") },
-    };
+    const images = [_]Image{ debug_image, fast_image };
 
     var failed = false;
     for (images) |image| {
@@ -99,6 +103,42 @@ const Image = struct {
     name: []const u8,
     ptx: [:0]const u8,
 };
+
+const debug_image: Image = .{ .name = "debug", .ptx = @embedFile("kernels_debug.ptx") };
+const fast_image: Image = .{ .name = "fast", .ptx = @embedFile("kernels_fast.ptx") };
+
+/// Launches `outOfBoundsKernel` from the debug image, whose threads past the end of the slice
+/// fail its bounds check, and checks that the launch fails with `error.Assert` and that the driver
+/// reported the panic message of the first failing thread.
+fn testPanicAssert(context: cuda.Context) void {
+    var error_log: [16 * 1024]u8 = @splat(0);
+    const module = context.loadModule(debug_image.ptx, .{ .error_log = &error_log }) catch |err| {
+        std.debug.print("gpu_cuda: cannot load the debug module: {s}\n{s}\n", .{ @errorName(err), std.mem.sliceTo(&error_log, 0) });
+        std.process.exit(1);
+    };
+    defer module.unload();
+    const kernel = module.function("outOfBoundsKernel") catch |err| return fail("find outOfBoundsKernel", err);
+    const buffer = context.alloc(u32, 64) catch |err| return fail("allocate for outOfBoundsKernel", err);
+    defer buffer.free();
+
+    var capture = OutputCapture.begin(2) catch |err| return fail("capture the standard error of outOfBoundsKernel", err);
+    defer capture.deinit();
+    kernel.launch(.linear(64, 64), .{ buffer, @as(u32, 40) }) catch |err| return fail("launch outOfBoundsKernel", err);
+    const result = context.synchronize();
+    const reported = capture.end();
+
+    const expected_message = "Assertion `index out of bounds: index 40, len 40` failed.";
+    const asserted = if (result) |_| false else |err| err == error.Assert;
+    if (!asserted or std.mem.indexOf(u8, reported, expected_message) == null or
+        std.mem.indexOf(u8, reported, "thread: [40,0,0]") == null)
+    {
+        std.debug.print("gpu_cuda: outOfBoundsKernel: expected error.Assert and the message\n  {s}\ngot {any} and:\n{s}\n", .{
+            expected_message, result, reported,
+        });
+        std.process.exit(1);
+    }
+    std.debug.print("gpu_cuda: a panic in the debug image stops the launch with its message\n", .{});
+}
 
 /// A test of one example, or of one group of kernels: it launches the kernels and checks the
 /// results.
@@ -239,13 +279,15 @@ fn equalValues(comptime T: type, expected: T, actual: T) bool {
     return expected == actual;
 }
 
-// The output of the device through `std.gpu.print` is written to the standard output of this
-// process, so a check of the text of a kernel reads it from a temporary file that the standard
-// output is redirected into while that kernel runs.
+// The driver writes the output of `std.gpu.print` to the standard output of this process, and
+// the message of a failed device assertion to its standard error, so a check of that text reads
+// it from a temporary file that the stream is redirected into while the kernel runs.
 
 extern "c" fn fflush(stream: ?*anyopaque) c_int;
 
-const StdoutCapture = struct {
+const OutputCapture = struct {
+    /// The file descriptor that is redirected: 1 for the standard output, 2 for standard error.
+    fd: c_int,
     path: [64:0]u8 = undefined,
     path_len: usize = 0,
     file: c_int = -1,
@@ -253,27 +295,26 @@ const StdoutCapture = struct {
     active: bool = false,
     buffer: [64 * 1024]u8 = undefined,
 
-    /// Redirects the standard output of the process into a temporary file.
-    fn begin() !StdoutCapture {
-        var capture: StdoutCapture = .{};
-        const path = try std.mem.printSentinel(capture.path[0..capture.path.len], "/tmp/zig-gpu-cuda-{d}.txt", .{std.c.getpid()}, 0);
+    /// Redirects the stream `fd` of the process into a temporary file.
+    fn begin(fd: c_int) !OutputCapture {
+        var capture: OutputCapture = .{ .fd = fd };
+        const path = try std.mem.printSentinel(capture.path[0..capture.path.len], "/tmp/zig-gpu-cuda-{d}-{d}.txt", .{ std.c.getpid(), fd }, 0);
         capture.path_len = path.len;
         const path_pointer: [*:0]const u8 = @ptrCast(&capture.path);
         capture.file = std.c.open(path_pointer, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o600));
         if (capture.file < 0) return error.OpenFailed;
-        capture.saved = std.c.dup(1);
-        if (capture.saved < 0 or std.c.dup2(capture.file, 1) < 0) return error.RedirectFailed;
+        capture.saved = std.c.dup(fd);
+        if (capture.saved < 0 or std.c.dup2(capture.file, fd) < 0) return error.RedirectFailed;
         capture.active = true;
         return capture;
     }
 
-    /// Restores the standard output and returns the text that the device wrote to it. The host
-    /// must have synchronized with the device first, because that is when the driver writes the
-    /// buffered output of the kernels.
-    fn end(capture: *StdoutCapture) []const u8 {
-        // The driver writes the output with the C standard output stream, which buffers it.
+    /// Restores the stream and returns the text that the driver wrote to it. The host must have
+    /// synchronized with the device first, because that is when the driver writes the text.
+    fn end(capture: *OutputCapture) []const u8 {
+        // The driver writes the output with the C standard streams, which buffer it.
         _ = fflush(null);
-        if (std.c.dup2(capture.saved, 1) < 0) return "";
+        if (std.c.dup2(capture.saved, capture.fd) < 0) return "";
         capture.active = false;
         if (std.c.lseek(capture.file, 0, std.c.SEEK.SET) < 0) return "";
         var total: usize = 0;
@@ -285,10 +326,10 @@ const StdoutCapture = struct {
         return capture.buffer[0..total];
     }
 
-    fn deinit(capture: *StdoutCapture) void {
+    fn deinit(capture: *OutputCapture) void {
         if (capture.active) {
             _ = fflush(null);
-            _ = std.c.dup2(capture.saved, 1);
+            _ = std.c.dup2(capture.saved, capture.fd);
             capture.active = false;
         }
         if (capture.saved >= 0) _ = std.c.close(capture.saved);
@@ -931,7 +972,7 @@ fn testBase64(r: *Runner) void {
     const round_trip_buffer = r.context.alloc(u32, 1) catch |err| return r.reportError("base64RoundTripKernel", "allocate for", err);
     defer round_trip_buffer.free();
 
-    var capture = StdoutCapture.begin() catch |err| return r.reportError("base64RoundTripKernel", "capture the output of", err);
+    var capture = OutputCapture.begin(1) catch |err| return r.reportError("base64RoundTripKernel", "capture the output of", err);
     defer capture.deinit();
     r.runLinear("base64RoundTripKernel", 1, 1, .{ round_buffer, @as(u32, round_n), round_trip_buffer });
     const printed = capture.end();
@@ -1204,7 +1245,7 @@ fn testDynamic(r: *Runner) void {
 
 fn testPrintf(r: *Runner) void {
     // One thread, so that the order of the lines is the order of the calls of that thread.
-    var capture = StdoutCapture.begin() catch |err| return r.reportError("printfKernel", "capture the output of", err);
+    var capture = OutputCapture.begin(1) catch |err| return r.reportError("printfKernel", "capture the output of", err);
     defer capture.deinit();
     r.runLinear("printfKernel", 1, 1, .{});
     const printed = capture.end();
@@ -1218,7 +1259,7 @@ fn testPrintf(r: *Runner) void {
     // `std.gpu.print` makes possible.
     r.expectContains(printed, "100%");
 
-    var capture_math = StdoutCapture.begin() catch |err| return r.reportError("mathPrintfKernel", "capture the output of", err);
+    var capture_math = OutputCapture.begin(1) catch |err| return r.reportError("mathPrintfKernel", "capture the output of", err);
     defer capture_math.deinit();
     r.runLinear("mathPrintfKernel", 1, 1, .{@as(f32, 1.5)});
     const printed_math = capture_math.end();
@@ -1249,7 +1290,7 @@ fn testPrintf(r: *Runner) void {
         r.expect(0, value * value + 2 * value + 1, result);
     }
 
-    var capture_debug = StdoutCapture.begin() catch |err| return r.reportError("debugComputeKernel", "capture the output of", err);
+    var capture_debug = OutputCapture.begin(1) catch |err| return r.reportError("debugComputeKernel", "capture the output of", err);
     defer capture_debug.deinit();
     r.runLinear("debugComputeKernel", 1, 1, .{ input_buffer, output_buffer, @as(u32, 1) });
     const printed_debug = capture_debug.end();
