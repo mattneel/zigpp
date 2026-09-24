@@ -3,7 +3,8 @@
 # Checks an unpacked Zig++ release on the machine it was built for: the
 # compiler reports the version it was built as, compiles and runs Zig++ code
 # with private fields, rejects code that names a private field from another
-# file, and compiles and runs C with the Clang and libc it carries.
+# file, computes with f128 both at compile time and at run time, and compiles
+# and runs C with the Clang and libc it carries.
 #
 #   .github/scripts/smoke.sh <directory of the release> <expected version>
 #
@@ -71,6 +72,30 @@ pub fn main() void {
 EOF
 "$zig" build-exe "$work/hello.zig" -femit-bin="$work/hello$exe"
 "$work/hello$exe" 2>&1 | grep "hello from Zig++"
+
+# The compiler evaluates float expressions at compile time in f128, with the
+# compiler-rt routines linked into it, and a program calls them at run time.
+# Both are calls whose calling convention LLVM decides, so a mismatch between
+# LLVM and compiler-rt, as happened with f128 results on Windows in LLVM 23,
+# shows up here as wrong numbers.
+cat >"$work/float.zig" <<'EOF'
+const std = @import("std");
+
+test "f128 at compile time and at run time" {
+    const sqrt2 = comptime @sqrt(@as(f128, 2.0));
+    try std.testing.expectEqual(0x3fff6a09e667f3bcc908b2fb1366ea95, @as(u128, @bitCast(sqrt2)));
+
+    var a: f128 = 1.5;
+    var b: f128 = 2.25;
+    std.mem.doNotOptimizeAway(&a);
+    std.mem.doNotOptimizeAway(&b);
+    try std.testing.expectEqual(3.75, a + b);
+    try std.testing.expectEqual(3.375, a * b);
+    try std.testing.expectEqual(2.0 / 3.0, a / b);
+    try std.testing.expectEqual(sqrt2, @sqrt(a + a - 1.0));
+}
+EOF
+"$zig" test "$work/float.zig"
 
 cat >"$work/hello.c" <<'EOF'
 #include <stdio.h>
