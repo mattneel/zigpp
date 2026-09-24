@@ -39,7 +39,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/deps
-          key: devkit-x86_64-linux-musl-${{ hashFiles('ci/x86_64-linux-release.sh') }}
+          key: devkit-x86_64-linux-musl-${{ hashFiles('.github/scripts/devkit.sh') }}
 
       - name: Build Zig++ from source
         run: .github/scripts/bootstrap.sh
@@ -75,7 +75,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/deps
-          key: devkit-${{ matrix.target }}-${{ hashFiles('ci/x86_64-linux-release.sh') }}
+          key: devkit-${{ matrix.target }}-${{ hashFiles('.github/scripts/devkit.sh') }}
 
       - name: Build and pack
         run: |

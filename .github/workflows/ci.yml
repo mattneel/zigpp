@@ -33,13 +33,13 @@ jobs:
       - name: Install CMake and Ninja
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
 
-      # The devkit is 150 MB, and its version only changes with upstream's
-      # release script.
+      # The devkit is large, and it only changes when devkit.sh moves to a new
+      # one.
       - name: Restore the LLVM devkit
         uses: actions/cache@v6
         with:
           path: ~/deps
-          key: devkit-x86_64-linux-musl-${{ hashFiles('ci/x86_64-linux-release.sh') }}
+          key: devkit-x86_64-linux-musl-${{ hashFiles('.github/scripts/devkit.sh') }}
 
       - name: Build Zig++ from source
         run: .github/scripts/bootstrap.sh

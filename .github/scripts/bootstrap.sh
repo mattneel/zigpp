@@ -2,9 +2,9 @@
 #
 # Builds Zig++ for x86_64 Linux from source with the CMake build, the way
 # upstream's ci/x86_64-linux-release.sh starts: bootstrap.c's zig2 builds the
-# compiler with the LLVM of upstream's devkit, into a static binary that runs on
-# any x86_64 Linux. An upstream Zig cannot build Zig++, so every other build
-# starts from this one.
+# compiler with the LLVM 23.1.2 of zigpp-bootstrap's devkit, into a static
+# binary that runs on any x86_64 Linux. An upstream Zig cannot build Zig++, so
+# every other build starts from this one.
 #
 # The compiler is left at build-bootstrap/stage3/bin/zig, without lib/: point
 # ZIG_LIB_DIR at the lib/ of this checkout to use it.
