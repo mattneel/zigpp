@@ -1566,6 +1566,9 @@ fn renderContainerField(
         .tuple, .other => .eagerly_unquote,
     };
 
+    if (field.priv_token) |t| {
+        try renderToken(r, t, .maybe_space); // priv
+    }
     if (field.comptime_token) |t| {
         try renderToken(r, t, .maybe_space); // comptime
     }

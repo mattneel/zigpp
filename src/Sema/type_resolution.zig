@@ -232,14 +232,16 @@ pub fn resolveStructLayout(sema: *Sema, struct_ty: Type) CompileError!void {
         // Declared structs do not yet have field information populated:
         // * field names
         // * field comptime-ness
+        // * field privacy
         // * field types
         // * field aligns
         // It's our job to populate these now.
         try sema.declareDependency(.{ .src_hash = struct_obj.zir_index });
 
-        // Likewise, comptime bits may be set. We clear them all first because it avoids needing
-        // "unset bit with AND" logic below (instead we only need the "set bit with OR" case).
+        // Likewise, comptime and priv bits may be set. We clear them all first because it avoids
+        // needing "unset bit with AND" logic below (instead we only need the "set bit with OR" case).
         @memset(struct_obj.field_is_comptime_bits.getAll(ip), 0);
+        @memset(struct_obj.field_is_priv_bits.getAll(ip), 0);
 
         const zir_struct = sema.code.getStructDecl(zir_index);
         var field_it = zir_struct.iterateFields();
@@ -256,6 +258,12 @@ pub fn resolveStructLayout(sema: *Sema, struct_ty: Type) CompileError!void {
                 const mask = @as(u32, 1) << @intCast(zir_field.idx % 32);
                 struct_obj.field_is_comptime_bits.getAll(ip)[bit_bag_index] |= mask;
                 any_comptime_fields = true;
+            }
+
+            if (zir_field.is_priv) {
+                const bit_bag_index = zir_field.idx / 32;
+                const mask = @as(u32, 1) << @intCast(zir_field.idx % 32);
+                struct_obj.field_is_priv_bits.getAll(ip)[bit_bag_index] |= mask;
             }
 
             {
@@ -877,7 +885,9 @@ pub fn resolveUnionLayout(sema: *Sema, union_ty: Type) CompileError!void {
             return failUnionFieldMismatch(sema, &block, union_field_names, enum_tag_ty, &enum_obj);
         }
 
-        // Field names okay; populate types and aligns.
+        // Field names okay; populate types, aligns, and privacy. There may be old priv bits here
+        // from a previous update, so clear them first; below we only need to set bits.
+        @memset(union_obj.field_is_priv_bits.getAll(ip), 0);
         var field_it = zir_union.iterateFields();
         while (field_it.next()) |zir_field| {
             const field_ty_src = block.src(.{ .container_field_type = zir_field.idx });
@@ -906,6 +916,12 @@ pub fn resolveUnionLayout(sema: *Sema, union_ty: Type) CompileError!void {
                 union_obj.field_aligns.get(ip)[zir_field.idx] = explicit_field_align;
             } else {
                 assert(explicit_field_align == .none);
+            }
+
+            if (zir_field.is_priv) {
+                const bit_bag_index = zir_field.idx / 32;
+                const mask = @as(u32, 1) << @intCast(zir_field.idx % 32);
+                union_obj.field_is_priv_bits.getAll(ip)[bit_bag_index] |= mask;
             }
         }
     }

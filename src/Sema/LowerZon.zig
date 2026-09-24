@@ -141,6 +141,7 @@ fn lowerExprAnonResTy(self: *LowerZon, node: Zoir.Node.Index) CompileError!Inter
                 .fields_len = @intCast(init.names.len),
                 .layout = .auto,
                 .any_comptime_fields = true,
+                .any_priv_fields = false,
                 .any_field_defaults = true,
                 .any_field_aligns = false,
                 .packed_backing_int_type = .none,

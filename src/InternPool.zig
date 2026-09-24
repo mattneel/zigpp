@@ -3201,6 +3201,27 @@ pub const Key = union(enum) {
     }
 };
 
+/// A bit set with one bit per field of a container type, stored in `extra`. The LSB of the first
+/// element corresponds to field 0.
+pub const FieldBits = struct {
+    tid: Zcu.PerThread.Id,
+    start: u32,
+    /// This is the number of u32 elements, not the number of fields.
+    len: u32,
+
+    pub const empty: FieldBits = .{ .tid = .main, .start = 0, .len = 0 };
+
+    pub fn getAll(this: FieldBits, ip: *const InternPool) []u32 {
+        const extra = ip.getLocalShared(this.tid).extra.acquire();
+        return extra.view().items(.@"0")[this.start..][0..this.len];
+    }
+
+    pub fn get(this: FieldBits, ip: *const InternPool, i: usize) bool {
+        if (this.len == 0) return false;
+        return @as(u1, @truncate(this.getAll(ip)[i / 32] >> @intCast(i % 32))) != 0;
+    }
+};
+
 pub const LoadedStructType = struct {
     /// Index of the `struct_decl` or `reify` ZIR instruction.
     zir_index: TrackedInst.Index,
@@ -3236,7 +3257,10 @@ pub const LoadedStructType = struct {
     field_types: Index.Slice,
     field_defaults: Index.Slice,
     field_aligns: Alignment.Slice,
-    field_is_comptime_bits: ComptimeBits,
+    field_is_comptime_bits: FieldBits,
+    /// Which fields are marked `priv`, meaning they cannot be accessed by name outside of the file
+    /// which declares this type. `.empty` if no field is private.
+    field_is_priv_bits: FieldBits,
     /// If `layout` is `.@"packed"`, this is `.empty`.
     field_runtime_order: RuntimeOrder.Slice,
     /// If `layout` is `.@"packed"`, this is `.empty`.
@@ -3249,25 +3273,6 @@ pub const LoadedStructType = struct {
     size: u32,
     /// Only valid if `layout` is *not* `.@"packed"`.
     alignment: Alignment,
-
-    pub const ComptimeBits = struct {
-        tid: Zcu.PerThread.Id,
-        start: u32,
-        /// This is the number of u32 elements, not the number of struct fields.
-        len: u32,
-
-        pub const empty: ComptimeBits = .{ .tid = .main, .start = 0, .len = 0 };
-
-        pub fn getAll(this: ComptimeBits, ip: *const InternPool) []u32 {
-            const extra = ip.getLocalShared(this.tid).extra.acquire();
-            return extra.view().items(.@"0")[this.start..][0..this.len];
-        }
-
-        pub fn get(this: ComptimeBits, ip: *const InternPool, i: usize) bool {
-            if (this.len == 0) return false;
-            return @as(u1, @truncate(this.getAll(ip)[i / 32] >> @intCast(i % 32))) != 0;
-        }
-    };
 
     pub const Offsets = struct {
         tid: Zcu.PerThread.Id,
@@ -3423,6 +3428,9 @@ pub const LoadedUnionType = struct {
     // The remaining fields are only valid once the union's layout is resolved.
     field_types: Index.Slice,
     field_aligns: Alignment.Slice,
+    /// Which fields are marked `priv`, meaning they cannot be accessed by name outside of the file
+    /// which declares this type. `.empty` if no field is private.
+    field_is_priv_bits: FieldBits,
     tag_usage: TagUsage,
     /// While `tag_usage` indicates whether the union should logically contain a tag, it may be
     /// omitted if the union layout is resolved as OPV or NPV. This field is `true` iff there is an
@@ -3587,12 +3595,18 @@ pub fn loadStructType(ip: *const InternPool, index: Index) LoadedStructType {
                 .len = extra.data.fields_len,
             } else .empty;
             extra_index += @divCeil(field_aligns.len, 4);
-            const field_is_comptime_bits: LoadedStructType.ComptimeBits = if (extra.data.flags.any_comptime_fields) .{
+            const field_is_comptime_bits: FieldBits = if (extra.data.flags.any_comptime_fields) .{
                 .tid = unwrapped_index.tid,
                 .start = extra_index,
                 .len = @divCeil(extra.data.fields_len, 32),
             } else .empty;
             extra_index += field_is_comptime_bits.len;
+            const field_is_priv_bits: FieldBits = if (extra.data.flags.any_priv_fields) .{
+                .tid = unwrapped_index.tid,
+                .start = extra_index,
+                .len = @divCeil(extra.data.fields_len, 32),
+            } else .empty;
+            extra_index += field_is_priv_bits.len;
             const field_runtime_order: LoadedStructType.RuntimeOrder.Slice = if (extra.data.flags.layout == .auto) .{
                 .tid = unwrapped_index.tid,
                 .start = extra_index,
@@ -3628,6 +3642,7 @@ pub fn loadStructType(ip: *const InternPool, index: Index) LoadedStructType {
                 .field_defaults = field_defaults,
                 .field_aligns = field_aligns,
                 .field_is_comptime_bits = field_is_comptime_bits,
+                .field_is_priv_bits = field_is_priv_bits,
                 .field_runtime_order = field_runtime_order,
                 .field_offsets = field_offsets,
                 .packed_backing_int_type = .none,
@@ -3670,6 +3685,12 @@ pub fn loadStructType(ip: *const InternPool, index: Index) LoadedStructType {
         .len = extra.data.fields_len,
     } else .empty;
     extra_index += field_defaults.len;
+    const field_is_priv_bits: FieldBits = if (extra.data.bits.any_priv_fields) .{
+        .tid = unwrapped_index.tid,
+        .start = extra_index,
+        .len = @divCeil(extra.data.fields_len, 32),
+    } else .empty;
+    extra_index += field_is_priv_bits.len;
     return .{
         .zir_index = extra.data.zir_index,
         .captures = captures,
@@ -3689,6 +3710,7 @@ pub fn loadStructType(ip: *const InternPool, index: Index) LoadedStructType {
         .field_defaults = field_defaults,
         .field_aligns = .empty,
         .field_is_comptime_bits = .empty,
+        .field_is_priv_bits = field_is_priv_bits,
         .field_runtime_order = .empty,
         .field_offsets = .empty,
         .packed_backing_int_type = extra.data.backing_int_type,
@@ -3745,6 +3767,12 @@ pub fn loadUnionType(ip: *const InternPool, index: Index) LoadedUnionType {
                 .len = extra.data.fields_len,
             } else .empty;
             extra_index += @divCeil(field_aligns.len, 4);
+            const field_is_priv_bits: FieldBits = if (extra.data.flags.any_priv_fields) .{
+                .tid = unwrapped_index.tid,
+                .start = extra_index,
+                .len = @divCeil(extra.data.fields_len, 32),
+            } else .empty;
+            extra_index += field_is_priv_bits.len;
 
             return .{
                 .zir_index = extra.data.zir_index,
@@ -3767,6 +3795,7 @@ pub fn loadUnionType(ip: *const InternPool, index: Index) LoadedUnionType {
                 .want_layout = extra.data.flags.want_layout,
                 .field_types = field_types,
                 .field_aligns = field_aligns,
+                .field_is_priv_bits = field_is_priv_bits,
                 .has_runtime_tag = extra.data.flags.has_runtime_tag,
                 .class = extra.data.flags.class,
                 .size = extra.data.size,
@@ -3802,6 +3831,12 @@ pub fn loadUnionType(ip: *const InternPool, index: Index) LoadedUnionType {
         .len = extra.data.fields_len,
     };
     extra_index += field_types.len;
+    const field_is_priv_bits: FieldBits = if (extra.data.bits.any_priv_fields) .{
+        .tid = unwrapped_index.tid,
+        .start = extra_index,
+        .len = @divCeil(extra.data.fields_len, 32),
+    } else .empty;
+    extra_index += field_is_priv_bits.len;
     return .{
         .zir_index = extra.data.zir_index,
         .captures = captures,
@@ -3820,6 +3855,7 @@ pub fn loadUnionType(ip: *const InternPool, index: Index) LoadedUnionType {
         .want_layout = extra.data.bits.want_layout,
         .field_types = field_types,
         .field_aligns = .empty,
+        .field_is_priv_bits = field_is_priv_bits,
         .has_runtime_tag = false,
         .class = undefined,
         .size = undefined,
@@ -5087,6 +5123,7 @@ pub const Tag = enum(u8) {
             captures: ?[]CaptureValue,
             field_names: []NullTerminatedString,
             field_types: []Index,
+            field_is_priv_bits: ?[]u32,
         },
         .config = .{
             .@"trailing.type_hash.?" = .@"payload.bits.captures_len == .reified",
@@ -5094,6 +5131,8 @@ pub const Tag = enum(u8) {
             .@"trailing.captures.?.len" = .@"@intFromEnum(payload.bits.captures_len)",
             .@"trailing.field_names.len" = .@"payload.fields_len",
             .@"trailing.field_types.len" = .@"payload.fields_len",
+            .@"trailing.field_is_priv_bits.?" = .@"payload.bits.any_priv_fields",
+            .@"trailing.field_is_priv_bits.?.len" = .@"(payload.fields_len + 31) / 32",
         },
     };
     const struct_packed_defaults_encoding = .{
@@ -5105,6 +5144,7 @@ pub const Tag = enum(u8) {
             field_names: []NullTerminatedString,
             field_types: []Index,
             field_defaults: []Index,
+            field_is_priv_bits: ?[]u32,
         },
         .config = .{
             .@"trailing.type_hash.?" = .@"payload.bits.captures_len == .reified",
@@ -5113,6 +5153,8 @@ pub const Tag = enum(u8) {
             .@"trailing.field_names.len" = .@"payload.fields_len",
             .@"trailing.field_types.len" = .@"payload.fields_len",
             .@"trailing.field_defaults.len" = .@"payload.fields_len",
+            .@"trailing.field_is_priv_bits.?" = .@"payload.bits.any_priv_fields",
+            .@"trailing.field_is_priv_bits.?.len" = .@"(payload.fields_len + 31) / 32",
         },
     };
     const union_packed_encoding = .{
@@ -5122,12 +5164,15 @@ pub const Tag = enum(u8) {
             type_hash: ?u64,
             captures: ?[]CaptureValue,
             field_types: []Index,
+            field_is_priv_bits: ?[]u32,
         },
         .config = .{
             .@"trailing.type_hash.?" = .@"payload.bits.captures_len == .reified",
             .@"trailing.captures.?" = .@"payload.bits.captures_len != .reified",
             .@"trailing.captures.?.len" = .@"@intFromEnum(payload.bits.captures_len)",
             .@"trailing.field_types.len" = .@"payload.fields_len",
+            .@"trailing.field_is_priv_bits.?" = .@"payload.bits.any_priv_fields",
+            .@"trailing.field_is_priv_bits.?.len" = .@"(payload.fields_len + 31) / 32",
         },
     };
     const enum_explicit_encoding = .{
@@ -5223,6 +5268,7 @@ pub const Tag = enum(u8) {
                 field_defaults: ?[]Index,
                 field_aligns: ?[]Alignment,
                 field_is_comptime_bits: ?[]u32,
+                field_is_priv_bits: ?[]u32,
                 field_runtime_order: ?[]u32,
                 field_offsets: []u32,
             },
@@ -5239,6 +5285,8 @@ pub const Tag = enum(u8) {
                 .@"trailing.field_aligns.?.len" = .@"(payload.fields_len + 3) / 4",
                 .@"trailing.field_is_comptime_bits.?" = .@"payload.flags.any_comptime_fields",
                 .@"trailing.field_is_comptime_bits.?.len" = .@"(payload.fields_len + 31) / 32",
+                .@"trailing.field_is_priv_bits.?" = .@"payload.flags.any_priv_fields",
+                .@"trailing.field_is_priv_bits.?.len" = .@"(payload.fields_len + 31) / 32",
                 .@"trailing.field_runtime_order.?" = .@"payload.flags.layout == .auto",
                 .@"trailing.field_runtime_order.?.len" = .@"payload.fields_len",
                 .@"trailing.field_offsets.len" = .@"payload.fields_len",
@@ -5257,6 +5305,7 @@ pub const Tag = enum(u8) {
                 captures: ?[]CaptureValue,
                 field_types: []Index,
                 field_aligns: ?[]Alignment,
+                field_is_priv_bits: ?[]u32,
             },
             .config = .{
                 .@"trailing.type_hash.?" = .@"payload.flags.any_captures == .reified",
@@ -5266,6 +5315,8 @@ pub const Tag = enum(u8) {
                 .@"trailing.field_types.len" = .@"payload.fields_len",
                 .@"trailing.field_aligns.?" = .@"payloads.flags.any_field_aligns",
                 .@"trailing.field_aligns.?.len" = .@"(payload.fields_len + 3) / 4",
+                .@"trailing.field_is_priv_bits.?" = .@"payload.flags.any_priv_fields",
+                .@"trailing.field_is_priv_bits.?.len" = .@"(payload.fields_len + 31) / 32",
             },
         },
         .type_union_packed_auto = union_packed_encoding,
@@ -5542,8 +5593,9 @@ pub const Tag = enum(u8) {
     /// 5. field_default: Index        // if `any_field_defaults`; for each `fields_len`
     /// 6. field_align: Alignment      // if `any_field_aligns`; for each `fields_len`
     /// 7. field_is_comptime_bits: u32 // if `any_comptime_fields`; minimum `u32` for `fields_len`; LSB is field 0
-    /// 8. field_runtime_order: RuntimeOrder // if `layout == .auto`; for each `fields_len`
-    /// 9. field_offset: u32                 // for each `fields_len`
+    /// 8. field_is_priv_bits: u32     // if `any_priv_fields`; minimum `u32` for `fields_len`; LSB is field 0
+    /// 9. field_runtime_order: RuntimeOrder // if `layout == .auto`; for each `fields_len`
+    /// 10. field_offset: u32                // for each `fields_len`
     pub const TypeStruct = struct {
         zir_index: TrackedInst.Index,
 
@@ -5567,6 +5619,7 @@ pub const Tag = enum(u8) {
             layout: enum(u1) { auto, @"extern" },
 
             any_comptime_fields: bool,
+            any_priv_fields: bool,
             any_field_defaults: bool,
             any_field_aligns: bool,
 
@@ -5576,7 +5629,7 @@ pub const Tag = enum(u8) {
 
             want_layout: bool,
 
-            _: u16 = 0,
+            _: u15 = 0,
         };
     };
 
@@ -5586,6 +5639,7 @@ pub const Tag = enum(u8) {
     /// 2. field_name: NullTerminatedString // for each `fields_len`
     /// 3. field_type: Index                // for each `fields_len`
     /// 4. field_default: Index             // if item tag implies field defaults; for each `fields_len`
+    /// 5. field_is_priv_bits: u32          // if `any_priv_fields`; minimum `u32` for `fields_len`; LSB is field 0
     pub const TypeStructPacked = struct {
         zir_index: TrackedInst.Index,
         bits: Bits,
@@ -5602,10 +5656,11 @@ pub const Tag = enum(u8) {
         field_name_map: MapIndex,
 
         const Bits = packed struct(u32) {
-            captures_len: enum(u31) {
-                reified = std.math.maxInt(u31),
+            captures_len: enum(u30) {
+                reified = std.math.maxInt(u30),
                 _,
             },
+            any_priv_fields: bool,
             want_layout: bool,
         };
     };
@@ -5622,6 +5677,7 @@ pub const Tag = enum(u8) {
     /// 3. reified_field_name: NullTerminatedString // if `any_captures == .reified`; for each `fields_len`
     /// 4. field_type: Index      // for each `fields_len`
     /// 5. field_align: Alignment // for each `fields_len` if `any_field_aligns`
+    /// 6. field_is_priv_bits: u32 // if `any_priv_fields`; minimum `u32` for `fields_len`; LSB is field 0
     pub const TypeUnion = struct {
         zir_index: TrackedInst.Index,
 
@@ -5657,6 +5713,7 @@ pub const Tag = enum(u8) {
             layout: enum(u1) { auto, @"extern" },
 
             any_field_aligns: bool,
+            any_priv_fields: bool,
             tag_usage: LoadedUnionType.TagUsage,
 
             class: TypeClass,
@@ -5667,7 +5724,7 @@ pub const Tag = enum(u8) {
 
             want_layout: bool,
 
-            _: u14 = 0,
+            _: u13 = 0,
         };
     };
 
@@ -5681,6 +5738,7 @@ pub const Tag = enum(u8) {
     /// 1. capture: CaptureValue // if `captures_len != .reified`; for each `captures_len`
     /// 2. reified_field_name: NullTerminatedString // if `captures_len == .reified`; for each `fields_len`
     /// 3. field_type: Index     // for each `fields_len`
+    /// 4. field_is_priv_bits: u32 // if `any_priv_fields`; minimum `u32` for `fields_len`; LSB is field 0
     pub const TypeUnionPacked = struct {
         zir_index: TrackedInst.Index,
         bits: Bits,
@@ -5702,10 +5760,11 @@ pub const Tag = enum(u8) {
         fields_len: u32,
 
         const Bits = packed struct(u32) {
-            captures_len: enum(u31) {
-                reified = std.math.maxInt(u31),
+            captures_len: enum(u30) {
+                reified = std.math.maxInt(u30),
                 _,
             },
+            any_priv_fields: bool,
             want_layout: bool,
         };
     };
@@ -8042,6 +8101,7 @@ pub fn getDeclaredStructType(
         fields_len: u32,
         layout: std.lang.Type.ContainerLayout,
         any_comptime_fields: bool,
+        any_priv_fields: bool,
         any_field_defaults: bool,
         any_field_aligns: bool,
         packed_backing_mode: BackingTypeMode,
@@ -8070,12 +8130,14 @@ pub fn getDeclaredStructType(
                 ini.captures.len + // capture
                 ini.fields_len + // field_name
                 ini.fields_len + // field_type
-                (if (ini.any_field_defaults) ini.fields_len else 0)); // field_default
+                (if (ini.any_field_defaults) ini.fields_len else 0) + // field_default
+                (if (ini.any_priv_fields) (ini.fields_len + 31) / 32 else 0)); // field_is_priv_bits
 
             const extra_index = addExtraAssumeCapacity(extra, Tag.TypeStructPacked{
                 .zir_index = ini.zir_index,
                 .bits = .{
                     .captures_len = @fromBackingInt(@intCast(ini.captures.len)),
+                    .any_priv_fields = ini.any_priv_fields,
                     .want_layout = false,
                 },
                 .name = undefined, // set by `finish`
@@ -8091,6 +8153,9 @@ pub fn getDeclaredStructType(
             extra.appendNTimesAssumeCapacity(.{@backingInt(Index.none)}, ini.fields_len); // field_type
             if (ini.any_field_defaults) {
                 extra.appendNTimesAssumeCapacity(.{@backingInt(Index.none)}, ini.fields_len); // field_default
+            }
+            if (ini.any_priv_fields) {
+                extra.appendNTimesAssumeCapacity(.{0}, (ini.fields_len + 31) / 32); // field_is_priv_bits
             }
             items.appendAssumeCapacity(.{
                 .tag = switch (ini.packed_backing_mode) {
@@ -8111,6 +8176,7 @@ pub fn getDeclaredStructType(
                 .field_values = undefined,
                 .field_aligns = undefined,
                 .field_is_comptime_bits = undefined,
+                .field_is_priv_bits = undefined,
             } };
         },
     };
@@ -8123,6 +8189,7 @@ pub fn getDeclaredStructType(
         (if (ini.any_field_defaults) ini.fields_len else 0) + // field_default
         (if (ini.any_field_aligns) (ini.fields_len + 3) / 4 else 0) + // field_align
         (if (ini.any_comptime_fields) (ini.fields_len + 31) / 32 else 0) + // field_is_comptime_bits
+        (if (ini.any_priv_fields) (ini.fields_len + 31) / 32 else 0) + // field_is_priv_bits
         (if (!is_extern) ini.fields_len else 0) + // field_runtime_order
         ini.fields_len); // field_offset
 
@@ -8139,6 +8206,7 @@ pub fn getDeclaredStructType(
             .any_captures = if (ini.captures.len != 0) .true else .false,
             .layout = if (is_extern) .@"extern" else .auto,
             .any_comptime_fields = ini.any_comptime_fields,
+            .any_priv_fields = ini.any_priv_fields,
             .any_field_defaults = ini.any_field_defaults,
             .any_field_aligns = ini.any_field_aligns,
             .class = .no_possible_value,
@@ -8161,6 +8229,9 @@ pub fn getDeclaredStructType(
     if (ini.any_comptime_fields) {
         extra.appendNTimesAssumeCapacity(.{0}, (ini.fields_len + 31) / 32); // field_is_comptime_bits
     }
+    if (ini.any_priv_fields) {
+        extra.appendNTimesAssumeCapacity(.{0}, (ini.fields_len + 31) / 32); // field_is_priv_bits
+    }
     if (!is_extern) {
         extra.appendNTimesAssumeCapacity(.{@backingInt(LoadedStructType.RuntimeOrder.unresolved)}, ini.fields_len); // field_runtime_order
     }
@@ -8181,6 +8252,7 @@ pub fn getDeclaredStructType(
         .field_values = undefined,
         .field_aligns = undefined,
         .field_is_comptime_bits = undefined,
+        .field_is_priv_bits = undefined,
     } };
 }
 
@@ -8190,6 +8262,7 @@ pub fn getReifiedStructType(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.Pe
     fields_len: u32,
     layout: std.lang.Type.ContainerLayout,
     any_comptime_fields: bool,
+    any_priv_fields: bool,
     any_field_defaults: bool,
     any_field_aligns: bool,
     /// Explicitly specified backing int type. `.none` if not packed or if backing type is inferred.
@@ -8218,12 +8291,14 @@ pub fn getReifiedStructType(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.Pe
                 2 + // type_hash
                 ini.fields_len + // field_name
                 ini.fields_len + // field_type
-                (if (ini.any_field_defaults) ini.fields_len else 0)); // field_default
+                (if (ini.any_field_defaults) ini.fields_len else 0) + // field_default
+                (if (ini.any_priv_fields) (ini.fields_len + 31) / 32 else 0)); // field_is_priv_bits
 
             const extra_index = addExtraAssumeCapacity(extra, Tag.TypeStructPacked{
                 .zir_index = ini.zir_index,
                 .bits = .{
                     .captures_len = .reified,
+                    .any_priv_fields = ini.any_priv_fields,
                     .want_layout = false,
                 },
                 .name = undefined, // set by `finish`
@@ -8242,6 +8317,10 @@ pub fn getReifiedStructType(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.Pe
             const field_defaults_start = extra.mutate.len;
             if (ini.any_field_defaults) {
                 extra.appendNTimesAssumeCapacity(.{@backingInt(Index.none)}, ini.fields_len); // field_default
+            }
+            const field_is_priv_bits_start = extra.mutate.len;
+            if (ini.any_priv_fields) {
+                extra.appendNTimesAssumeCapacity(.{0}, (ini.fields_len + 31) / 32); // field_is_priv_bits
             }
             items.appendAssumeCapacity(.{
                 .tag = switch (ini.packed_backing_int_type) {
@@ -8265,6 +8344,10 @@ pub fn getReifiedStructType(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.Pe
                     undefined,
                 .field_aligns = undefined,
                 .field_is_comptime_bits = undefined,
+                .field_is_priv_bits = if (ini.any_priv_fields)
+                    .{ .tid = tid, .start = field_is_priv_bits_start, .len = (ini.fields_len + 31) / 32 }
+                else
+                    undefined,
             } };
         },
     };
@@ -8276,6 +8359,7 @@ pub fn getReifiedStructType(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.Pe
         (if (ini.any_field_defaults) ini.fields_len else 0) + // field_default
         (if (ini.any_field_aligns) (ini.fields_len + 3) / 4 else 0) + // field_align
         (if (ini.any_comptime_fields) (ini.fields_len + 31) / 32 else 0) + // field_is_comptime_bits
+        (if (ini.any_priv_fields) (ini.fields_len + 31) / 32 else 0) + // field_is_priv_bits
         (if (!is_extern) ini.fields_len else 0) + // field_runtime_order
         ini.fields_len); // field_offset
 
@@ -8292,6 +8376,7 @@ pub fn getReifiedStructType(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.Pe
             .any_captures = .reified,
             .layout = if (is_extern) .@"extern" else .auto,
             .any_comptime_fields = ini.any_comptime_fields,
+            .any_priv_fields = ini.any_priv_fields,
             .any_field_defaults = ini.any_field_defaults,
             .any_field_aligns = ini.any_field_aligns,
             .class = .no_possible_value,
@@ -8315,6 +8400,10 @@ pub fn getReifiedStructType(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.Pe
     const field_is_comptime_bits_start = extra.mutate.len;
     if (ini.any_comptime_fields) {
         extra.appendNTimesAssumeCapacity(.{0}, (ini.fields_len + 31) / 32); // field_is_comptime_bits
+    }
+    const field_is_priv_bits_start = extra.mutate.len;
+    if (ini.any_priv_fields) {
+        extra.appendNTimesAssumeCapacity(.{0}, (ini.fields_len + 31) / 32); // field_is_priv_bits
     }
     if (!is_extern) {
         extra.appendNTimesAssumeCapacity(.{@backingInt(LoadedStructType.RuntimeOrder.unresolved)}, ini.fields_len); // field_runtime_order
@@ -8345,6 +8434,10 @@ pub fn getReifiedStructType(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.Pe
             .{ .tid = tid, .start = field_is_comptime_bits_start, .len = (ini.fields_len + 31) / 32 }
         else
             undefined,
+        .field_is_priv_bits = if (ini.any_priv_fields)
+            .{ .tid = tid, .start = field_is_priv_bits_start, .len = (ini.fields_len + 31) / 32 }
+        else
+            undefined,
     } };
 }
 
@@ -8370,6 +8463,7 @@ pub fn getDeclaredUnionType(
         fields_len: u32,
         layout: std.lang.Type.ContainerLayout,
         any_field_aligns: bool,
+        any_priv_fields: bool,
         tag_usage: LoadedUnionType.TagUsage,
         enum_tag_mode: BackingTypeMode,
         packed_backing_mode: BackingTypeMode,
@@ -8393,12 +8487,14 @@ pub fn getDeclaredUnionType(
         .@"packed" => {
             try extra.ensureUnusedCapacity(@typeInfo(Tag.TypeUnionPacked).@"struct".field_names.len +
                 ini.captures.len + // capture
-                ini.fields_len); // field_type
+                ini.fields_len + // field_type
+                (if (ini.any_priv_fields) (ini.fields_len + 31) / 32 else 0)); // field_is_priv_bits
 
             const extra_index = addExtraAssumeCapacity(extra, Tag.TypeUnionPacked{
                 .zir_index = ini.zir_index,
                 .bits = .{
                     .captures_len = @fromBackingInt(@intCast(ini.captures.len)),
+                    .any_priv_fields = ini.any_priv_fields,
                     .want_layout = false,
                 },
                 .name = undefined, // set by `finish`
@@ -8411,6 +8507,9 @@ pub fn getDeclaredUnionType(
             });
             extra.appendSliceAssumeCapacity(.{@ptrCast(ini.captures)}); // capture
             extra.appendNTimesAssumeCapacity(.{@backingInt(Index.none)}, ini.fields_len); // field_type
+            if (ini.any_priv_fields) {
+                extra.appendNTimesAssumeCapacity(.{0}, (ini.fields_len + 31) / 32); // field_is_priv_bits
+            }
             items.appendAssumeCapacity(.{
                 .tag = switch (ini.packed_backing_mode) {
                     .auto => .type_union_packed_auto,
@@ -8430,6 +8529,7 @@ pub fn getDeclaredUnionType(
                 .field_values = undefined,
                 .field_aligns = undefined,
                 .field_is_comptime_bits = undefined,
+                .field_is_priv_bits = undefined,
             } };
         },
     };
@@ -8438,7 +8538,8 @@ pub fn getDeclaredUnionType(
         1 + // captures_len
         ini.captures.len + // capture
         ini.fields_len + // field_type
-        (if (ini.any_field_aligns) (ini.fields_len + 3) / 4 else 0)); // field_align
+        (if (ini.any_field_aligns) (ini.fields_len + 3) / 4 else 0) + // field_align
+        (if (ini.any_priv_fields) (ini.fields_len + 31) / 32 else 0)); // field_is_priv_bits
 
     const extra_index = addExtraAssumeCapacity(extra, Tag.TypeUnion{
         .zir_index = ini.zir_index,
@@ -8455,6 +8556,7 @@ pub fn getDeclaredUnionType(
             .enum_tag_mode = ini.enum_tag_mode,
             .layout = if (is_extern) .@"extern" else .auto,
             .any_field_aligns = ini.any_field_aligns,
+            .any_priv_fields = ini.any_priv_fields,
             .tag_usage = ini.tag_usage,
             .class = .no_possible_value,
             .has_runtime_tag = false,
@@ -8469,6 +8571,9 @@ pub fn getDeclaredUnionType(
     extra.appendNTimesAssumeCapacity(.{@backingInt(Index.none)}, ini.fields_len); // field_type
     if (ini.any_field_aligns) {
         extra.appendNTimesAssumeCapacity(.{0}, (ini.fields_len + 3) / 4); // field_align
+    }
+    if (ini.any_priv_fields) {
+        extra.appendNTimesAssumeCapacity(.{0}, (ini.fields_len + 31) / 32); // field_is_priv_bits
     }
     items.appendAssumeCapacity(.{
         .tag = .type_union,
@@ -8486,6 +8591,7 @@ pub fn getDeclaredUnionType(
         .field_values = undefined,
         .field_aligns = undefined,
         .field_is_comptime_bits = undefined,
+        .field_is_priv_bits = undefined,
     } };
 }
 
@@ -8495,6 +8601,7 @@ pub fn getReifiedUnionType(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.Per
     fields_len: u32,
     layout: std.lang.Type.ContainerLayout,
     any_field_aligns: bool,
+    any_priv_fields: bool,
     tag_usage: LoadedUnionType.TagUsage,
     /// Explicitly specified enum tag type. `.none` if `tag_usage != .tagged`.
     enum_tag_type: Index,
@@ -8520,12 +8627,14 @@ pub fn getReifiedUnionType(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.Per
             try extra.ensureUnusedCapacity(@typeInfo(Tag.TypeUnionPacked).@"struct".field_names.len +
                 2 + // type_hash
                 ini.fields_len + // reified_field_name
-                ini.fields_len); // field_type
+                ini.fields_len + // field_type
+                (if (ini.any_priv_fields) (ini.fields_len + 31) / 32 else 0)); // field_is_priv_bits
 
             const extra_index = addExtraAssumeCapacity(extra, Tag.TypeUnionPacked{
                 .zir_index = ini.zir_index,
                 .bits = .{
                     .captures_len = .reified,
+                    .any_priv_fields = ini.any_priv_fields,
                     .want_layout = false,
                 },
                 .name = undefined, // set by `finish`
@@ -8541,6 +8650,10 @@ pub fn getReifiedUnionType(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.Per
             extra.appendNTimesAssumeCapacity(.{@backingInt(NullTerminatedString.empty)}, ini.fields_len); // reified_field_name
             const field_types_start = extra.mutate.len;
             extra.appendNTimesAssumeCapacity(.{@backingInt(Index.none)}, ini.fields_len); // field_type
+            const field_is_priv_bits_start = extra.mutate.len;
+            if (ini.any_priv_fields) {
+                extra.appendNTimesAssumeCapacity(.{0}, (ini.fields_len + 31) / 32); // field_is_priv_bits
+            }
             items.appendAssumeCapacity(.{
                 .tag = switch (ini.packed_backing_int_type) {
                     .none => .type_union_packed_auto,
@@ -8560,6 +8673,10 @@ pub fn getReifiedUnionType(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.Per
                 .field_values = undefined,
                 .field_aligns = undefined,
                 .field_is_comptime_bits = undefined,
+                .field_is_priv_bits = if (ini.any_priv_fields)
+                    .{ .tid = tid, .start = field_is_priv_bits_start, .len = (ini.fields_len + 31) / 32 }
+                else
+                    undefined,
             } };
         },
     };
@@ -8568,7 +8685,8 @@ pub fn getReifiedUnionType(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.Per
         2 + // type_hash
         ini.fields_len + // reified_field_name
         ini.fields_len + // field_type
-        (if (ini.any_field_aligns) (ini.fields_len + 3) / 4 else 0)); // field_align
+        (if (ini.any_field_aligns) (ini.fields_len + 3) / 4 else 0) + // field_align
+        (if (ini.any_priv_fields) (ini.fields_len + 31) / 32 else 0)); // field_is_priv_bits
 
     const extra_index = addExtraAssumeCapacity(extra, Tag.TypeUnion{
         .zir_index = ini.zir_index,
@@ -8585,6 +8703,7 @@ pub fn getReifiedUnionType(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.Per
             .enum_tag_mode = if (ini.enum_tag_type == .none) .auto else .explicit,
             .layout = if (is_extern) .@"extern" else .auto,
             .any_field_aligns = ini.any_field_aligns,
+            .any_priv_fields = ini.any_priv_fields,
             .tag_usage = ini.tag_usage,
             .class = .no_possible_value,
             .has_runtime_tag = false,
@@ -8600,6 +8719,10 @@ pub fn getReifiedUnionType(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.Per
     const field_aligns_start = extra.mutate.len;
     if (ini.any_field_aligns) {
         extra.appendNTimesAssumeCapacity(.{0}, (ini.fields_len + 3) / 4); // field_align
+    }
+    const field_is_priv_bits_start = extra.mutate.len;
+    if (ini.any_priv_fields) {
+        extra.appendNTimesAssumeCapacity(.{0}, (ini.fields_len + 31) / 32); // field_is_priv_bits
     }
     items.appendAssumeCapacity(.{
         .tag = .type_union,
@@ -8620,6 +8743,10 @@ pub fn getReifiedUnionType(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.Per
         else
             undefined,
         .field_is_comptime_bits = undefined,
+        .field_is_priv_bits = if (ini.any_priv_fields)
+            .{ .tid = tid, .start = field_is_priv_bits_start, .len = (ini.fields_len + 31) / 32 }
+        else
+            undefined,
     } };
 }
 
@@ -8714,6 +8841,7 @@ pub fn getDeclaredEnumType(
         .field_values = undefined,
         .field_aligns = undefined,
         .field_is_comptime_bits = undefined,
+        .field_is_priv_bits = undefined,
     } };
 }
 
@@ -8796,6 +8924,7 @@ pub fn getReifiedEnumType(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.PerT
             undefined,
         .field_aligns = undefined,
         .field_is_comptime_bits = undefined,
+        .field_is_priv_bits = undefined,
     } };
 }
 
@@ -8894,6 +9023,7 @@ pub fn getGeneratedEnumTagType(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu
         .field_values = undefined,
         .field_aligns = undefined,
         .field_is_comptime_bits = undefined,
+        .field_is_priv_bits = undefined,
     } };
 }
 
@@ -8939,6 +9069,7 @@ pub fn getDeclaredOpaqueType(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.P
         .field_values = undefined,
         .field_aligns = undefined,
         .field_is_comptime_bits = undefined,
+        .field_is_priv_bits = undefined,
     } };
 }
 
@@ -8958,7 +9089,8 @@ pub const WipContainerType = struct {
     field_types: Index.Slice,
     field_values: Index.Slice,
     field_aligns: Alignment.Slice,
-    field_is_comptime_bits: LoadedStructType.ComptimeBits,
+    field_is_comptime_bits: FieldBits,
+    field_is_priv_bits: FieldBits,
 
     pub fn setName(
         wip: WipContainerType,
@@ -10772,6 +10904,9 @@ fn dumpStatsFallible(ip: *const InternPool, w: *Io.Writer, arena: Allocator) !vo
                     if (extra.data.flags.any_comptime_fields) {
                         n += (extra.data.fields_len + 31) / 32; // field_is_comptime_bits: u32
                     }
+                    if (extra.data.flags.any_priv_fields) {
+                        n += (extra.data.fields_len + 31) / 32; // field_is_priv_bits: u32
+                    }
                     if (extra.data.flags.layout == .auto) {
                         n += extra.data.fields_len; // field_runtime_order: RuntimeOrder
                     }
@@ -10787,6 +10922,9 @@ fn dumpStatsFallible(ip: *const InternPool, w: *Io.Writer, arena: Allocator) !vo
                     }
                     n += extra.data.fields_len; // field_name: NullTerminatedString
                     n += extra.data.fields_len; // field_type: Index
+                    if (extra.data.bits.any_priv_fields) {
+                        n += (extra.data.fields_len + 31) / 32; // field_is_priv_bits: u32
+                    }
                     break :b n * @sizeOf(u32);
                 },
                 .type_struct_packed_auto_defaults, .type_struct_packed_explicit_defaults => b: {
@@ -10799,6 +10937,9 @@ fn dumpStatsFallible(ip: *const InternPool, w: *Io.Writer, arena: Allocator) !vo
                     n += extra.data.fields_len; // field_name: NullTerminatedString
                     n += extra.data.fields_len; // field_type: Index
                     n += extra.data.fields_len; // field_default: Index
+                    if (extra.data.bits.any_priv_fields) {
+                        n += (extra.data.fields_len + 31) / 32; // field_is_priv_bits: u32
+                    }
                     break :b n * @sizeOf(u32);
                 },
                 .type_union => b: {
@@ -10816,6 +10957,9 @@ fn dumpStatsFallible(ip: *const InternPool, w: *Io.Writer, arena: Allocator) !vo
                     if (extra.data.flags.any_field_aligns) {
                         n += (extra.data.fields_len + 3) / 4; // field_align: Alignment
                     }
+                    if (extra.data.flags.any_priv_fields) {
+                        n += (extra.data.fields_len + 31) / 32; // field_is_priv_bits: u32
+                    }
                     break :b n * @sizeOf(u32);
                 },
                 .type_union_packed_auto, .type_union_packed_explicit => b: {
@@ -10826,6 +10970,9 @@ fn dumpStatsFallible(ip: *const InternPool, w: *Io.Writer, arena: Allocator) !vo
                         _ => |len| n += @backingInt(len), // capture: CaptureValue
                     }
                     n += extra.data.fields_len; // field_type: Index
+                    if (extra.data.bits.any_priv_fields) {
+                        n += (extra.data.fields_len + 31) / 32; // field_is_priv_bits: u32
+                    }
                     break :b n * @sizeOf(u32);
                 },
                 .type_enum_auto => b: {
@@ -12847,6 +12994,48 @@ pub fn resolveEnumLayout(
     }
 
     extra_items[item.data + std.meta.fieldIndex(Tag.TypeEnum, "int_tag_type").?] = @backingInt(int_tag_type);
+}
+
+/// Returns whether any field of the struct or union type `container_type` is marked `priv`, and
+/// `false` for any other type. Unlike loading the type, this only reads the type's flags, so it is
+/// suitable for fast paths. It is valid to call this before the type's layout is resolved.
+pub fn containerHasPrivFields(ip: *const InternPool, container_type: Index) bool {
+    const unwrapped_index = container_type.unwrap(ip);
+    const item = unwrapped_index.getItem(ip);
+    const extra_items = unwrapped_index.getExtra(ip).view().items(.@"0");
+    switch (item.tag) {
+        .type_struct => {
+            const flags: Tag.TypeStruct.Flags = @bitCast(extra_items[
+                item.data + std.meta.fieldIndex(Tag.TypeStruct, "flags").?
+            ]);
+            return flags.any_priv_fields;
+        },
+        .type_struct_packed_auto,
+        .type_struct_packed_explicit,
+        .type_struct_packed_auto_defaults,
+        .type_struct_packed_explicit_defaults,
+        => {
+            const bits: Tag.TypeStructPacked.Bits = @bitCast(extra_items[
+                item.data + std.meta.fieldIndex(Tag.TypeStructPacked, "bits").?
+            ]);
+            return bits.any_priv_fields;
+        },
+        .type_union => {
+            const flags: Tag.TypeUnion.Flags = @bitCast(extra_items[
+                item.data + std.meta.fieldIndex(Tag.TypeUnion, "flags").?
+            ]);
+            return flags.any_priv_fields;
+        },
+        .type_union_packed_auto,
+        .type_union_packed_explicit,
+        => {
+            const bits: Tag.TypeUnionPacked.Bits = @bitCast(extra_items[
+                item.data + std.meta.fieldIndex(Tag.TypeUnionPacked, "bits").?
+            ]);
+            return bits.any_priv_fields;
+        },
+        else => return false,
+    }
 }
 
 /// Sets the "want_layout" flag on the given struct, union, or enum type. Returns true if the flag

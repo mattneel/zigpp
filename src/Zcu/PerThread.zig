@@ -1053,6 +1053,7 @@ pub fn ensureFilePopulated(pt: Zcu.PerThread, file_index: Zcu.File.Index) (Alloc
         .fields_len = @intCast(struct_decl.field_names.len),
         .layout = struct_decl.layout,
         .any_comptime_fields = struct_decl.field_comptime_bits != null,
+        .any_priv_fields = struct_decl.field_priv_bits != null,
         .any_field_defaults = struct_decl.field_default_body_lens != null,
         .any_field_aligns = struct_decl.field_align_body_lens != null,
         .packed_backing_mode = if (struct_decl.backing_int_type_body != null) .explicit else .auto,

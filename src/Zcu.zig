@@ -3442,14 +3442,17 @@ pub fn mapOldZirToNew(
                 const old_any_field_aligns = old.field_align_body_lens != null;
                 const old_any_field_defaults = old.field_default_body_lens != null;
                 const old_any_comptime_fields = old.field_comptime_bits != null;
+                const old_any_priv_fields = old.field_priv_bits != null;
                 const old_explicit_backing_int = old.backing_int_type_body != null;
                 const new_any_field_aligns = new.field_align_body_lens != null;
                 const new_any_field_defaults = new.field_default_body_lens != null;
                 const new_any_comptime_fields = new.field_comptime_bits != null;
+                const new_any_priv_fields = new.field_priv_bits != null;
                 const new_explicit_backing_int = new.backing_int_type_body != null;
                 if (old_any_field_aligns != new_any_field_aligns) continue;
                 if (old_any_field_defaults != new_any_field_defaults) continue;
                 if (old_any_comptime_fields != new_any_comptime_fields) continue;
+                if (old_any_priv_fields != new_any_priv_fields) continue;
                 if (old_explicit_backing_int != new_explicit_backing_int) continue;
             },
             .union_decl => {
@@ -3461,6 +3464,9 @@ pub fn mapOldZirToNew(
                 const old_any_field_aligns = old.field_align_body_lens != null;
                 const new_any_field_aligns = new.field_align_body_lens != null;
                 if (old_any_field_aligns != new_any_field_aligns) continue;
+                const old_any_priv_fields = old.field_priv_bits != null;
+                const new_any_priv_fields = new.field_priv_bits != null;
+                if (old_any_priv_fields != new_any_priv_fields) continue;
             },
             .enum_decl => {
                 const old = old_zir.getEnumDecl(match_item.old_inst);

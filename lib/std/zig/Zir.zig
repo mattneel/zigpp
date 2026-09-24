@@ -3503,8 +3503,10 @@ pub const Inst = struct {
     /// 10. field_default_body_len: u32 // for every `fields_len` if `any_field_defaults`
     /// 11. field_comptime_bits: u32 // one bit per `fields_len` if `any_comptime_fields`
     ///                              // LSB is first field, minimum number of `u32` needed
-    /// 12. backing_int_body_inst: Inst.Index // for each `backing_int_body_len`
-    /// 13. body_inst: Inst.Index // type body, then align body, then default body, for each field
+    /// 12. field_priv_bits: u32 // one bit per `fields_len` if `any_priv_fields`
+    ///                          // LSB is first field, minimum number of `u32` needed
+    /// 13. backing_int_body_inst: Inst.Index // for each `backing_int_body_len`
+    /// 14. body_inst: Inst.Index // type body, then align body, then default body, for each field
     pub const StructDecl = struct {
         // These fields should be concatenated and reinterpreted as a `std.zig.SrcHash`.
         // This hash contains the source of all fields, and any specified attributes (`extern`, backing type, etc).
@@ -3528,7 +3530,8 @@ pub const Inst = struct {
             any_field_aligns: bool,
             any_field_defaults: bool,
             any_comptime_fields: bool,
-            _: u5 = 0,
+            any_priv_fields: bool,
+            _: u4 = 0,
         };
     };
 
@@ -3697,8 +3700,10 @@ pub const Inst = struct {
     /// 8.  field_type_body_len: u32 // for every `fields_len`
     /// 9 . field_align_body_len: u32 // for every `fields_len` if `any_field_aligns`
     /// 10. field_value_body_len: u32 // for every `fields_len` if `any_field_values`
-    /// 11. arg_type_body_inst: Inst.Index // for each `arg_type_body_len`
-    /// 12. body_inst: Inst.Index // type body, then align body, then value body, for each field
+    /// 11. field_priv_bits: u32 // one bit per `fields_len` if `any_priv_fields`
+    ///                          // LSB is first field, minimum number of `u32` needed
+    /// 12. arg_type_body_inst: Inst.Index // for each `arg_type_body_len`
+    /// 13. body_inst: Inst.Index // type body, then align body, then value body, for each field
     pub const UnionDecl = struct {
         // These fields should be concatenated and reinterpreted as a `std.zig.SrcHash`.
         // This hash contains the source of all fields, and any specified attributes (`extern` etc).
@@ -3719,7 +3724,8 @@ pub const Inst = struct {
             kind: Kind,
             any_field_aligns: bool,
             any_field_values: bool,
-            _: u6 = 0,
+            any_priv_fields: bool,
+            _: u5 = 0,
         };
 
         pub const Kind = enum(u3) {
@@ -5318,6 +5324,12 @@ pub fn getStructDecl(zir: *const Zir, struct_decl: Inst.Index) UnwrappedStructDe
         extra_index += bits_len;
         break :bits bits;
     } else null;
+    const field_priv_bits: ?[]const u32 = if (small.any_priv_fields) bits: {
+        const bits_len = @divCeil(fields_len, 32);
+        const bits = zir.extra[extra_index..][0..bits_len];
+        extra_index += bits_len;
+        break :bits bits;
+    } else null;
     const backing_int_type_body: ?[]const Zir.Inst.Index = switch (backing_int_type_body_len) {
         0 => null,
         else => |n| zir.bodySlice(extra_index, n),
@@ -5339,6 +5351,7 @@ pub fn getStructDecl(zir: *const Zir, struct_decl: Inst.Index) UnwrappedStructDe
         .field_align_body_lens = field_align_body_lens,
         .field_default_body_lens = field_default_body_lens,
         .field_comptime_bits = field_comptime_bits,
+        .field_priv_bits = field_priv_bits,
         .field_bodies_overlong = field_bodies_overlong,
     };
 }
@@ -5361,6 +5374,7 @@ pub const UnwrappedStructDecl = struct {
     field_align_body_lens: ?[]const u32,
     field_default_body_lens: ?[]const u32,
     field_comptime_bits: ?[]const u32,
+    field_priv_bits: ?[]const u32,
     field_bodies_overlong: []const Inst.Index,
 
     pub fn iterateFields(struct_decl: UnwrappedStructDecl) FieldIterator {
@@ -5371,6 +5385,7 @@ pub const UnwrappedStructDecl = struct {
             .align_body_lens = struct_decl.field_align_body_lens,
             .default_body_lens = struct_decl.field_default_body_lens,
             .comptime_bits = struct_decl.field_comptime_bits,
+            .priv_bits = struct_decl.field_priv_bits,
             .bodies_overlong = struct_decl.field_bodies_overlong,
         };
     }
@@ -5382,6 +5397,7 @@ pub const UnwrappedStructDecl = struct {
         align_body_lens: ?[]const u32,
         default_body_lens: ?[]const u32,
         comptime_bits: ?[]const u32,
+        priv_bits: ?[]const u32,
         bodies_overlong: []const Inst.Index,
         pub const Field = struct {
             idx: u32,
@@ -5390,6 +5406,7 @@ pub const UnwrappedStructDecl = struct {
             align_body: ?[]const Inst.Index,
             default_body: ?[]const Inst.Index,
             is_comptime: bool,
+            is_priv: bool,
         };
         pub fn next(it: *FieldIterator) ?Field {
             const idx = it.next_idx;
@@ -5401,12 +5418,8 @@ pub const UnwrappedStructDecl = struct {
                 .type_body = it.body(it.type_body_lens[idx]).?,
                 .align_body = it.body(if (it.align_body_lens) |l| l[idx] else 0),
                 .default_body = it.body(if (it.default_body_lens) |l| l[idx] else 0),
-                .is_comptime = ct: {
-                    const bits = it.comptime_bits orelse break :ct false;
-                    const big = bits[idx / 32];
-                    const shifted = big >> @intCast(idx % 32);
-                    break :ct @as(u1, @truncate(shifted)) == 1;
-                },
+                .is_comptime = fieldBit(it.comptime_bits, idx),
+                .is_priv = fieldBit(it.priv_bits, idx),
             };
         }
         fn body(it: *FieldIterator, len: u32) ?[]const Inst.Index {
@@ -5417,6 +5430,13 @@ pub const UnwrappedStructDecl = struct {
         }
     };
 };
+
+/// Reads bit `idx` of a per-field bit set stored as a minimal number of `u32`s,
+/// LSB first. A `null` bit set means that no fields have the bit set.
+fn fieldBit(bits: ?[]const u32, idx: u32) bool {
+    const big = (bits orelse return false)[idx / 32];
+    return @as(u1, @truncate(big >> @intCast(idx % 32))) == 1;
+}
 
 pub fn getUnionDecl(zir: *const Zir, union_decl: Inst.Index) UnwrappedUnionDecl {
     const inst_data = zir.instructions.get(@backingInt(union_decl));
@@ -5465,6 +5485,12 @@ pub fn getUnionDecl(zir: *const Zir, union_decl: Inst.Index) UnwrappedUnionDecl 
         extra_index += fields_len;
         break :lens @ptrCast(lens);
     } else null;
+    const field_priv_bits: ?[]const u32 = if (small.any_priv_fields) bits: {
+        const bits_len = @divCeil(fields_len, 32);
+        const bits = zir.extra[extra_index..][0..bits_len];
+        extra_index += bits_len;
+        break :bits bits;
+    } else null;
     const arg_type_body: ?[]const Zir.Inst.Index = switch (arg_type_body_len) {
         0 => null,
         else => |n| zir.bodySlice(extra_index, n),
@@ -5485,6 +5511,7 @@ pub fn getUnionDecl(zir: *const Zir, union_decl: Inst.Index) UnwrappedUnionDecl 
         .field_type_body_lens = field_type_body_lens,
         .field_align_body_lens = field_align_body_lens,
         .field_value_body_lens = field_value_body_lens,
+        .field_priv_bits = field_priv_bits,
         .field_bodies_overlong = field_bodies_overlong,
     };
 }
@@ -5506,6 +5533,7 @@ pub const UnwrappedUnionDecl = struct {
     field_type_body_lens: []const u32,
     field_align_body_lens: ?[]const u32,
     field_value_body_lens: ?[]const u32,
+    field_priv_bits: ?[]const u32,
     field_bodies_overlong: []const Inst.Index,
 
     pub fn iterateFields(union_decl: UnwrappedUnionDecl) FieldIterator {
@@ -5515,6 +5543,7 @@ pub const UnwrappedUnionDecl = struct {
             .type_body_lens = union_decl.field_type_body_lens,
             .align_body_lens = union_decl.field_align_body_lens,
             .value_body_lens = union_decl.field_value_body_lens,
+            .priv_bits = union_decl.field_priv_bits,
             .bodies_overlong = union_decl.field_bodies_overlong,
         };
     }
@@ -5525,6 +5554,7 @@ pub const UnwrappedUnionDecl = struct {
         type_body_lens: []const u32,
         align_body_lens: ?[]const u32,
         value_body_lens: ?[]const u32,
+        priv_bits: ?[]const u32,
         bodies_overlong: []const Inst.Index,
         pub const Field = struct {
             idx: u32,
@@ -5532,6 +5562,7 @@ pub const UnwrappedUnionDecl = struct {
             type_body: ?[]const Inst.Index,
             align_body: ?[]const Inst.Index,
             value_body: ?[]const Inst.Index,
+            is_priv: bool,
         };
         pub fn next(it: *FieldIterator) ?Field {
             const idx = it.next_idx;
@@ -5543,6 +5574,7 @@ pub const UnwrappedUnionDecl = struct {
                 .type_body = it.body(it.type_body_lens[idx]),
                 .align_body = it.body(if (it.align_body_lens) |l| l[idx] else 0),
                 .value_body = it.body(if (it.value_body_lens) |l| l[idx] else 0),
+                .is_priv = fieldBit(it.priv_bits, idx),
             };
         }
         fn body(it: *FieldIterator, len: u32) ?[]const Inst.Index {

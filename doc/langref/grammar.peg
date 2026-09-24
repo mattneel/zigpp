@@ -71,7 +71,7 @@ VarDeclProto <- (KEYWORD_const / KEYWORD_var) IDENTIFIER (COLON TypeExpr)? ByteA
 
 GlobalVarDecl <- VarDeclProto (EQUAL Expr)? SEMICOLON
 
-ContainerField <- doc_comment? KEYWORD_comptime? (IDENTIFIER COLON)? TypeExpr ByteAlign? (EQUAL Expr)?
+ContainerField <- doc_comment? KEYWORD_priv? KEYWORD_comptime? (IDENTIFIER COLON)? TypeExpr ByteAlign? (EQUAL Expr)?
 
 # *** Block Level ***
 BlockStatement
@@ -671,6 +671,7 @@ KEYWORD_opaque      <- skip 'opaque'      end_of_word
 KEYWORD_or          <- skip 'or'          end_of_word
 KEYWORD_orelse      <- skip 'orelse'      end_of_word
 KEYWORD_packed      <- skip 'packed'      end_of_word
+KEYWORD_priv        <- skip 'priv'        end_of_word
 KEYWORD_pub         <- skip 'pub'         end_of_word
 KEYWORD_resume      <- skip 'resume'      end_of_word
 KEYWORD_return      <- skip 'return'      end_of_word
@@ -694,7 +695,7 @@ keyword <- KEYWORD_addrspace / KEYWORD_align / KEYWORD_allowzero / KEYWORD_and
          / KEYWORD_else / KEYWORD_enum / KEYWORD_errdefer / KEYWORD_error / KEYWORD_export
          / KEYWORD_extern / KEYWORD_fn / KEYWORD_for / KEYWORD_if
          / KEYWORD_inline / KEYWORD_noalias / KEYWORD_nosuspend / KEYWORD_noinline
-         / KEYWORD_opaque / KEYWORD_or / KEYWORD_orelse / KEYWORD_packed
+         / KEYWORD_opaque / KEYWORD_or / KEYWORD_orelse / KEYWORD_packed / KEYWORD_priv
          / KEYWORD_pub / KEYWORD_resume / KEYWORD_return / KEYWORD_linksection
          / KEYWORD_struct / KEYWORD_suspend / KEYWORD_switch / KEYWORD_test
          / KEYWORD_threadlocal / KEYWORD_try / KEYWORD_union / KEYWORD_unreachable
