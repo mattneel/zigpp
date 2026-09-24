@@ -1,6 +1,11 @@
+![Zig++](doc/assets/zigpp-logo.png)
+
 # Zig++
 
 *Pronounced "zig peepee".*
+
+[zigpp.lol](https://zigpp.lol/) is Zig++'s documentation: installing it, what it
+adds to Zig, GPU programming with `std.gpu`, and how versions and releases work.
 
 Zig++ is to Zig what TypeScript is to JavaScript: a superset that adds the
 features people kept asking for. Every valid Zig program is a valid Zig++
@@ -159,6 +164,9 @@ Language proposals are welcome. Zig++ is made of them.
 
 ## Documentation
 
+[zigpp.lol](https://zigpp.lol/) has this book along with the language reference
+and the standard library documentation of the newest release.
+
 If you are looking at this README file in a source tree, please refer to the
 **Release Notes**, **Language Reference**, or **Standard Library
 Documentation** corresponding to the version of Zig that you are using by
@@ -171,8 +179,12 @@ running `zig std`, which will open a browser tab.
 
 ## Installation
 
-Zig++ does not have pre-built binaries yet, so build it from source. The links
-below are for upstream Zig.
+Zig++ publishes a release on every push to master: see
+[zigpp.lol/downloads.html](https://zigpp.lol/downloads.html) for the archives
+and their SHA-256 checksums, and [Installing](https://zigpp.lol/installing.html)
+for the archive layout. To build it yourself, see
+[Building from Source](#building-from-source). The links below are for upstream
+Zig.
 
  * [download a pre-built binary](https://ziglang.org/download/)
  * [install from a package manager](https://ziglang.org/learn/getting-started/#managers)
