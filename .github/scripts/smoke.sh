@@ -3,8 +3,8 @@
 # Checks an unpacked Zig++ release on the machine it was built for: the
 # compiler reports the version it was built as, compiles and runs Zig++ code
 # with private fields, rejects code that names a private field from another
-# file, computes with f128 both at compile time and at run time, and compiles
-# and runs C with the Clang and libc it carries.
+# file, computes with f128 both at compile time and at run time, compiles and
+# runs C with the Clang and libc it carries, and C++ with the libc++ it builds.
 #
 #   .github/scripts/smoke.sh <directory of the release> <expected version>
 #
@@ -107,5 +107,28 @@ int main(void) {
 EOF
 "$zig" cc "$work/hello.c" -o "$work/hello_c$exe"
 "$work/hello_c$exe" | grep "hello from C"
+
+# libc++ is built from source for the target, and it blocks a thread in
+# atomic::wait with each operating system's own primitive: a futex on Linux,
+# os_sync_wait_on_address on macOS, WaitOnAddress on Windows.
+cat >"$work/wait.cpp" <<'EOF'
+#include <atomic>
+#include <cstdio>
+#include <thread>
+
+int main() {
+    std::atomic<int> flag{0};
+    std::thread notifier([&] {
+        flag.store(1);
+        flag.notify_one();
+    });
+    flag.wait(0);
+    notifier.join();
+    std::printf("hello from C++: %d\n", flag.load());
+    return 0;
+}
+EOF
+"$zig" c++ -std=c++20 "$work/wait.cpp" -o "$work/wait$exe"
+"$work/wait$exe" | grep "hello from C++: 1"
 
 echo "smoke test passed for $expected"
