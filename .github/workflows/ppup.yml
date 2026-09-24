@@ -1,0 +1,225 @@
+name: ppup
+
+# ppup is Zig++'s installer and toolchain manager: ppup/ppup for Linux and
+# macOS, ppup/ppup.ps1 for Windows. Both install from the published releases,
+# so this runs on every pull request that changes them, and after every release
+# on master, the same way the site is rebuilt.
+on:
+  pull_request:
+    paths:
+      - "ppup/**"
+      - ".github/workflows/ppup.yml"
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    # A release that failed published nothing new.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-24.04 (sh)
+            os: ubuntu-24.04
+            shell: sh
+          - name: ubuntu-24.04-arm (sh)
+            os: ubuntu-24.04-arm
+            shell: sh
+          - name: macos-15 (sh)
+            os: macos-15
+            shell: sh
+          - name: windows-2025 (Windows PowerShell 5.1)
+            os: windows-2025
+            shell: powershell
+          - name: windows-2025 (pwsh)
+            os: windows-2025
+            shell: pwsh
+    env:
+      GH_TOKEN: ${{ github.token }}
+    # The shell under test: sh on Linux and macOS, Windows PowerShell 5.1 and
+    # pwsh on Windows. A step's own `shell` key may not use the matrix context;
+    # this one may.
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install, use, and remove a toolchain (POSIX shell)
+        if: runner.os != 'Windows'
+        run: |
+          set -eu
+
+          # A temporary PPUP_HOME with no PATH edits: the script under test in
+          # the checkout installs the newest release into it.
+          export PPUP_HOME="$RUNNER_TEMP/ppup-home"
+          rm -rf "$PPUP_HOME"
+
+          ./ppup/ppup --no-modify-path
+          export PATH="$PPUP_HOME/bin:$PATH"
+
+          version=$(ppup default)
+          echo "ppup default: $version"
+          installed=$(zig version)
+          [ "$installed" = "$version" ] ||
+            { echo "zig version is $installed, expected $version" >&2; exit 1; }
+
+          cat > hello.zig <<'EOF'
+          const std = @import("std");
+
+          pub fn main() void {
+              std.debug.print("hello from Zig++\n", .{});
+          }
+          EOF
+          zig build-exe hello.zig
+          # hello prints to stderr; a failing build or run fails the step
+          # through set -e.
+          out=$(./hello 2>&1)
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -q "hello from Zig++" ||
+            { echo "hello did not print" >&2; exit 1; }
+
+          ppup list
+          ppup list | grep -q "\* $version (default)" ||
+            { echo "ppup list does not mark the default" >&2; exit 1; }
+
+          # The newest release is the default: nothing to update.
+          ppup update | tee update.txt
+          grep -q "newest release" update.txt ||
+            { echo "ppup update did not report being current" >&2; exit 1; }
+
+          # The `curl | sh` form, against the toolchain that is already
+          # installed, so this is the pipe and the self-install rather than a
+          # second download.
+          cat ppup/ppup | sh -s -- --no-modify-path install "$version"
+
+          # With a second release published, a second toolchain goes in and
+          # comes out again; the default one refuses to.
+          tags=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName \
+            --jq '[.[] | select(.tagName | startswith("zigpp-"))] | .[0:2] | .[].tagName')
+          echo "$tags"
+          if [ "$(printf '%s\n' "$tags" | grep -c .)" -ge 2 ]; then
+            second=$(printf '%s\n' "$tags" | sed -n '2p')
+            second=${second#zigpp-}
+            ppup install "$second"
+            ppup list
+            ppup default "$second"
+            ppup default
+            if ppup uninstall "$second" 2>/dev/null; then
+              echo "ppup uninstall removed the default toolchain" >&2; exit 1
+            fi
+            ppup default "$version"
+            ppup uninstall "$second"
+            ppup list
+            [ "$(ppup list | grep -c .)" -eq 1 ] ||
+              { echo "ppup list still shows a second toolchain" >&2; exit 1; }
+          else
+            echo "only one release so far: skipping the second toolchain"
+          fi
+
+          if ppup uninstall "$version" 2>/dev/null; then
+            echo "ppup uninstall removed the default toolchain" >&2; exit 1
+          fi
+
+          ppup self uninstall
+          [ ! -e "$PPUP_HOME" ] ||
+            { echo "ppup self uninstall left $PPUP_HOME behind" >&2; exit 1; }
+          exit 0
+
+      - name: Install, use, and remove a toolchain (PowerShell)
+        if: runner.os == 'Windows'
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # A temporary PPUP_HOME with no PATH edits: the script under test in
+          # the checkout installs the newest release into it. The PATH entries
+          # go into this session by hand below.
+          $env:PPUP_HOME = Join-Path $env:RUNNER_TEMP 'ppup-home'
+          if (Test-Path -LiteralPath $env:PPUP_HOME) { Remove-Item -LiteralPath $env:PPUP_HOME -Recurse -Force }
+          $env:PPUP_NO_MODIFY_PATH = '1'
+
+          & .\ppup\ppup.ps1
+          $env:Path = "$env:PPUP_HOME\current;$env:PPUP_HOME\bin;$env:Path"
+
+          $ppup = Join-Path $env:PPUP_HOME 'bin\ppup.ps1'
+          $version = (& $ppup default | Out-String).Trim()
+          Write-Host "ppup default: $version"
+          $installed = (& "$env:PPUP_HOME\current\zig.exe" version | Out-String).Trim()
+          if ($installed -ne $version) { throw "zig version is $installed, expected $version" }
+
+          @'
+          const std = @import("std");
+
+          pub fn main() void {
+              std.debug.print("hello from Zig++\n", .{});
+          }
+          '@ | Set-Content -Path hello.zig -Encoding ascii
+          & "$env:PPUP_HOME\current\zig.exe" build-exe hello.zig
+          if ($LASTEXITCODE -ne 0) { throw "zig build-exe exited $LASTEXITCODE" }
+          # std.debug.print writes to stderr, and Windows PowerShell turns a
+          # native command's redirected stderr into error records:
+          # "$_" gets the message from either that or a plain string.
+          $relaxed = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          $hello = ((& .\hello.exe 2>&1 | ForEach-Object { "$_" }) -join "`n").Trim()
+          $ErrorActionPreference = $relaxed
+          if ($LASTEXITCODE -ne 0) { throw "hello.exe exited $LASTEXITCODE" }
+          Write-Host $hello
+          if ($hello -notmatch [regex]::Escape('hello from Zig++')) { throw "hello.exe printed: $hello" }
+
+          & $ppup list
+          if (((& $ppup list | Out-String) -notmatch [regex]::Escape("* $version (default)"))) {
+            throw 'ppup list does not mark the default'
+          }
+
+          # The newest release is the default: update touches nothing. (ppup's
+          # status messages go to the host, so this compares the toolchain
+          # itself rather than its output.)
+          $before = (Get-Item -LiteralPath (Join-Path $env:PPUP_HOME "toolchains\$version")).LastWriteTimeUtc
+          & $ppup update
+          $after = (Get-Item -LiteralPath (Join-Path $env:PPUP_HOME "toolchains\$version")).LastWriteTimeUtc
+          if ($before -ne $after) { throw 'ppup update reinstalled the toolchain' }
+          if (((& $ppup default | Out-String).Trim()) -ne $version) { throw 'ppup update changed the default toolchain' }
+
+          # The ppup.cmd shim runs ppup.ps1 the way cmd.exe would.
+          cmd /c "$env:PPUP_HOME\bin\ppup.cmd" list
+          if ($LASTEXITCODE -ne 0) { throw "ppup.cmd list failed with $LASTEXITCODE" }
+
+          # With a second release published, a second toolchain goes in and
+          # comes out again; the default one refuses to. The list is filtered
+          # here rather than with --jq: Windows PowerShell 5.1 drops the
+          # double quotes inside arguments to native programs.
+          $releases = gh release list --repo $env:GITHUB_REPOSITORY --limit 100 --json tagName
+          if ($LASTEXITCODE -ne 0) { throw "gh release list failed with $LASTEXITCODE" }
+          $tags = @((($releases -join "`n") | ConvertFrom-Json) | ForEach-Object { $_.tagName } | Where-Object { $_ -like 'zigpp-*' } | Select-Object -First 2)
+          if ($tags.Count -ge 2) {
+            $second = $tags[1] -replace '^zigpp-', ''
+            & $ppup install $second
+            & $ppup list
+            & $ppup default $second
+            & $ppup uninstall $second
+            if ($LASTEXITCODE -eq 0) { throw 'ppup uninstall removed the default toolchain' }
+            & $ppup default $version
+            & $ppup uninstall $second
+            & $ppup list
+          } else {
+            Write-Host 'only one release so far: skipping the second toolchain'
+          }
+
+          # The `irm | iex` form: PowerShell does not keep the text of what iex
+          # was given, so this reuses the toolchain and the ppup that are
+          # already installed.
+          Get-Content -Raw .\ppup\ppup.ps1 | iex
+
+          & $ppup self uninstall
+          if (Test-Path -LiteralPath $env:PPUP_HOME) { throw "ppup self uninstall left $env:PPUP_HOME behind" }
+          exit 0
