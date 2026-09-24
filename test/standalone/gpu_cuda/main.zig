@@ -172,35 +172,20 @@ const Runner = struct {
             r.checks += 1;
             return;
         }
-        r.reportMismatch(index, "{any}", .{expected}, "{any}", .{actual});
-    }
-
-    /// Checks a result that a transcendental function gave, which may differ from the value here
-    /// by a few units in the last place: the device uses the implementations of compiler-rt and
-    /// the host the ones of libm.
-    fn expectApprox(r: *Runner, index: usize, expected: anytype, actual: @TypeOf(expected)) void {
-        if (r.skipChecks()) return;
-        if (approxEqual(@TypeOf(expected), expected, actual)) {
-            r.checks += 1;
-            return;
+        if (comptime @typeInfo(@TypeOf(expected)) == .float) {
+            const Bits = @Int(.unsigned, @bitSizeOf(@TypeOf(expected)));
+            r.reportMismatch(index, "{d} (0x{x})", .{ expected, @as(Bits, @bitCast(expected)) }, "{d} (0x{x})", .{
+                actual, @as(Bits, @bitCast(actual)),
+            });
+        } else {
+            r.reportMismatch(index, "{any}", .{expected}, "{any}", .{actual});
         }
-        r.reportMismatch(index, "{d} ({x})", .{ expected, @as(@Int(.unsigned, @bitSizeOf(@TypeOf(expected))), @bitCast(expected)) }, "{d} ({x})", .{
-            actual, @as(@Int(.unsigned, @bitSizeOf(@TypeOf(actual))), @bitCast(actual)),
-        });
     }
 
     /// Checks every element of `actual` against `expected`.
     fn expectSlice(r: *Runner, expected: anytype, actual: anytype) void {
         for (expected, actual, 0..) |expected_value, actual_value, index| {
             r.expect(index, expected_value, actual_value);
-        }
-    }
-
-    /// Checks every element of `actual` against `expected`, with the tolerance of
-    /// `expectApprox`.
-    fn expectSliceApprox(r: *Runner, expected: anytype, actual: anytype) void {
-        for (expected, actual, 0..) |expected_value, actual_value, index| {
-            r.expectApprox(index, expected_value, actual_value);
         }
     }
 
@@ -245,23 +230,13 @@ fn block2D(tile: u32) cuda.Dim3 {
 
 fn equalValues(comptime T: type, expected: T, actual: T) bool {
     if (comptime @typeInfo(T) == .float) {
-        // Two NaNs are the same result for a test of math functions: both the device and the host
-        // call their math library, and the sign of a NaN is not part of the result.
+        // Processors produce different NaN bit patterns for the same operation, so any NaN matches
+        // any NaN; every other value must match bit for bit, including the sign of zero.
         if (std.math.isNan(expected)) return std.math.isNan(actual);
-        return expected == actual;
+        const Bits = @Int(.unsigned, @bitSizeOf(T));
+        return @as(Bits, @bitCast(expected)) == @as(Bits, @bitCast(actual));
     }
     return expected == actual;
-}
-
-/// Units in the last place by which a transcendental result may differ from the value computed
-/// here.
-const ulp_tolerance = 32;
-
-fn approxEqual(comptime T: type, expected: T, actual: T) bool {
-    if (std.math.isNan(expected) or std.math.isNan(actual)) return std.math.isNan(expected) == std.math.isNan(actual);
-    if (std.math.isInf(expected) or std.math.isInf(actual)) return expected == actual;
-    const scale = @max(@abs(expected), 1);
-    return @abs(actual - expected) <= ulp_tolerance * std.math.floatEpsAt(T, scale);
 }
 
 // The output of the device through `std.gpu.print` is written to the standard output of this
@@ -1295,34 +1270,51 @@ fn testHello(r: *Runner) void {
     r.expect(0, @as(u32, 42), out[0]);
 }
 
+/// The device and this process both compute the builtin math functions with the same
+/// compiler-rt code, so their results must be identical, bit for bit. The inputs cover typical
+/// arguments, large arguments, random bit patterns across every exponent, arguments right next
+/// to multiples of pi/2, and the range where `@exp` is finite. A different math library on
+/// either side, or a float operation that the PTX assembler contracts into a fused multiply-add,
+/// changes some of these results.
 fn testBuiltinMath(r: *Runner) void {
-    const values_f32 = [_]f32{ 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 8, 10, 0.1, -1.25 };
-    const n = values_f32.len;
+    testBuiltinMathSweep(f32, r, "builtinMathF32Kernel");
+    testBuiltinMathSweep(f64, r, "builtinMathF64Kernel");
+}
 
-    const input32_buffer = r.upload(f32, &values_f32) catch |err| return r.reportError("builtinMathF32Kernel", "upload to", err);
-    defer input32_buffer.free();
-    const output32_buffer = r.context.alloc(f32, n * 8) catch |err| return r.reportError("builtinMathF32Kernel", "allocate for", err);
-    defer output32_buffer.free();
-    r.runLinear("builtinMathF32Kernel", n, 32, .{ input32_buffer, output32_buffer, @as(u32, n) });
-    var results32: [n * 8]f32 = undefined;
-    output32_buffer.copyToHost(&results32) catch |err| return r.reportError("builtinMathF32Kernel", "copy the results of", err);
-    for (values_f32, 0..) |x, index| {
-        const expected = mathResults(f32, x);
-        r.expectSliceApprox(&expected, results32[index * 8 ..][0..8]);
+fn testBuiltinMathSweep(comptime T: type, r: *Runner, comptime kernel: [:0]const u8) void {
+    const class_len = 1 << 17;
+    const n = 5 * class_len;
+    const gpa = std.heap.page_allocator;
+    const inputs = gpa.alloc(T, n) catch |err| return r.reportError(kernel, "allocate the inputs of", err);
+    defer gpa.free(inputs);
+    const results = gpa.alloc(T, n * 8) catch |err| return r.reportError(kernel, "allocate the results of", err);
+    defer gpa.free(results);
+
+    var prng: std.Random.DefaultPrng = .init(0x5eed);
+    const random = prng.random();
+    for (inputs, 0..) |*x, i| {
+        const u = random.float(T);
+        x.* = switch (i / class_len) {
+            0 => (2 * u - 1) * 2 * std.math.pi,
+            1 => (2 * u - 1) * 1e6,
+            2 => while (true) {
+                const bits: T = @bitCast(random.int(@Int(.unsigned, @bitSizeOf(T))));
+                if (std.math.isFinite(bits)) break bits;
+            },
+            3 => @as(T, @floatFromInt(random.intRangeAtMost(i32, -100_000, 100_000))) * (std.math.pi / 2.0) + (u - 0.5) * 1e-6,
+            else => (2 * u - 1) * 750,
+        };
     }
 
-    var values_f64: [n]f64 = undefined;
-    for (&values_f64, values_f32) |*value, x| value.* = x;
-    const input64_buffer = r.upload(f64, &values_f64) catch |err| return r.reportError("builtinMathF64Kernel", "upload to", err);
-    defer input64_buffer.free();
-    const output64_buffer = r.context.alloc(f64, n * 8) catch |err| return r.reportError("builtinMathF64Kernel", "allocate for", err);
-    defer output64_buffer.free();
-    r.runLinear("builtinMathF64Kernel", n, 32, .{ input64_buffer, output64_buffer, @as(u32, n) });
-    var results64: [n * 8]f64 = undefined;
-    output64_buffer.copyToHost(&results64) catch |err| return r.reportError("builtinMathF64Kernel", "copy the results of", err);
-    for (values_f64, 0..) |x, index| {
-        const expected = mathResults(f64, x);
-        r.expectSliceApprox(&expected, results64[index * 8 ..][0..8]);
+    const input_buffer = r.upload(T, inputs) catch |err| return r.reportError(kernel, "upload to", err);
+    defer input_buffer.free();
+    const output_buffer = r.context.alloc(T, n * 8) catch |err| return r.reportError(kernel, "allocate for", err);
+    defer output_buffer.free();
+    r.runLinear(kernel, n, 256, .{ input_buffer, output_buffer, @as(u32, n) });
+    output_buffer.copyToHost(results) catch |err| return r.reportError(kernel, "copy the results of", err);
+    for (inputs, 0..) |x, index| {
+        const expected = mathResults(T, x);
+        r.expectSlice(&expected, results[index * 8 ..][0..8]);
     }
 }
 
