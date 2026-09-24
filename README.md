@@ -1,9 +1,108 @@
-![ZIG](https://ziglang.org/img/zig-logo-dynamic.svg)
+# Zig++
 
-A general-purpose programming language and toolchain for maintaining
-**robust**, **optimal**, and **reusable** software.
+*Pronounced "zig peepee".*
 
-https://ziglang.org/
+Zig++ is to Zig what TypeScript is to JavaScript: a superset that adds the
+features people kept asking for. Every valid Zig program is a valid Zig++
+program, unless it names something `priv` (write `@"priv"` instead).
+TypeScript made the same promise, and everyone believed them too.
+
+Like Zig, Zig++ is a general-purpose programming language and toolchain for
+maintaining **robust**, **optimal**, and **reusable** software. Unlike Zig, it
+has private fields, it will never drop LLVM, it welcomes AI, and its BDFL is
+Matthew Neel. Zig++ is a fork of [Zig](https://ziglang.org/), and nearly all of
+the compiler was written by upstream Zig contributors.
+
+## What Zig++ Adds
+
+- **Private fields.** A struct or union field marked `priv` can only be named
+  from the file that declares its type. See "Private Fields" in the language
+  reference (run `zig build langref`, then open `zig-out/doc/langref.html`) and
+  [doc/langref/test_private_fields.zig](doc/langref/test_private_fields.zig).
+  Upstream closed the [proposal](https://github.com/ziglang/zig/issues/9909) as
+  not planned.
+- **LLVM forever**, and a blessed path to PTX. See
+  [LLVM Is Forever](#llvm-is-forever).
+- **AI in the toolchain.** See [AI Policy](#ai-policy).
+- **A BDFL and one rule: talk about code.** See [Governance](#governance).
+
+**Does Zig++ compile to Zig, the way TypeScript compiles to JavaScript?** No.
+It compiles to machine code, C, WebAssembly, and PTX.
+
+**Is Zig++ stable?** Zig++ follows semantic versioning exactly as closely as
+TypeScript does.
+
+**Can upstream Zig build Zig++?** No. Zig++ changed `std.lang.Type`, and an
+upstream Zig binary cannot compile against it. Use the CMake build,
+`bootstrap.c`, or an existing Zig++ binary; see
+[Building from Source](#building-from-source).
+
+## LLVM Is Forever
+
+Upstream Zig plans to drop its dependency on the LLVM libraries. Zig++ will
+never phase out LLVM. In `package.json` terms, LLVM stays in `dependencies`.
+
+LLVM, and MLIR above it, are how Zig++ goes the final stretch on GPUs. Zig++
+will have a blessed path that lowers Zig++ directly to PTX, with first-class
+GPU intrinsics. The reference design is [zzgpu](https://github.com/mattneel/zzgpu):
+plain Zig functions as kernels, intrinsics such as `gpu.globalId()`,
+`gpu.threadIdx`, and `gpu.syncThreads()`, shared memory, and kernels compiled to
+PTX and embedded at build time.
+
+The first leg works today. With a Zig++ compiler built against LLVM, this kernel
+compiles to PTX that NVIDIA's `ptxas` accepts:
+
+```zig
+export fn add(
+    a: [*]addrspace(.global) const f32,
+    b: [*]addrspace(.global) const f32,
+    c: [*]addrspace(.global) f32,
+    n: u32,
+) callconv(.nvptx_kernel) void {
+    const i = @workGroupId(0) * @workGroupSize(0) + @workItemId(0);
+    if (i < n) c[i] = a[i] + b[i];
+}
+```
+
+```sh
+zig build-obj -target nvptx64-cuda -mcpu=sm_120 -O ReleaseFast -fno-emit-bin -femit-asm=add.ptx add.zig
+ptxas -arch=sm_120 add.ptx -o add.cubin
+```
+
+Still to come: a GPU API in the standard library covering the intrinsics above
+plus atomics, warp operations, and math functions; build system support for
+compiling and embedding kernels; and MLIR lowering for tensor cores and kernel
+fusion.
+
+## AI Policy
+
+Upstream Zig bans LLMs from issues, patches, and bug tracker comments. Zig++
+welcomes them. The first Zig++ language feature, private fields, was
+implemented, tested, and documented by Claude, and the commit is signed that
+way.
+
+Zig++ is also building AI code generation into the build system. Today that is
+[Zigger](https://github.com/mattneel/zigger), a package that adds a
+`zig build gen` step: it reads `SPEC.md`, runs the Claude CLI to implement it,
+runs `zig build test`, feeds any failures back, and repeats until the tests pass
+(up to 10 times by default). With `-Dtdd=true` it writes failing tests first.
+The plan is to make this pipeline part of `std.Build`.
+
+The goal: by September 2027, all new Zig++ code is written through the Zigger
+pipeline.
+
+## Governance
+
+Upstream Zig is BDFN (Benevolent Dictator For Now). Zig++ is BDFL: Matthew Neel
+is the Benevolent Dictator For Life and has final say on the design and
+implementation of everything.
+
+Zig++ has no Code of Conduct. It has one rule: talk about code. Issues, pull
+requests, reviews, and comments are for the compiler, the language, the
+standard library, and the tools. Everything else, politics included, is off
+topic and will be closed.
+
+Language proposals are welcome. Zig++ is made of them.
 
 ## Documentation
 
@@ -18,6 +117,9 @@ reference at `doc/langref.html`, and the standard library documentation by
 running `zig std`, which will open a browser tab.
 
 ## Installation
+
+Zig++ does not have pre-built binaries yet, so build it from source. The links
+below are for upstream Zig.
 
  * [download a pre-built binary](https://ziglang.org/download/)
  * [install from a package manager](https://ziglang.org/learn/getting-started/#managers)
@@ -99,12 +201,21 @@ the build system as usual:
 ./zig2 build
 ```
 
-However, due to the above listed caveats, it is recommended to not proceed to
-this step until this issue is resolved:
+Upstream Zig recommends not proceeding with this step until this issue is
+resolved:
 
 [completely eliminate dependency on LLVM library API calls](https://github.com/ziglang/zig/issues/25492)
 
+**Zig++:** that issue will not be resolved here. LLVM is a permanent,
+first-class dependency of Zig++; the LLVM-less `zig2` above exists only for
+bootstrapping. See [LLVM Is Forever](#llvm-is-forever).
+
 ## Building from Source Using Prebuilt Zig
+
+**Zig++:** the prebuilt Zig must be a Zig++ binary, such as `stage3/bin/zig`
+from the CMake build. Upstream Zig binaries, including the one zig-bootstrap
+produces, cannot build Zig++, because Zig++ changed `std.lang.Type`.
+zig-bootstrap is still a good source of the LLVM, Clang, and LLD libraries.
 
 Dependencies:
 
@@ -453,14 +564,13 @@ Debug or Release LLVM.
 
 ## Contributing
 
-[Donate monthly](https://ziglang.org/zsf/).
+Zig++ is Free and Open Source Software. Bug reports, patches, and language
+proposals are welcome from everyone, and so is AI. Read [AI Policy](#ai-policy)
+and [Governance](#governance) first: Matthew Neel is BDFL, there is no Code of
+Conduct, and the only topic is code.
 
-[Join a community](https://ziglang.org/community/).
-
-Zig is Free and Open Source Software. We welcome bug reports and patches from
-everyone. However, keep in mind that Zig governance is BDFN (Benevolent
-Dictator For Now) which means that Andrew Kelley has final say on the design
-and implementation of everything.
+Most of this compiler was written by upstream Zig contributors. If you want to
+support them, [donate to the Zig Software Foundation](https://ziglang.org/zsf/).
 
 ### Make Software With Zig
 
@@ -484,17 +594,10 @@ Programming languages live and die based on the pulse of their ecosystems. The
 more people involved, the more we can build great things upon each other's
 abstractions.
 
-### Strict No LLM / No AI Policy
+### AI Welcome
 
-No LLMs for issues.
-
-No LLMs for patches / pull requests.
-
-No LLMs for comments on the bug tracker, including translation.
-
-English is encouraged, but not required. You are welcome to post in your native
-language and rely on others to have their own translation tools of choice to
-interpret your words.
+Use whatever tools you like for issues, patches, and code review. Better yet,
+use the Zigger pipeline; see [AI Policy](#ai-policy).
 
 ### Find a Contributor Friendly Issue
 
