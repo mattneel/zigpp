@@ -3,10 +3,16 @@
 //!
 //! Both drivers take the arguments of a launch as an array with one pointer per kernel
 //! parameter, each of them pointing at the value to pass, so the code that turns the tuple that
-//! `Function.launch` is called with into that array is the same for the two. The only thing that
-//! this code needs to know about the namespace it works for is the `Buffer` type function of
+//! `Function.launch` is called with into that array is the same for the two. The only things that
+//! this code needs to know about the namespace it works for are the `Buffer` type function of
 //! that namespace: a `Buffer` passes to a kernel as the address of its device memory, and a
 //! `Buffer` of one namespace does not belong in a launch of the other.
+//!
+//! `std.gpu.metal` uses the checks of the argument types and `isBuffer` from here, but not
+//! `argumentValue` and `ArgumentTuple`: the Metal runtime takes a buffer as the object that holds
+//! the memory rather than as its address, and takes a scalar as the bytes of the value. What that
+//! namespace passes a pointer off to differs too, so `ValueStorage` takes the advice its errors
+//! give.
 
 const std = @import("../std.zig");
 
@@ -30,33 +36,44 @@ pub fn ArgumentStorage(comptime Buffer: anytype, comptime T: type, comptime inde
     if (comptime isBuffer(Buffer, T)) {
         return @TypeOf(@as(T, undefined).ptr);
     } else {
-        return switch (@typeInfo(T)) {
-            .comptime_int => @compileError(std.fmt.comptimePrint(
-                "kernel parameter {d} is a comptime_int, which has no type that the driver could pass; write the type, such as `@as(u32, 256)`",
-                .{index},
-            )),
-            .comptime_float => @compileError(std.fmt.comptimePrint(
-                "kernel parameter {d} is a comptime_float, which has no type that the driver could pass; write the type, such as `@as(f32, 1.5)`",
-                .{index},
-            )),
-            .pointer => @compileError(std.fmt.comptimePrint(
-                "kernel parameter {d} is a host pointer or slice ('{s}'), and a kernel cannot read the memory of the host process; put the data in a Buffer and pass that, or pass a DevicePtr",
-                .{ index, @typeName(T) },
-            )),
-            .int, .float, .bool, .vector, .@"enum" => T,
-            .@"struct" => |info| if (info.layout == .@"extern" or info.layout == .@"packed")
-                T
-            else
-                @compileError(std.fmt.comptimePrint(
-                    "kernel parameter {d} has the type '{s}', which is not an extern or packed struct; only those have the layout that a kernel parameter needs",
-                    .{ index, @typeName(T) },
-                )),
-            else => @compileError(std.fmt.comptimePrint(
-                "kernel parameter {d} has the type '{s}', which cannot pass to a kernel; pass a Buffer, a DevicePtr, or a value of an integer, float, bool, enum, vector, extern struct, or packed struct type",
-                .{ index, @typeName(T) },
-            )),
-        };
+        return ValueStorage(T, index, "a Buffer or a DevicePtr");
     }
+}
+
+/// The storage for a kernel argument that is not a `Buffer`: the argument itself, for the types
+/// that a kernel parameter of that kind may have. Every check of what a kernel parameter may be
+/// is here, so that the namespaces agree on what a kernel can take.
+///
+/// `pointer_advice` is what the errors for a host pointer say to pass instead, which the
+/// namespaces word differently: `std.gpu.cuda` and `std.gpu.hip` have a device pointer type to
+/// pass as well as a buffer, and a namespace whose kernels are given buffers only does not.
+pub fn ValueStorage(comptime T: type, comptime index: usize, comptime pointer_advice: []const u8) type {
+    return switch (@typeInfo(T)) {
+        .comptime_int => @compileError(std.fmt.comptimePrint(
+            "kernel parameter {d} is a comptime_int, which has no type that the driver could pass; write the type, such as `@as(u32, 256)`",
+            .{index},
+        )),
+        .comptime_float => @compileError(std.fmt.comptimePrint(
+            "kernel parameter {d} is a comptime_float, which has no type that the driver could pass; write the type, such as `@as(f32, 1.5)`",
+            .{index},
+        )),
+        .pointer => @compileError(std.fmt.comptimePrint(
+            "kernel parameter {d} is a host pointer or slice ('{s}'), and a kernel cannot read the memory of the host process; pass {s}",
+            .{ index, @typeName(T), pointer_advice },
+        )),
+        .int, .float, .bool, .vector, .@"enum" => T,
+        .@"struct" => |info| if (info.layout == .@"extern" or info.layout == .@"packed")
+            T
+        else
+            @compileError(std.fmt.comptimePrint(
+                "kernel parameter {d} has the type '{s}', which is not an extern or packed struct; only those have the layout that a kernel parameter needs",
+                .{ index, @typeName(T) },
+            )),
+        else => @compileError(std.fmt.comptimePrint(
+            "kernel parameter {d} has the type '{s}', which cannot pass to a kernel; pass {s}, or a value of an integer, float, bool, enum, vector, extern struct, or packed struct type",
+            .{ index, @typeName(T), pointer_advice },
+        )),
+    };
 }
 
 /// The value of one kernel argument that the launch passes to the driver: the address of the

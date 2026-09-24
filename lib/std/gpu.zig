@@ -54,10 +54,12 @@ const output_buffer = @import("gpu/output_buffer.zig");
 pub const allocators = @import("gpu/allocators.zig");
 pub const cuda = @import("gpu/cuda.zig");
 pub const hip = @import("gpu/hip.zig");
+pub const metal = @import("gpu/metal.zig");
 
 test {
     _ = cuda;
     _ = hip;
+    _ = metal;
 }
 
 const arch = builtin.cpu.arch;

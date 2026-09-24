@@ -23,6 +23,11 @@ pub fn build(b: *std.Build) void {
     const os = host_target.result.os.tag;
     if (os == .linux) addCudaTest(b, test_step, host_target);
     if (os == .linux or os == .windows) addHipTest(b, test_step, host_target, amdgpu_archs);
+
+    // `std.gpu.metal` finds the Metal framework and the Objective-C runtime at run time, and only
+    // on macOS. The host program is built and run everywhere: without a Mac, and without the
+    // `.metallib` files of the kernels, every test of it is skipped.
+    addMetalHost(b, test_step, host_target);
 }
 
 const images = [_]struct { name: []const u8, optimize: std.builtin.OptimizeMode }{
@@ -107,6 +112,39 @@ fn addHipTest(
     }
     exe.root_module.addImport("code_objects", code_objects);
     addRuns(b, test_step, exe);
+}
+
+/// The Metal arm of this suite: `metal_host.zig` runs the vector add and the reduction through
+/// `std.gpu.metal`, with the same kernels and the same arguments as the CUDA and HIP hosts, and
+/// checks the results against the CPU. Its kernels are `.metallib` files that the step is given
+/// with `-Dmetallib=a.metallib,b.metallib`, rather than objects of this directory, because the
+/// container is what a Metal GPU is given: see the header of `metal_host.zig` for the two ways to
+/// build one. The host program skips the tests of a library that it was not given, and every test
+/// of a machine without the Metal framework, so the step passes with no libraries at all.
+fn addMetalHost(b: *std.Build, test_step: *std.Build.Step, host_target: std.Build.ResolvedTarget) void {
+    const exe = b.addExecutable(.{
+        .name = "gpu_metal_host",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("metal_host.zig"),
+            .target = host_target,
+            .optimize = .debug,
+            // The Metal framework and the Objective-C runtime are loaded with `dlopen`.
+            .link_libc = true,
+        }),
+    });
+    b.installArtifact(exe);
+
+    const run = b.addRunArtifact(exe);
+    const metallibs = b.option(
+        []const u8,
+        "metallib",
+        "Comma-separated .metallib files whose kernels the Metal host test runs on the GPU of a Mac",
+    );
+    if (metallibs) |list| {
+        var paths = std.mem.tokenizeScalar(u8, list, ',');
+        while (paths.next()) |path| run.addArg(path);
+    }
+    test_step.dependOn(&run.step);
 }
 
 fn addHost(b: *std.Build, host_target: std.Build.ResolvedTarget, backend: Backend) *std.Build.Step.Compile {
