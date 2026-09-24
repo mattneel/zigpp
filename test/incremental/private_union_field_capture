@@ -1,0 +1,62 @@
+#update=initial version
+#file=main.zig
+const std = @import("std");
+const Shape = @import("shape.zig").Shape;
+pub fn main(init: std.process.Init) !void {
+    const shape = Shape.makeSquare(3);
+    const area: u32 = switch (shape) {
+        .circle => 0,
+        .square => |side| side * side,
+    };
+    var buf: [16]u8 = undefined;
+    try std.Io.File.stdout().writeStreamingAll(init.io, try std.fmt.bufPrint(&buf, "{d}\n", .{area}));
+}
+#file=shape.zig
+pub const Shape = union(enum) {
+    circle: u32,
+    square: u32,
+    pub fn makeSquare(side: u32) Shape {
+        return .{ .square = side };
+    }
+};
+#expect_stdout="9\n"
+
+#update=make square private
+#file=shape.zig
+pub const Shape = union(enum) {
+    circle: u32,
+    priv square: u32,
+    pub fn makeSquare(side: u32) Shape {
+        return .{ .square = side };
+    }
+};
+#expect_error=main.zig:7:10: error: field 'square' of union 'shape.Shape' is private
+#expect_error=shape.zig:3:10: note: field 'square' declared here
+
+#update=use the public interface and inline else
+#file=main.zig
+const std = @import("std");
+const Shape = @import("shape.zig").Shape;
+pub fn main(init: std.process.Init) !void {
+    const shape = Shape.makeSquare(3);
+    const payload: u32 = switch (shape) {
+        inline else => |value| value,
+    };
+    var buf: [16]u8 = undefined;
+    try std.Io.File.stdout().writeStreamingAll(init.io, try std.fmt.bufPrint(&buf, "{d}\n", .{shape.area() + payload}));
+}
+#file=shape.zig
+pub const Shape = union(enum) {
+    circle: u32,
+    priv square: u32,
+    pub fn makeSquare(side: u32) Shape {
+        return .{ .square = side };
+    }
+    pub fn area(s: Shape) u32 {
+        return switch (s) {
+            .circle => |r| 3 * r * r,
+            .square => |side| side * side,
+        };
+    }
+};
+#expect_stdout="12\n"

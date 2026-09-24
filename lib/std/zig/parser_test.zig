@@ -542,6 +542,43 @@ test "zig fmt: comptime struct field" {
     );
 }
 
+test "zig fmt: priv container fields" {
+    try testCanonical(
+        \\const Foo = struct {
+        \\    a: i32,
+        \\    /// Documentation.
+        \\    priv b: i32,
+        \\    priv c: i32 align(8) = 1,
+        \\    priv comptime d: i32 = 1234,
+        \\};
+        \\const Bar = union(enum) {
+        \\    a: u32,
+        \\    priv b,
+        \\    priv c: u64,
+        \\};
+        \\const Baz = struct { priv a: u8, b: u8 };
+        \\
+    );
+}
+
+test "zig fmt: priv on non-fields" {
+    try testError(
+        \\const S = struct {
+        \\    priv fn f() void {}
+        \\    priv const x = 1;
+        \\    priv comptime {}
+        \\    priv test {}
+        \\};
+    , &[_]Error{
+        .priv_decl,
+        .decl_private_by_default,
+        .priv_decl,
+        .decl_private_by_default,
+        .priv_decl,
+        .priv_decl,
+    });
+}
+
 test "zig fmt: break from block" {
     try testCanonical(
         \\const a = blk: {

@@ -1482,6 +1482,7 @@ const Writer = struct {
             var it = struct_decl.iterateFields();
             while (it.next()) |field| {
                 try stream.splatByteAll(' ', self.indent);
+                try self.writeFlag(stream, "priv ", field.is_priv);
                 try self.writeFlag(stream, "comptime ", field.is_comptime);
                 const field_name = self.code.nullTerminatedString(field.name);
                 try stream.print("{f}: ", .{std.zig.fmtIdP(field_name)});
@@ -1559,6 +1560,7 @@ const Writer = struct {
             var it = union_decl.iterateFields();
             while (it.next()) |field| {
                 try stream.splatByteAll(' ', self.indent);
+                try self.writeFlag(stream, "priv ", field.is_priv);
                 const field_name = self.code.nullTerminatedString(field.name);
                 try stream.print("{f}", .{std.zig.fmtIdP(field_name)});
 

@@ -270,6 +270,7 @@ const Def = enum {
     defKEYWORD_or,
     defKEYWORD_orelse,
     defKEYWORD_packed,
+    defKEYWORD_priv,
     defKEYWORD_pub,
     defKEYWORD_resume,
     defKEYWORD_return,
@@ -290,7 +291,7 @@ const Def = enum {
 const Parser = struct {
     source: []const u8,
     i: usize,
-    depths: [272]u8,
+    depths: [273]u8,
     pub fn parseRoot(p: *Parser) Error!bool {
         const def_index = @backingInt(Def.defRoot);
         if (p.depths[def_index] > max_depth) return error.MaxDepth;
@@ -554,7 +555,7 @@ const Parser = struct {
         defer p.depths[def_index] -= 1;
         return blk_0: {
             const pos_0 = p.i;
-            if ((try p.parsedoc_comment() or true) and (try p.parseKEYWORD_comptime() or true) and (blk_3: {
+            if ((try p.parsedoc_comment() or true) and (try p.parseKEYWORD_priv() or true) and (try p.parseKEYWORD_comptime() or true) and (blk_3: {
                 const pos_3 = p.i;
                 if (try p.parseIDENTIFIER() and try p.parseCOLON()) break :blk_3 true;
                 p.i = pos_3;
@@ -6177,6 +6178,24 @@ const Parser = struct {
             break :blk_0 false;
         };
     }
+    pub fn parseKEYWORD_priv(p: *Parser) Error!bool {
+        const def_index = @backingInt(Def.defKEYWORD_priv);
+        if (p.depths[def_index] > max_depth) return error.MaxDepth;
+        p.depths[def_index] += 1;
+        defer p.depths[def_index] -= 1;
+        return blk_0: {
+            const pos_0 = p.i;
+            if (try p.parseskip() and blk_1: {
+                if (std.mem.startsWith(u8, p.source[p.i..], "priv")) {
+                    p.i += 4;
+                    break :blk_1 true;
+                }
+                break :blk_1 false;
+            } and try p.parseend_of_word()) break :blk_0 true;
+            p.i = pos_0;
+            break :blk_0 false;
+        };
+    }
     pub fn parseKEYWORD_pub(p: *Parser) Error!bool {
         const def_index = @backingInt(Def.defKEYWORD_pub);
         if (p.depths[def_index] > max_depth) return error.MaxDepth;
@@ -6515,6 +6534,8 @@ const Parser = struct {
             if (try p.parseKEYWORD_orelse()) break :blk_0 true;
             p.i = pos_0;
             if (try p.parseKEYWORD_packed()) break :blk_0 true;
+            p.i = pos_0;
+            if (try p.parseKEYWORD_priv()) break :blk_0 true;
             p.i = pos_0;
             if (try p.parseKEYWORD_pub()) break :blk_0 true;
             p.i = pos_0;

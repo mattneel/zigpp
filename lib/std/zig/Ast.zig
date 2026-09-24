@@ -490,6 +490,12 @@ pub fn renderError(tree: Ast, parse_error: Error, w: *Writer) Writer.Error!void 
         .comptime_doc_comment => {
             return w.writeAll("documentation comments cannot be attached to comptime blocks");
         },
+        .priv_decl => {
+            return w.writeAll("only container fields can be marked 'priv'");
+        },
+        .decl_private_by_default => {
+            return w.writeAll("declarations are private unless marked 'pub'");
+        },
         .varargs_nonfinal => {
             return w.writeAll("function prototype has parameter after varargs");
         },
@@ -751,10 +757,10 @@ pub fn firstToken(tree: Ast, node: Node.Index) TokenIndex {
         .container_field_align,
         .container_field,
         => {
-            const name_token = tree.nodeMainToken(n);
-            const has_comptime_token = tree.isTokenPrecededByTags(name_token, &.{.keyword_comptime});
-            end_offset += @intFromBool(has_comptime_token);
-            return name_token - end_offset;
+            var first_token = tree.nodeMainToken(n);
+            if (tree.isTokenPrecededByTags(first_token, &.{.keyword_comptime})) first_token -= 1;
+            if (tree.isTokenPrecededByTags(first_token, &.{.keyword_priv})) first_token -= 1;
+            return first_token - end_offset;
         },
 
         .global_var_decl,
@@ -2045,14 +2051,24 @@ fn fullIfComponents(tree: Ast, info: full.If.Components) full.If {
 fn fullContainerFieldComponents(tree: Ast, info: full.ContainerField.Components) full.ContainerField {
     var result: full.ContainerField = .{
         .ast = info,
+        .priv_token = null,
         .comptime_token = null,
     };
-    if (tree.isTokenPrecededByTags(info.main_token, &.{.keyword_comptime})) {
+    var first_token = info.main_token;
+    if (tree.isTokenPrecededByTags(first_token, &.{.keyword_comptime})) {
         // comptime type = init,
         // ^        ^
         // comptime name: type = init,
         // ^        ^
-        result.comptime_token = info.main_token - 1;
+        first_token -= 1;
+        result.comptime_token = first_token;
+    }
+    if (tree.isTokenPrecededByTags(first_token, &.{.keyword_priv})) {
+        // priv comptime name: type = init,
+        // ^    ^
+        // priv name: type = init,
+        // ^    ^
+        result.priv_token = first_token - 1;
     }
     return result;
 }
@@ -2537,6 +2553,9 @@ pub const full = struct {
     };
 
     pub const ContainerField = struct {
+        /// The `priv` keyword, if present. Marks the field as private to the file
+        /// in which the containing type is declared.
+        priv_token: ?TokenIndex,
         comptime_token: ?TokenIndex,
         ast: Components,
 
@@ -2550,7 +2569,7 @@ pub const full = struct {
         };
 
         pub fn firstToken(cf: ContainerField) TokenIndex {
-            return cf.comptime_token orelse cf.ast.main_token;
+            return cf.priv_token orelse cf.comptime_token orelse cf.ast.main_token;
         }
 
         pub fn convertToNonTupleLike(cf: *ContainerField, tree: *const Ast) void {
@@ -2876,6 +2895,7 @@ pub const Error = struct {
         unattached_doc_comment,
         test_doc_comment,
         comptime_doc_comment,
+        priv_decl,
         varargs_nonfinal,
         expected_semi_after_decl,
         expected_semi_after_stmt,
@@ -2897,6 +2917,7 @@ pub const Error = struct {
         zig_style_container,
         previous_field,
         next_field,
+        decl_private_by_default,
 
         /// `expected_tag` is populated.
         expected_token,

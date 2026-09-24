@@ -419,14 +419,12 @@ fn ast_decl_fields_fallible(ast: *Ast, ast_index: Ast.Node.Index) ![]Ast.Node.In
     g.result.clearRetainingCapacity();
     var buf: [2]Ast.Node.Index = undefined;
     const container_decl = ast.fullContainerDecl(&buf, ast_index) orelse return &.{};
-    for (container_decl.ast.members) |member_node| switch (ast.nodeTag(member_node)) {
-        .container_field_init,
-        .container_field_align,
-        .container_field,
-        => try g.result.append(gpa, member_node),
-
-        else => continue,
-    };
+    for (container_decl.ast.members) |member_node| {
+        const field = ast.fullContainerField(member_node) orelse continue;
+        // Private fields are an implementation detail, like non-pub declarations.
+        if (field.priv_token != null) continue;
+        try g.result.append(gpa, member_node);
+    }
     return g.result.items;
 }
 

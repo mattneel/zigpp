@@ -2238,6 +2238,55 @@ or
       {#header_close#}
       {#header_close#}
 
+      {#header_open|Private Fields#}
+      <p>
+      Struct fields are public by default, meaning that they can be accessed from any file.
+      A field declared with the {#syntax#}priv{#endsyntax#} keyword is <em>private</em>: it can only
+      be accessed by name from within the file which declares the struct, just like a declaration
+      which is not marked {#syntax#}pub{#endsyntax#}. Private fields allow a type to protect its
+      invariants, and communicate which fields are implementation details rather than part of its API.
+      </p>
+      {#code|test_private_fields.zig#}
+
+      <p>
+      Code in any other file cannot name a private field, whether to read it, write it, take its
+      address, call it, or specify its value in an initialization expression:
+      </p>
+      {#code|test_private_field_access.zig#}
+
+      <p>
+      Private fields are still a part of every value of the type. If a private field has no
+      {#link|default value|Default Field Values#}, the struct can only be initialized within the file
+      which declares it, typically by a public initialization function.
+      </p>
+      <p>
+      Field privacy only applies to syntax which names a field. {#link|@typeInfo#} reports private
+      fields along with all other fields, indicating their privacy with the
+      {#syntax#}@"priv"{#endsyntax#} field attribute. Builtins which name fields with strings, such as
+      {#link|@field#}, {#link|@FieldType#}, and {#link|@offsetOf#}, can be used with any field. This
+      allows generic code, such as formatting, comparison, hashing, and serialization, to operate on
+      all types:
+      </p>
+      {#code|test_private_field_reflection.zig#}
+
+      <p>
+      A type created with {#link|@Struct#} or {#link|@Union#} has private fields where the
+      {#syntax#}@"priv"{#endsyntax#} field attribute is set; these fields are private to the file
+      containing the reification builtin call.
+      </p>
+      <p>
+      Fields of {#link|unions|union#} can also be marked {#syntax#}priv{#endsyntax#}. Outside of the file
+      which declares the union, a private field cannot be accessed, initialized, or have its payload
+      captured by a {#link|switch#} prong which names it. The tag of a union is not affected by field
+      privacy, so it can still be compared against and switched on, and {#syntax#}else{#endsyntax#} and
+      {#syntax#}inline else{#endsyntax#} prongs can capture any payload.
+      </p>
+      <p>
+      {#link|Enum|enum#} fields and {#link|tuple|Tuples#} fields cannot be marked {#syntax#}priv{#endsyntax#}.
+      </p>
+      {#see_also|@import|@typeInfo|@field#}
+      {#header_close#}
+
       {#header_open|extern struct#}
       <p>An {#syntax#}extern struct{#endsyntax#} has in-memory layout matching
       the C ABI for the target.</p>
@@ -2475,6 +2524,9 @@ or
       </p>
       <p>
       To initialize a union when the tag is a {#link|comptime#}-known name, see {#link|@unionInit#}.
+      </p>
+      <p>
+      Union fields can be marked {#syntax#}priv{#endsyntax#}; see {#link|Private Fields#}.
       </p>
 
       {#header_open|Tagged union#}
@@ -5867,6 +5919,8 @@ fn cmpxchgWeakButNotAtomic(comptime T: type, ptr: *T, expected_value: T, new_val
     comptime field_attrs: *const [field_names.len]std.lang.Type.Struct.FieldAttributes,
 ) type{#endsyntax#}</pre>
       <p>Returns a {#link|struct#} type with the properties specified by the arguments.</p>
+      <p>Fields whose {#syntax#}@"priv"{#endsyntax#} attribute is set are {#link|private|Private Fields#}
+      to the file containing the call to {#syntax#}@Struct{#endsyntax#}.</p>
       {#header_close#}
 
       {#header_open|@Union#}
@@ -5879,6 +5933,8 @@ fn cmpxchgWeakButNotAtomic(comptime T: type, ptr: *T, expected_value: T, new_val
     comptime field_attrs: *const [field_names.len]std.lang.Type.Union.FieldAttributes,
 ) type{#endsyntax#}</pre>
       <p>Returns a {#link|union#} type with the properties specified by the arguments.</p>
+      <p>Fields whose {#syntax#}@"priv"{#endsyntax#} attribute is set are {#link|private|Private Fields#}
+      to the file containing the call to {#syntax#}@Union{#endsyntax#}.</p>
       {#header_close#}
 
       {#header_open|@Enum#}
@@ -7681,6 +7737,18 @@ fn readU32Be() u32 {}
             to the guaranteed {#syntax#}packed{#endsyntax#} layout.
             <ul>
               <li>See also {#link|packed struct#}</li>
+            </ul>
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">
+            <pre>{#syntax#}priv{#endsyntax#}</pre>
+          </th>
+          <td>
+            The {#syntax#}priv{#endsyntax#} in front of a struct or union field makes the field only
+            accessible by name from within the file which declares the type.
+            <ul>
+              <li>See also {#link|Private Fields#}</li>
             </ul>
           </td>
         </tr>

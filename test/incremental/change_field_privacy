@@ -1,0 +1,68 @@
+#update=initial version
+#file=main.zig
+const std = @import("std");
+const Counter = @import("counter.zig").Counter;
+pub fn main(init: std.process.Init) !void {
+    var counter: Counter = .{};
+    counter.step = 2;
+    counter.increment();
+    counter.count += 1;
+    var buf: [16]u8 = undefined;
+    try std.Io.File.stdout().writeStreamingAll(init.io, try std.fmt.bufPrint(&buf, "{d}\n", .{counter.get()}));
+}
+#file=counter.zig
+pub const Counter = struct {
+    count: u32 = 0,
+    step: u32 = 1,
+    pub fn increment(c: *Counter) void {
+        c.count += c.step;
+    }
+    pub fn get(c: Counter) u32 {
+        return c.count;
+    }
+};
+#expect_stdout="3\n"
+
+#update=make count private
+#file=counter.zig
+pub const Counter = struct {
+    priv count: u32 = 0,
+    step: u32 = 1,
+    pub fn increment(c: *Counter) void {
+        c.count += c.step;
+    }
+    pub fn get(c: Counter) u32 {
+        return c.count;
+    }
+};
+#expect_error=main.zig:7:13: error: field 'count' of struct 'counter.Counter' is private
+#expect_error=counter.zig:2:10: note: field 'count' declared here
+
+#update=make step private instead
+#file=counter.zig
+pub const Counter = struct {
+    count: u32 = 0,
+    priv step: u32 = 1,
+    pub fn increment(c: *Counter) void {
+        c.count += c.step;
+    }
+    pub fn get(c: Counter) u32 {
+        return c.count;
+    }
+};
+#expect_error=main.zig:5:13: error: field 'step' of struct 'counter.Counter' is private
+#expect_error=counter.zig:3:10: note: field 'step' declared here
+
+#update=make all fields public again
+#file=counter.zig
+pub const Counter = struct {
+    count: u32 = 0,
+    step: u32 = 1,
+    pub fn increment(c: *Counter) void {
+        c.count += c.step;
+    }
+    pub fn get(c: Counter) u32 {
+        return c.count;
+    }
+};
+#expect_stdout="3\n"

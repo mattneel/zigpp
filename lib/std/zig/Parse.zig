@@ -377,6 +377,37 @@ fn parseContainerMembers(p: *Parse) Error!Members {
                     p.findNextContainerMember();
                 },
             },
+            .keyword_priv => switch (p.tokenTag(p.tok_i + 1)) {
+                .keyword_pub,
+                .keyword_const,
+                .keyword_var,
+                .keyword_threadlocal,
+                .keyword_export,
+                .keyword_extern,
+                .keyword_inline,
+                .keyword_noinline,
+                .keyword_fn,
+                .keyword_test,
+                => |t| {
+                    try p.warn(.priv_decl);
+                    if (t != .keyword_test) {
+                        try p.warnMsg(.{ .tag = .decl_private_by_default, .is_note = true, .token = p.tok_i });
+                    }
+                    // Recover by parsing the member as if `priv` was absent.
+                    p.tok_i += 1;
+                    continue :sw t;
+                },
+                .keyword_comptime => if (p.tokenTag(p.tok_i + 2) == .l_brace) {
+                    try p.warn(.priv_decl);
+                    p.tok_i += 1;
+                    continue :sw .keyword_comptime;
+                } else {
+                    // `priv comptime name: T = value,`
+                    continue :sw .identifier;
+                },
+                // A container field; handled by the `else` prong.
+                else => continue :sw .identifier,
+            },
             .keyword_pub,
             .keyword_const,
             .keyword_var,
@@ -526,6 +557,7 @@ fn findNextContainerMember(p: *Parse) void {
             // Any of these can start a new top level declaration.
             .keyword_test,
             .keyword_comptime,
+            .keyword_priv,
             .keyword_pub,
             .keyword_export,
             .keyword_extern,
@@ -898,6 +930,7 @@ fn parseGlobalVarDecl(p: *Parse) !?Node.Index {
 }
 
 fn expectContainerField(p: *Parse) !Node.Index {
+    _ = p.eatToken(.keyword_priv);
     _ = p.eatToken(.keyword_comptime);
     const main_token = p.tok_i;
     _ = p.eatTokens(&.{ .identifier, .colon });

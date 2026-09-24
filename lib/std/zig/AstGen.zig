@@ -4864,6 +4864,7 @@ fn structDeclInner(
             .any_field_aligns = false,
             .any_field_defaults = false,
             .any_comptime_fields = false,
+            .any_priv_fields = false,
             .fields_hash = @splat(0),
             .captures = &.{},
             .capture_names = &.{},
@@ -4911,6 +4912,11 @@ fn structDeclInner(
         @divCeil(scan_result.fields_len, 32),
     );
     if (field_comptime_bits) |bits| @memset(bits.get(astgen), 0);
+    const field_priv_bits = try scratch.addOptionalSlice(
+        scan_result.any_priv_fields,
+        @divCeil(scan_result.fields_len, 32),
+    );
+    if (field_priv_bits) |bits| @memset(bits.get(astgen), 0);
 
     const old_hasher = astgen.src_hasher;
     defer astgen.src_hasher = old_hasher;
@@ -5001,6 +5007,11 @@ fn structDeclInner(
             const mask = @as(u32, 1) << @intCast(field_idx % 32);
             field_comptime_bits.?.get(astgen)[field_idx / 32] |= mask;
         }
+
+        if (member.priv_token != null) {
+            const mask = @as(u32, 1) << @intCast(field_idx % 32);
+            field_priv_bits.?.get(astgen)[field_idx / 32] |= mask;
+        }
     }
     assert(next_field_idx == scan_result.fields_len);
     wip_decls.finish();
@@ -5020,6 +5031,7 @@ fn structDeclInner(
         .any_field_aligns = scan_result.any_field_aligns,
         .any_field_defaults = scan_result.any_field_values,
         .any_comptime_fields = scan_result.any_comptime_fields,
+        .any_priv_fields = scan_result.any_priv_fields,
         .fields_hash = fields_hash,
         .captures = namespace.captures.keys(),
         .capture_names = namespace.captures.values(),
@@ -5077,6 +5089,10 @@ fn tupleDecl(
                 &.{try astgen.errNoteNode(tuple_member, "tuple field here", .{})},
             );
         };
+
+        if (field.priv_token) |priv_token| {
+            return astgen.failTok(priv_token, "tuple fields cannot be marked 'priv'", .{});
+        }
 
         if (!field.ast.tuple_like) {
             return astgen.failTok(field.ast.main_token, "tuple field has a name", .{});
@@ -5196,6 +5212,11 @@ fn unionDeclInner(
     const field_type_body_lens = try scratch.addSlice(scan_result.fields_len);
     const field_align_body_lens = try scratch.addOptionalSlice(scan_result.any_field_aligns, scan_result.fields_len);
     const field_value_body_lens = try scratch.addOptionalSlice(scan_result.any_field_values, scan_result.fields_len);
+    const field_priv_bits = try scratch.addOptionalSlice(
+        scan_result.any_priv_fields,
+        @divCeil(scan_result.fields_len, 32),
+    );
+    if (field_priv_bits) |bits| @memset(bits.get(astgen), 0);
 
     const old_hasher = astgen.src_hasher;
     defer astgen.src_hasher = old_hasher;
@@ -5286,6 +5307,11 @@ fn unionDeclInner(
         } else if (field_value_body_lens) |lens| {
             lens.get(astgen)[field_idx] = 0;
         }
+
+        if (member.priv_token != null) {
+            const mask = @as(u32, 1) << @intCast(field_idx % 32);
+            field_priv_bits.?.get(astgen)[field_idx / 32] |= mask;
+        }
     }
     assert(next_field_idx == scan_result.fields_len);
     wip_decls.finish();
@@ -5312,6 +5338,7 @@ fn unionDeclInner(
         .fields_len = scan_result.fields_len,
         .any_field_aligns = scan_result.any_field_aligns,
         .any_field_values = scan_result.any_field_values,
+        .any_priv_fields = scan_result.any_priv_fields,
         .fields_hash = fields_hash,
         .captures = namespace.captures.keys(),
         .capture_names = namespace.captures.values(),
@@ -5433,6 +5460,7 @@ fn containerDecl(
                 member.convertToNonTupleLike(astgen.tree);
                 if (member.ast.tuple_like) return astgen.failTok(member.ast.main_token, "enum field missing name", .{});
                 if (member.comptime_token) |t| return astgen.failTok(t, "enum fields cannot be marked comptime", .{});
+                if (member.priv_token) |t| return astgen.failTok(t, "enum fields cannot be marked 'priv'", .{});
                 if (member.ast.type_expr.unwrap()) |type_node| {
                     return astgen.failNodeNotes(type_node, "enum fields do not have types", .{}, &.{
                         try astgen.errNoteNode(node, "consider 'union(enum)' here to make it a tagged union", .{}),
@@ -12427,6 +12455,7 @@ const GenZir = struct {
         any_field_aligns: bool,
         any_field_defaults: bool,
         any_comptime_fields: bool,
+        any_priv_fields: bool,
         fields_hash: std.zig.SrcHash,
         captures: []const Zir.Inst.Capture,
         capture_names: []const Zir.NullTerminatedString,
@@ -12481,6 +12510,7 @@ const GenZir = struct {
                     .any_field_aligns = args.any_field_aligns,
                     .any_field_defaults = args.any_field_defaults,
                     .any_comptime_fields = args.any_comptime_fields,
+                    .any_priv_fields = args.any_priv_fields,
                 }),
                 .operand = payload_index,
             } },
@@ -12498,6 +12528,7 @@ const GenZir = struct {
         fields_len: u32,
         any_field_aligns: bool,
         any_field_values: bool,
+        any_priv_fields: bool,
         fields_hash: std.zig.SrcHash,
         captures: []const Zir.Inst.Capture,
         capture_names: []const Zir.NullTerminatedString,
@@ -12553,6 +12584,7 @@ const GenZir = struct {
                     .kind = args.kind,
                     .any_field_aligns = args.any_field_aligns,
                     .any_field_values = args.any_field_values,
+                    .any_priv_fields = args.any_priv_fields,
                 }),
                 .operand = payload_index,
             } },
@@ -12896,6 +12928,7 @@ const ScanContainerResult = struct {
     any_field_aligns: bool,
     any_field_values: bool,
     any_comptime_fields: bool,
+    any_priv_fields: bool,
     /// Whether there is a field named `_` (indicating a non-exhaustive enum)
     has_underscore_field: bool,
 };
@@ -12940,6 +12973,7 @@ fn scanContainer(
     var any_field_aligns = false;
     var any_field_values = false;
     var any_comptime_fields = false;
+    var any_priv_fields = false;
     var has_underscore_field = false;
     for (members) |member_node| {
         const Kind = enum { decl, field };
@@ -12956,6 +12990,7 @@ fn scanContainer(
                 if (full.ast.align_expr != .none) any_field_aligns = true;
                 if (full.ast.value_expr != .none) any_field_values = true;
                 if (full.comptime_token != null) any_comptime_fields = true;
+                if (full.priv_token != null) any_priv_fields = true;
                 if (mem.eql(u8, tree.tokenSlice(full.ast.main_token), "_")) has_underscore_field = true;
                 if (full.ast.tuple_like) continue;
                 break :blk .{ .field, full.ast.main_token };
@@ -13128,6 +13163,7 @@ fn scanContainer(
             .any_field_aligns = any_field_aligns,
             .any_field_values = any_field_values,
             .any_comptime_fields = any_comptime_fields,
+            .any_priv_fields = any_priv_fields,
             .has_underscore_field = has_underscore_field,
         };
     }

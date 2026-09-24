@@ -4819,6 +4819,77 @@ fn failWithBadUnionFieldAccess(
     return sema.failWithOwnedErrorMsg(block, msg);
 }
 
+/// Emits a compile error if field `field_index` of the struct or union type `container_ty` is
+/// marked `priv` and the code being analyzed in `block` is not in the file which declares
+/// `container_ty`. Does nothing for other types.
+///
+/// This check applies to syntax which names a field: field access (`a.b`, `&a.b`, `a.b()`),
+/// initialization (`T{ .b = x }`, `.{ .b = x }`, and `.b` with a union result type), and payload
+/// captures of `switch` prongs whose items name a union field. Reflection builtins which take field
+/// names as strings, such as `@field` and `@unionInit`, deliberately bypass this check, so that
+/// generic code (formatting, hashing, comparison, serialization, ...) keeps working with types
+/// that have private fields. Likewise, coercing an enum value to a tagged union, and `else` prongs
+/// with payload captures, do not name any field, so are not subject to this check.
+///
+/// Asserts that the layout of `container_ty` is resolved if it is a struct or union type.
+fn checkFieldAccess(
+    sema: *Sema,
+    block: *Block,
+    src: LazySrcLoc,
+    container_ty: Type,
+    field_index: u32,
+) CompileError!void {
+    const pt = sema.pt;
+    const zcu = pt.zcu;
+    const ip = &zcu.intern_pool;
+    if (!ip.containerHasPrivFields(container_ty.toIntern())) return;
+    const kind: []const u8, const namespace: InternPool.NamespaceIndex, const field_name: InternPool.NullTerminatedString = switch (ip.indexToKey(container_ty.toIntern())) {
+        .struct_type => info: {
+            const struct_type = ip.loadStructType(container_ty.toIntern());
+            if (!struct_type.field_is_priv_bits.get(ip, field_index)) return;
+            break :info .{ "struct", struct_type.namespace, struct_type.field_names.get(ip)[field_index] };
+        },
+        .union_type => info: {
+            const union_type = ip.loadUnionType(container_ty.toIntern());
+            if (!union_type.field_is_priv_bits.get(ip, field_index)) return;
+            const enum_type = ip.loadEnumType(union_type.enum_tag_type);
+            break :info .{ "union", union_type.namespace, enum_type.field_names.get(ip)[field_index] };
+        },
+        else => unreachable,
+    };
+    if (zcu.namespacePtr(namespace).file_scope == block.getFileScopeIndex(zcu)) return;
+    return sema.failWithOwnedErrorMsg(block, msg: {
+        const msg = try sema.errMsg(src, "field '{f}' of {s} '{f}' is private", .{
+            field_name.fmt(ip), kind, container_ty.fmt(pt),
+        });
+        errdefer msg.destroy(sema.gpa);
+        try sema.addFieldErrNote(container_ty, field_index, msg, "field '{f}' declared here", .{field_name.fmt(ip)});
+        break :msg msg;
+    });
+}
+
+/// Like `checkFieldAccess`, but for field access syntax `a.b`, where `object_ty` is the type of `a`
+/// (which may be a single pointer to the container type) and `field_name` is `b`. Does nothing if
+/// `field_name` does not name a field of the container type.
+fn checkFieldAccessByName(
+    sema: *Sema,
+    block: *Block,
+    src: LazySrcLoc,
+    object_ty: Type,
+    field_name: InternPool.NullTerminatedString,
+) CompileError!void {
+    const zcu = sema.pt.zcu;
+    const ip = &zcu.intern_pool;
+    const container_ty = if (object_ty.isSinglePointer(zcu)) object_ty.childType(zcu) else object_ty;
+    if (!ip.containerHasPrivFields(container_ty.toIntern())) return;
+    const field_index: u32 = switch (ip.indexToKey(container_ty.toIntern())) {
+        .struct_type => ip.loadStructType(container_ty.toIntern()).nameIndex(ip, field_name) orelse return,
+        .union_type => ip.loadEnumType(ip.loadUnionType(container_ty.toIntern()).enum_tag_type).nameIndex(ip, field_name) orelse return,
+        else => unreachable,
+    };
+    return sema.checkFieldAccess(block, src, container_ty, field_index);
+}
+
 pub fn addDeclaredHereNote(sema: *Sema, parent: *Zcu.ErrorMsg, decl_ty: Type) Allocator.Error!void {
     const zcu = sema.pt.zcu;
     const src_loc = decl_ty.srcLocOrNull(zcu) orelse return;
@@ -7861,7 +7932,16 @@ fn analyzeDeclLiteral(
             else => break,
         };
 
-        break :res try sema.fieldVal(block, src, Air.internedToRef(ty.toIntern()), name, src);
+        const result = try sema.fieldVal(block, src, Air.internedToRef(ty.toIntern()), name, src);
+        if (ty.zigTypeTag(zcu) == .@"union" and
+            zcu.intern_pool.containerHasPrivFields(ty.toIntern()) and
+            try sema.namespaceLookup(block, src, ty.getNamespaceIndex(zcu), name) == null)
+        {
+            // `.name` refers to the union field `name` rather than to a declaration, and
+            // initializes that field, so the privacy of that field applies.
+            try sema.checkFieldAccessByName(block, src, ty, name);
+        }
+        break :res result;
     };
 
     // Decl literals cannot lookup runtime `var`s.
@@ -9254,7 +9334,9 @@ fn zirFieldPtrLoad(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileErro
         .no_embedded_nulls,
     );
     const object_ptr = sema.resolveInst(extra.lhs);
-    return fieldPtrLoad(sema, block, src, object_ptr, field_name, field_name_src);
+    const result = try fieldPtrLoad(sema, block, src, object_ptr, field_name, field_name_src);
+    try sema.checkFieldAccessByName(block, field_name_src, sema.typeOf(object_ptr).childType(zcu), field_name);
+    return result;
 }
 
 fn zirFieldPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Air.Inst.Ref {
@@ -9276,7 +9358,9 @@ fn zirFieldPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ai
         .no_embedded_nulls,
     );
     const object_ptr = sema.resolveInst(extra.lhs);
-    return sema.fieldPtr(block, src, object_ptr, field_name, field_name_src, false);
+    const result = try sema.fieldPtr(block, src, object_ptr, field_name, field_name_src, false);
+    try sema.checkFieldAccessByName(block, field_name_src, sema.typeOf(object_ptr).childType(zcu), field_name);
+    return result;
 }
 
 fn zirStructInitFieldPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Air.Inst.Ref {
@@ -9301,7 +9385,9 @@ fn zirStructInitFieldPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Compi
     const struct_ty = sema.typeOf(object_ptr).childType(zcu);
     switch (struct_ty.zigTypeTag(zcu)) {
         .@"struct", .@"union" => {
-            return sema.fieldPtr(block, src, object_ptr, field_name, field_name_src, true);
+            const result = try sema.fieldPtr(block, src, object_ptr, field_name, field_name_src, true);
+            try sema.checkFieldAccessByName(block, field_name_src, struct_ty, field_name);
+            return result;
         },
         else => {
             return sema.failWithStructInitNotSupported(block, src, struct_ty);
@@ -11377,6 +11463,13 @@ fn validateSwitchBlock(
             } else {
                 const item, extra_index = try sema.resolveSwitchItem(block, item_src, item_ty, item_info, extra_index, switch_inst, prong_info.is_comptime_unreach);
                 try sema.validateSwitchItemOrRange(block, item_src, item.val, null, item_ty, &seen);
+                if (prong_info.capture != .none and item_ty.toIntern() != operand_ty.toIntern()) {
+                    // This prong captures the payload of a tagged union field named by this item,
+                    // so the privacy of that field applies. (`else` prongs name no fields.)
+                    if (operand_ty.unionTagFieldIndex(item.val, zcu)) |field_index| {
+                        try sema.checkFieldAccess(block, item_src, operand_ty, @intCast(field_index));
+                    }
+                }
                 case_vals.appendAssumeCapacity(item.ref);
             }
         }
@@ -16725,7 +16818,9 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ai
 
                 field_name_val.* = name_val;
                 const union_field_attr = .{
-                    // alignment: ?usize,
+                    // @"priv": bool,
+                    Value.makeBool(union_obj.field_is_priv_bits.get(ip, field_index)).toIntern(),
+                    // @"align": ?usize,
                     alignment_val.toIntern(),
                 };
 
@@ -16912,6 +17007,8 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ai
                             const default_val_ptr = try sema.optRefValue(opt_default_val);
 
                             const struct_field_attr_fields = .{
+                                // @"priv": bool,
+                                Value.false.toIntern(),
                                 // @"comptime": bool,
                                 Value.makeBool(is_comptime).toIntern(),
                                 // @"align": ?usize,
@@ -16991,6 +17088,8 @@ fn zirTypeInfo(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Ai
                     };
 
                     const struct_field_attr_fields = .{
+                        // @"priv": bool,
+                        Value.makeBool(struct_type.field_is_priv_bits.get(ip, field_index)).toIntern(),
                         // @"comptime": bool,
                         Value.makeBool(field_is_comptime).toIntern(),
                         // @"align": ?usize,
@@ -18742,6 +18841,7 @@ fn zirStructInit(
                 try sema.tupleFieldIndex(block, resolved_ty, field_name, field_src)
             else
                 try sema.structFieldIndex(block, resolved_ty, field_name, field_src);
+            try sema.checkFieldAccess(block, block.src(.{ .node_offset_field_name_init = field_type_data.src_node }), resolved_ty, field_index);
             assert(field_inits[field_index] == .none);
             field_assign_idxs[field_index] = field_i;
             found_fields[field_index] = item.data.field_type;
@@ -18778,6 +18878,7 @@ fn zirStructInit(
             .no_embedded_nulls,
         );
         const field_index = try sema.unionFieldIndex(block, resolved_ty, field_name, field_src);
+        try sema.checkFieldAccess(block, block.src(.{ .node_offset_field_name_init = field_type_data.src_node }), resolved_ty, field_index);
         const tag_ty = resolved_ty.unionTagTypeHypothetical(zcu);
         const tag_val = try pt.enumValueFieldIndex(tag_ty, field_index);
         const field_ty: Type = .fromInterned(zcu.typeToUnion(resolved_ty).?.field_types.get(ip)[field_index]);
@@ -19138,6 +19239,7 @@ fn structInitAnon(
         .fields_len = extra_data.fields_len,
         .layout = .auto,
         .any_comptime_fields = any_values,
+        .any_priv_fields = false,
         .any_field_defaults = any_values,
         .any_field_aligns = false,
         .packed_backing_int_type = .none,
@@ -20281,6 +20383,7 @@ fn zirReifyStruct(
     var any_comptime_fields = false;
     var any_field_defaults = false;
     var any_field_aligns = false;
+    var any_priv_fields = false;
 
     // TODO: use a longer hash!
     var hasher = std.hash.Wyhash.init(0);
@@ -20307,6 +20410,10 @@ fn zirReifyStruct(
 
         const field_name = try sema.sliceToIpString(block, field_names_src, field_name_val, .{ .simple = .struct_field_names });
 
+        const field_attr_priv = try field_attrs_val.fieldValue(pt, std.meta.fieldIndex(
+            std.lang.Type.Struct.FieldAttributes,
+            "priv",
+        ).?);
         const field_attr_comptime = try field_attrs_val.fieldValue(pt, std.meta.fieldIndex(
             std.lang.Type.Struct.FieldAttributes,
             "comptime",
@@ -20355,8 +20462,11 @@ fn zirReifyStruct(
             any_field_aligns = true;
         }
 
+        if (field_attr_priv.toBool()) any_priv_fields = true;
+
         std.hash.autoHash(&hasher, .{
             field_name,
+            field_attr_priv,
             field_attr_comptime,
             field_attr_align,
             field_default,
@@ -20369,6 +20479,7 @@ fn zirReifyStruct(
         .fields_len = @intCast(fields_len),
         .layout = layout,
         .any_comptime_fields = any_comptime_fields,
+        .any_priv_fields = any_priv_fields,
         .any_field_defaults = any_field_defaults,
         .any_field_aligns = any_field_aligns,
         .packed_backing_int_type = if (backing_int_ty) |ty| ty.toIntern() else .none,
@@ -20392,6 +20503,10 @@ fn zirReifyStruct(
                 const field_ty = (try field_types_arr.elemValue(pt, field_idx)).toType();
                 wip.field_types.get(ip)[field_idx] = field_ty.toIntern();
 
+                const field_attr_priv = try field_attrs_val.fieldValue(pt, std.meta.fieldIndex(
+                    std.lang.Type.Struct.FieldAttributes,
+                    "priv",
+                ).?);
                 const field_attr_comptime = try field_attrs_val.fieldValue(pt, std.meta.fieldIndex(
                     std.lang.Type.Struct.FieldAttributes,
                     "comptime",
@@ -20404,6 +20519,12 @@ fn zirReifyStruct(
                     std.lang.Type.Struct.FieldAttributes,
                     "default_value_ptr",
                 ).?);
+
+                if (field_attr_priv.toBool()) {
+                    const bit_bag_index = field_idx / 32;
+                    const mask = @as(u32, 1) << @intCast(field_idx % 32);
+                    wip.field_is_priv_bits.getAll(ip)[bit_bag_index] |= mask;
+                }
 
                 if (field_attr_comptime.toBool()) {
                     const bit_bag_index = field_idx / 32;
@@ -20562,6 +20683,7 @@ fn zirReifyUnion(
     // a hash representing the inputs for deduplication purposes.
 
     var any_field_aligns = false;
+    var any_priv_fields = false;
 
     // TODO: use a longer hash!
     var hasher = std.hash.Wyhash.init(0);
@@ -20601,6 +20723,7 @@ fn zirReifyUnion(
             _ = try sema.validateAlign(block, field_attrs_src, bytes);
             any_field_aligns = true;
         }
+        if (field_attrs.@"priv") any_priv_fields = true;
     }
 
     switch (try ip.getReifiedUnionType(gpa, io, pt.tid, .{
@@ -20609,6 +20732,7 @@ fn zirReifyUnion(
         .fields_len = @intCast(fields_len),
         .layout = layout,
         .any_field_aligns = any_field_aligns,
+        .any_priv_fields = any_priv_fields,
         .tag_usage = tag: {
             if (explicit_tag_ty != null) break :tag .tagged;
             if (layout == .auto and block.wantSafeTypes()) break :tag .safety;
@@ -20648,6 +20772,11 @@ fn zirReifyUnion(
                     wip.field_aligns.get(ip)[field_idx] = a;
                 } else if (any_field_aligns) {
                     wip.field_aligns.get(ip)[field_idx] = .none;
+                }
+                if (field_attrs.@"priv") {
+                    const bit_bag_index = field_idx / 32;
+                    const mask = @as(u32, 1) << @intCast(field_idx % 32);
+                    wip.field_is_priv_bits.getAll(ip)[bit_bag_index] |= mask;
                 }
             }
 
@@ -26775,6 +26904,7 @@ fn fieldCallBind(
             .@"struct" => {
                 if (zcu.typeToStruct(concrete_ty)) |struct_type| {
                     const field_index = struct_type.nameIndex(ip, field_name) orelse break :find_field;
+                    try sema.checkFieldAccess(block, field_name_src, concrete_ty, field_index);
                     return sema.finishFieldCallBind(block, src, ptr_ty, field_index, object_ptr);
                 } else if (concrete_ty.isTuple(zcu)) {
                     if (field_name.eqlSlice("len", ip)) {
@@ -26797,7 +26927,8 @@ fn fieldCallBind(
             .@"union" => {
                 const union_obj = zcu.typeToUnion(concrete_ty).?;
                 const enum_obj = ip.loadEnumType(union_obj.enum_tag_type);
-                if (enum_obj.nameIndex(ip, field_name) == null) break :find_field;
+                const field_index = enum_obj.nameIndex(ip, field_name) orelse break :find_field;
+                try sema.checkFieldAccess(block, field_name_src, concrete_ty, field_index);
                 const field_ptr = try unionFieldPtr(sema, block, src, object_ptr, field_name, field_name_src, concrete_ty, false);
                 return .{ .direct = try sema.analyzeLoad(block, src, field_ptr, src) };
             },
@@ -35354,6 +35485,7 @@ fn zirStructDecl(
         .fields_len = @intCast(struct_decl.field_names.len),
         .layout = struct_decl.layout,
         .any_comptime_fields = struct_decl.field_comptime_bits != null,
+        .any_priv_fields = struct_decl.field_priv_bits != null,
         .any_field_defaults = struct_decl.field_default_body_lens != null,
         .any_field_aligns = struct_decl.field_align_body_lens != null,
         .packed_backing_mode = if (struct_decl.backing_int_type_body != null) .explicit else .auto,
@@ -35412,6 +35544,7 @@ fn zirUnionDecl(
         .fields_len = @intCast(union_decl.field_names.len),
         .layout = union_decl.kind.layout(),
         .any_field_aligns = union_decl.field_align_body_lens != null,
+        .any_priv_fields = union_decl.field_priv_bits != null,
         .tag_usage = switch (union_decl.kind) {
             .auto => if (block.wantSafeTypes()) .safety else .none,
 

@@ -764,6 +764,10 @@ pub const Type = union(enum) {
         decl_names: []const [:0]const u8,
 
         pub const FieldAttributes = struct {
+            /// Whether the field is marked `priv`. A private field cannot be accessed by name
+            /// outside of the file which declares the struct type. For a type created with
+            /// `@Struct`, this is the file containing the `@Struct` call.
+            @"priv": bool = false,
             @"comptime": bool = false,
             /// `null` means the field alignment is not explicitly specified. The field will still
             /// be aligned to at least `@alignOf` the field type.
@@ -838,6 +842,10 @@ pub const Type = union(enum) {
         decl_names: []const [:0]const u8,
 
         pub const FieldAttributes = struct {
+            /// Whether the field is marked `priv`. A private field cannot be accessed by name
+            /// outside of the file which declares the union type. For a type created with
+            /// `@Union`, this is the file containing the `@Union` call.
+            @"priv": bool = false,
             /// `null` means the field alignment is not explicitly specified. The field will still
             /// be aligned to at least `@alignOf` the field type.
             @"align": ?usize = null,

@@ -758,6 +758,7 @@ fn tokenizeAndPrintRaw(
             .keyword_orelse,
             .keyword_packed,
             .keyword_anyframe,
+            .keyword_priv,
             .keyword_pub,
             .keyword_resume,
             .keyword_return,
