@@ -27,6 +27,7 @@ const default_local_zig_cache_basename = std.zig.default_local_zig_cache_basenam
 const stringToEnum = std.meta.stringToEnum;
 
 const Fuzz = @import("Maker/Fuzz.zig");
+const Any = @import("Maker/Any.zig");
 const Graph = @import("Maker/Graph.zig");
 const Step = @import("Maker/Step.zig");
 const Watch = @import("Maker/Watch.zig");
@@ -198,13 +199,14 @@ pub fn main(init: process.Init.Minimal) !void {
         .random_seed = parseRandomSeed(seed_arg),
     };
 
-    const cmd = stringToEnum(enum { libc, init, fetch, build, @"cache-cat" }, cmd_name) orelse
+    const cmd = stringToEnum(enum { libc, init, fetch, build, @"cache-cat", @"any-install" }, cmd_name) orelse
         fatal("bad command name: {q}", .{cmd_name});
     switch (cmd) {
         .libc => return cmdLibC(gpa, &graph, args[arg_i..]),
         .init => return cmdInit(gpa, &graph, args[arg_i..]),
         .fetch => return cmdFetch(gpa, &graph, args[arg_i..]),
         .@"cache-cat" => return cmdCacheCat(gpa, &graph, args[arg_i..]),
+        .@"any-install" => return Any.cmdAnyInstall(gpa, &graph, args[arg_i..]),
         .build => {},
     }
 

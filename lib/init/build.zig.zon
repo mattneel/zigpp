@@ -23,8 +23,10 @@
     // on the following line intact, so that it shows up in code reviews that
     // modify the field.
     .fingerprint = .FINGERPRINT, // Changing this has security and trust implications.
-    // Tracks the earliest Zig version that the package considers to be a
-    // supported use case.
+    // The exact Zig version this package is built with. `zig init` writes the
+    // version that created the project here, and Zig++ runs that exact version
+    // for this project even when the `zig` on PATH is a different one. Run
+    // another version by hand with `zig any <version> <command>`.
     .minimum_zig_version = "_ZIGVER",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.

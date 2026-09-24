@@ -75,6 +75,7 @@ const normal_usage =
     \\
     \\Commands:
     \\
+    \\  any              Run an exact Zig version, downloading it if needed
     \\  build            Build project from build.zig
     \\  fetch            Copy a package into global cache and print its hash
     \\  init             Initialize a Zig package in the current directory
@@ -113,6 +114,15 @@ const normal_usage =
     \\General Options:
     \\
     \\  -h, --help       Print command-specific usage
+    \\
+    \\Version Dispatch:
+    \\
+    \\A project's build.zig.zon can pin the exact compiler version it is built
+    \\with in `minimum_zig_version`. When it does, `zig` runs that version
+    \\instead of itself, downloading it into the global cache on first use;
+    \\`zig any list` lists the installed versions, and `zig any <version>` runs
+    \\a version that never dispatches to the project's pin. Set ZIG_ANY=off to
+    \\always run the `zig` on PATH instead.
     \\
 ;
 
@@ -238,6 +248,7 @@ const Cmd = enum {
     lib,
     ar,
 
+    any,
     build,
     @"cache-cat",
     fetch,
@@ -317,6 +328,18 @@ fn mainArgs(
 
     const cmd = args[1];
     const cmd_args = args[2..];
+
+    // Version dispatch: when the enclosing project's build.zig.zon pins an
+    // exact compiler version, run that version instead of this one, installing
+    // it into the global cache on first use. `zig any` is the explicit way to
+    // do the same thing.
+    if (!mem.eql(u8, cmd, "any")) {
+        switch (native_os) {
+            .wasi => {},
+            else => try dispatchToPinnedVersion(gpa, arena, io, args, environ_map),
+        }
+    }
+
     switch (stringToEnum(Cmd, cmd) orelse {
         std.log.info("{s}", .{usage});
         fatal("unknown command: {s}", .{args[1]});
@@ -348,6 +371,10 @@ fn mainArgs(
         .dlltool, .ranlib, .lib, .ar => {
             dev.check(.ar_command);
             return process.exit(try llvmArMain(arena, args));
+        },
+        .any => switch (native_os) {
+            .wasi => fatal("the `any` command cannot run another compiler on {t}", .{native_os}),
+            else => return cmdAny(gpa, arena, io, cmd_args, environ_map),
         },
         .build, .fetch, .init, .libc, .@"cache-cat" => {
             return jitCmd(gpa, arena, io, cmd_args, environ_map, .{
@@ -507,6 +534,363 @@ fn mainArgs(
         },
     }
 }
+
+/// The directory in the global cache that holds one directory per installed
+/// version: `<global cache>/any/<version>/zig`. This layout is shared with
+/// `lib/compiler/Maker/Any.zig`, which installs the versions.
+const any_versions_dir_name = "any";
+
+const any_exe_name = if (native_os == .windows) "zig.exe" else "zig";
+
+/// Every version the dispatch can run comes from a path under the global
+/// cache, and, with a project's `minimum_zig_version`, from a file in that
+/// project. Refuse anything else before a path is built from it: only a
+/// semantic version, which is what the installer accepts, can be a version.
+fn isValidVersionString(version: []const u8) bool {
+    if (version.len == 0) return false;
+    for (version) |c| switch (c) {
+        '0'...'9', 'a'...'z', 'A'...'Z', '.', '+', '-' => {},
+        else => return false,
+    };
+    _ = std.SemanticVersion.parse(version) catch return false;
+    return true;
+}
+
+fn isHelpArg(arg: []const u8) bool {
+    return mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help");
+}
+
+/// Runs the compiler version that the enclosing project's build.zig.zon pins,
+/// downloading it first if needed. Returns normally when there is nothing to
+/// dispatch to, in which case the caller continues with this compiler.
+fn dispatchToPinnedVersion(
+    gpa: Allocator,
+    arena: Allocator,
+    io: Io,
+    args: []const [:0]const u8,
+    environ_map: *process.Environ.Map,
+) !void {
+    if (EnvVar.ZIG_ANY.get(environ_map)) |value| {
+        if (mem.eql(u8, value, "off")) return;
+    }
+
+    // The version this project pins is the exact compiler to run.
+    const version = findPinnedVersion(arena, io) orelse return;
+    if (mem.eql(u8, version, build_options.version)) return;
+
+    // Loop guard: when this process is the installed compiler of `version`,
+    // it is that compiler already, whatever the version reports, and running
+    // it again would run the same process forever. The paths are compared,
+    // rather than an environment variable: descendants inherit the
+    // environment, and a `zig` that a build step runs is a different binary
+    // that must still dispatch to the pin.
+    if (try isInstalledCompiler(arena, io, environ_map, version)) return;
+
+    std.log.debug("running the pinned compiler version {s}", .{version});
+    return execVersion(gpa, arena, io, environ_map, version, args[1..], .dispatch);
+}
+
+/// The exact compiler version that the nearest build.zig.zon pins, searching
+/// from the current working directory up to the filesystem root. A manifest
+/// that is missing, unreadable, or malformed means "no pin": the command that
+/// is about to run reports such problems itself.
+fn findPinnedVersion(arena: Allocator, io: Io) ?[]const u8 {
+    const cwd = std.zig.getResolvedCwd(io, arena) catch return null;
+    var dir: []const u8 = cwd;
+    while (true) {
+        const zon_path = fs.path.join(arena, &.{ dir, std.zig.build_zig_zon_basename }) catch return null;
+        const contents = Io.Dir.cwd().readFileAllocOptions(
+            io,
+            zon_path,
+            arena,
+            .limited(1 << 20),
+            .@"1",
+            0,
+        ) catch |err| switch (err) {
+            error.FileNotFound => {
+                dir = fs.path.dirname(dir) orelse return null;
+                continue;
+            },
+            else => return null,
+        };
+        const manifest = std.zon.parse.fromSliceAlloc(PinnedVersionManifest, arena, contents, null, .{
+            .ignore_unknown_fields = true,
+        }) catch return null;
+        const version = manifest.minimum_zig_version orelse return null;
+        if (!isValidVersionString(version)) return null;
+        return version;
+    }
+}
+
+/// Just enough of a build.zig.zon to find `minimum_zig_version`. Unknown
+/// fields, dependencies included, are ignored: nothing is fetched or loaded.
+const PinnedVersionManifest = struct {
+    minimum_zig_version: ?[]const u8 = null,
+};
+
+/// `zig any <version> [command] [args...]`, `zig any list`, and `zig any`.
+fn cmdAny(
+    gpa: Allocator,
+    arena: Allocator,
+    io: Io,
+    cmd_args: []const [:0]const u8,
+    environ_map: *process.Environ.Map,
+) !void {
+    if (cmd_args.len == 0 or isHelpArg(cmd_args[0])) {
+        return Io.File.stdout().writeStreamingAll(io, usage_any);
+    }
+    if (mem.eql(u8, cmd_args[0], "list")) {
+        for (cmd_args[1..]) |arg| {
+            if (isHelpArg(arg)) return Io.File.stdout().writeStreamingAll(io, usage_any);
+            fatal("unexpected extra parameter: {q}", .{arg});
+        }
+        return listInstalledVersions(arena, io, environ_map);
+    }
+
+    const version = cmd_args[0];
+    if (!isValidVersionString(version)) fatal("invalid version {q}", .{version});
+    return execVersion(gpa, arena, io, environ_map, version, cmd_args[1..], .explicit);
+}
+
+/// Prints the installed versions, one per line: the directory names under
+/// `<global cache>/any/`.
+fn listInstalledVersions(arena: Allocator, io: Io, environ_map: *const process.Environ.Map) !void {
+    const global_cache_dir = try globalCacheDir(arena, environ_map);
+    const any_dir_path = try fs.path.join(arena, &.{ global_cache_dir, any_versions_dir_name });
+
+    var any_dir = Io.Dir.cwd().openDir(io, any_dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        // No version was ever installed.
+        error.FileNotFound => return,
+        else => |e| fatal("unable to open {s}: {t}", .{ any_dir_path, e }),
+    };
+    defer any_dir.close(io);
+
+    var versions: std.ArrayList([]const u8) = .empty;
+    var iterator = any_dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        if (mem.startsWith(u8, entry.name, ".")) continue;
+        try versions.append(arena, try arena.dupe(u8, entry.name));
+    }
+    std.mem.sort([]const u8, versions.items, {}, struct {
+        fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+            return mem.lessThan(u8, lhs, rhs);
+        }
+    }.lessThan);
+
+    var stdout_writer = Io.File.stdout().writer(io, &stdout_buffer);
+    for (versions.items) |version| try stdout_writer.interface.print("{s}\n", .{version});
+    return stdout_writer.interface.flush();
+}
+
+/// How a version came to be run.
+const Run = enum {
+    /// The enclosing project's build.zig.zon pins it: the compiler that runs
+    /// is another version of Zig, and is left to do what it does, nested
+    /// dispatch included.
+    dispatch,
+    /// The user named it, with `zig any <version>`: the compiler that runs is
+    /// told not to dispatch to the enclosing project's pin, because the
+    /// version on the command line is the version that was asked for.
+    explicit,
+};
+
+/// Runs the compiler of `version` with `child_args`, installing that version
+/// first if it is not there yet. The process becomes that compiler on POSIX; on
+/// Windows, which cannot exec, it waits for it and exits with its exit code.
+fn execVersion(
+    gpa: Allocator,
+    arena: Allocator,
+    io: Io,
+    environ_map: *process.Environ.Map,
+    version: []const u8,
+    child_args: []const [:0]const u8,
+    run: Run,
+) !void {
+    const exe_path = try anyExePath(arena, environ_map, version);
+    try ensureInstalled(gpa, arena, io, environ_map, version, exe_path);
+
+    const child_argv = try arena.alloc([]const u8, child_args.len + 1);
+    child_argv[0] = exe_path;
+    for (child_args, child_argv[1..]) |arg, *dest| dest.* = arg;
+
+    // The child is another version of Zig: its lib directory is not ours.
+    _ = environ_map.swapRemove(@tagName(EnvVar.ZIG_LIB_DIR));
+    switch (run) {
+        .dispatch => {},
+        .explicit => try environ_map.put(@tagName(EnvVar.ZIG_ANY), "off"),
+    }
+
+    if (process.can_replace) {
+        _ = try io.lockStderr(&.{}, .no_color);
+        const err = process.replace(io, .{ .argv = child_argv, .environ_map = environ_map });
+        const cmd = try mem.join(arena, " ", child_argv);
+        fatal("the following command failed to execve with {t}:\n{s}", .{ err, cmd });
+    }
+    if (!process.can_spawn) fatal("running another compiler version is not supported on {t}", .{native_os});
+
+    const term = t: {
+        _ = try io.lockStderr(&.{}, .no_color);
+        defer io.unlockStderr();
+
+        var child = std.process.spawn(io, .{
+            .argv = child_argv,
+            .environ_map = environ_map,
+            .stdin = .inherit,
+            .stdout = .inherit,
+            .stderr = .inherit,
+        }) catch |err| fatal("failed to spawn {s}: {t}", .{ exe_path, err });
+        defer child.kill(io);
+
+        break :t try child.wait(io);
+    };
+    // Without exec, report the child's exit code as our own.
+    process.exit(switch (term) {
+        .exited => |code| code,
+        else => 1,
+    });
+}
+
+/// Downloads and installs `version` into the global cache. The Maker holds the
+/// HTTP client, the proxies, and the archive code, so it does the installing;
+/// the capture forces `jitCmd` to spawn it and wait for it rather than replace
+/// this process, so that the version can still be run here.
+fn installVersion(
+    gpa: Allocator,
+    arena: Allocator,
+    io: Io,
+    environ_map: *process.Environ.Map,
+    version: []const u8,
+) !void {
+    var maker_stdout: []u8 = &.{};
+    return jitCmd(gpa, arena, io, &.{version}, environ_map, .{
+        .cmd_name = "maker",
+        .root_src_path = "Maker.zig",
+        .prepend_cmd = "any-install",
+        .prepend_zig_lib_dir_path = true,
+        .prepend_zig_exe_path = true,
+        .prepend_global_cache_path = true,
+        .prepend_seed = true,
+        .capture = &maker_stdout,
+        .release_mode = .safe,
+    });
+}
+
+/// Runs the compiler of `version`, installing it first when it is not there
+/// yet. A version directory that is there without its compiler in it -- a
+/// partial delete, or an antivirus that took zig.exe away -- is named as what
+/// to delete, because installing would only fail to move a version into the
+/// place the broken directory holds.
+fn ensureInstalled(
+    gpa: Allocator,
+    arena: Allocator,
+    io: Io,
+    environ_map: *process.Environ.Map,
+    version: []const u8,
+    exe_path: []const u8,
+) !void {
+    const dir_path = try anyVersionPath(arena, environ_map, version);
+    if (try pathExists(io, exe_path)) return;
+    if (try pathExists(io, dir_path)) fatal(
+        "{s} is not a complete install: it has no {s}; delete it and try again",
+        .{ dir_path, any_exe_name },
+    );
+
+    try installVersion(gpa, arena, io, environ_map, version);
+
+    // The install may have lost a race with another process, which is fine,
+    // or it may have found a version directory without its compiler in it,
+    // which is not: say what to delete rather than fail to run a file that is
+    // not there, once per invocation.
+    if (try pathExists(io, exe_path)) return;
+    if (try pathExists(io, dir_path)) fatal(
+        "{s} is not a complete install: it has no {s}; delete it and try again",
+        .{ dir_path, any_exe_name },
+    );
+    fatal("installing {s} did not put a compiler at {s}", .{ version, exe_path });
+}
+
+/// Whether `path` is there.
+fn pathExists(io: Io, path: []const u8) !bool {
+    if (Io.Dir.cwd().access(io, path, .{})) |_| return true else |err| switch (err) {
+        error.FileNotFound => return false,
+        else => |e| fatal("unable to access {s}: {t}", .{ path, e }),
+    }
+}
+
+/// Whether this process's own executable is the installed compiler of
+/// `version`: `<global cache>/any/<version>/zig[.exe]`. It is, when this
+/// process is that install itself, which is what keeps a dispatched compiler
+/// from dispatching to itself forever. The global cache can be reached through
+/// a symlink, so the paths are compared as the file system resolves them.
+fn isInstalledCompiler(
+    arena: Allocator,
+    io: Io,
+    environ_map: *const process.Environ.Map,
+    version: []const u8,
+) !bool {
+    const self_exe_path = process.executablePathAlloc(io, arena) catch return false;
+    const exe_path = anyExePath(arena, environ_map, version) catch return false;
+    return std.zig.isSameFile(io, arena, self_exe_path, exe_path);
+}
+
+/// `<global cache>/any/<version>`, the directory an installed version lives
+/// in.
+fn anyVersionPath(arena: Allocator, environ_map: *const process.Environ.Map, version: []const u8) ![]const u8 {
+    const global_cache_dir = try globalCacheDir(arena, environ_map);
+    return fs.path.join(arena, &.{ global_cache_dir, any_versions_dir_name, version });
+}
+
+/// `<global cache>/any/<version>/zig[.exe]`, the executable of a version.
+fn anyExePath(arena: Allocator, environ_map: *const process.Environ.Map, version: []const u8) ![]const u8 {
+    return fs.path.join(arena, &.{ try anyVersionPath(arena, environ_map, version), any_exe_name });
+}
+
+/// The global cache directory, honoring ZIG_GLOBAL_CACHE_DIR, as the commands
+/// that use the cache resolve it.
+fn globalCacheDir(arena: Allocator, environ_map: *const process.Environ.Map) ![]const u8 {
+    return std.zig.resolveGlobalCacheDir(arena, environ_map) catch |err|
+        fatal("unable to resolve the global cache directory: {t}", .{err});
+}
+
+const usage_any =
+    \\Usage: zig any <version> [command] [args...]
+    \\       zig any list
+    \\
+    \\    Run an exact compiler version, downloading it into the global cache
+    \\    first if it is not installed yet. <version> names the exact compiler:
+    \\
+    \\      zig any 0.15.1 version                     upstream Zig release
+    \\      zig any 0.14.1 build                       upstream Zig release
+    \\      zig any 0.16.0-dev.1234+abcdef012 version  upstream Zig dev build
+    \\      zig any 0.17.0-dev.2361+zigpp.5b96e6d21    Zig++ release
+    \\
+    \\    `zig any list` prints the installed versions, one per line.
+    \\    Without a command, `zig any <version>` runs that compiler with the
+    \\    arguments that follow the version.
+    \\
+    \\    An upstream Zig archive is verified against the minisign signature
+    \\    that ziglang.org publishes next to it, with the Zig Software
+    \\    Foundation's key, and is looked for on the community mirrors when
+    \\    ziglang.org no longer has it.
+    \\
+    \\Version dispatch:
+    \\
+    \\    When the enclosing project's build.zig.zon pins `minimum_zig_version`,
+    \\    any `zig` command runs that exact version instead of the `zig` that was
+    \\    invoked, downloading it first if needed. Set ZIG_ANY=off to disable
+    \\    this and always run the `zig` on PATH.
+    \\
+    \\    The version that `zig any <version>` names is the version that runs:
+    \\    the compiler it starts is told with ZIG_ANY=off not to dispatch to the
+    \\    enclosing project's pin, which would run a different version than the
+    \\    one on the command line.
+    \\
+    \\Options:
+    \\  -h, --help             Print this help and exit
+    \\
+    \\
+;
 
 const compile_usage =
     \\Usage: zig build-exe   [options] [files]
