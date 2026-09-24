@@ -92,6 +92,21 @@ jobs:
           ppup list | grep -q "\* $version (default)" ||
             { echo "ppup list does not mark the default" >&2; exit 1; }
 
+          # The installed ppup keeps to its own home when PPUP_HOME is unset,
+          # rather than the default one in HOME, and it leaves shell profiles
+          # alone even with its bin directory off PATH: those are the
+          # installer's.
+          elsewhere="$RUNNER_TEMP/elsewhere"
+          mkdir -p "$elsewhere"
+          env -u PPUP_HOME HOME="$elsewhere" PATH=/usr/bin:/bin "$PPUP_HOME/bin/ppup" update
+          env -u PPUP_HOME HOME="$elsewhere" "$PPUP_HOME/bin/ppup" list | grep -q "\* $version (default)" ||
+            { echo "ppup without PPUP_HOME did not keep to its own home" >&2; exit 1; }
+          if [ -n "$(ls -A "$elsewhere")" ]; then
+            echo "ppup without PPUP_HOME wrote to $elsewhere:" >&2
+            ls -A "$elsewhere" >&2
+            exit 1
+          fi
+
           # The newest release is the default: nothing to update.
           ppup update | tee update.txt
           grep -q "newest release" update.txt ||
@@ -180,6 +195,28 @@ jobs:
           if (((& $ppup list | Out-String) -notmatch [regex]::Escape("* $version (default)"))) {
             throw 'ppup list does not mark the default'
           }
+
+          # The installed ppup keeps to its own home when PPUP_HOME is unset,
+          # rather than the default one in LOCALAPPDATA, and it leaves the user
+          # PATH alone: that is the installer's.
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          $elsewhere = Join-Path $env:RUNNER_TEMP 'elsewhere'
+          $savedHome = $env:PPUP_HOME
+          $savedLocalAppData = $env:LOCALAPPDATA
+          try {
+            $env:PPUP_HOME = $null
+            $env:PPUP_NO_MODIFY_PATH = $null
+            $env:LOCALAPPDATA = $elsewhere
+            & $ppup update
+            $list = & $ppup list | Out-String
+          } finally {
+            $env:PPUP_HOME = $savedHome
+            $env:PPUP_NO_MODIFY_PATH = '1'
+            $env:LOCALAPPDATA = $savedLocalAppData
+          }
+          if ($list -notmatch [regex]::Escape("* $version (default)")) { throw 'ppup without PPUP_HOME did not keep to its own home' }
+          if (Test-Path -LiteralPath $elsewhere) { throw "ppup without PPUP_HOME wrote to $elsewhere" }
+          if ([Environment]::GetEnvironmentVariable('Path', 'User') -ne $userPath) { throw 'the installed ppup changed the user PATH' }
 
           # The newest release is the default: update touches nothing. (ppup's
           # status messages go to the host, so this compares the toolchain
