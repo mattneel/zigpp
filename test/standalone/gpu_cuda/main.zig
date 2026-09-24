@@ -10,7 +10,12 @@
 const std = @import("std");
 const cuda = std.gpu.cuda;
 
-pub fn main(_: std.process.Init) !void {
+/// With the argument "assert", the program instead checks that a panic in a kernel stops the
+/// launch with its message, which leaves the context unusable, so it runs in a process of its own.
+pub fn main(init: std.process.Init) !void {
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const assert_mode = args.len > 1 and std.mem.eql(u8, args[1], "assert");
+
     var device_name_buffer: [256]u8 = undefined;
     var driver = cuda.Driver.open() catch |err| switch (err) {
         error.DriverNotFound, error.NoDevice => return skip(@errorName(err)),
@@ -46,14 +51,13 @@ pub fn main(_: std.process.Init) !void {
         else => return fail("set the device heap size", err),
     };
 
+    if (assert_mode) return testPanicAssert(context);
+
     std.debug.print("gpu_cuda: {s}, CUDA {d}.{d}, compute capability {d}.{d}\n", .{
         name, version.major, version.minor, capability.major, capability.minor,
     });
 
-    const images = [_]Image{
-        .{ .name = "debug", .ptx = @embedFile("kernels_debug.ptx") },
-        .{ .name = "fast", .ptx = @embedFile("kernels_fast.ptx") },
-    };
+    const images = [_]Image{ debug_image, fast_image };
 
     var failed = false;
     for (images) |image| {
@@ -99,6 +103,42 @@ const Image = struct {
     name: []const u8,
     ptx: [:0]const u8,
 };
+
+const debug_image: Image = .{ .name = "debug", .ptx = @embedFile("kernels_debug.ptx") };
+const fast_image: Image = .{ .name = "fast", .ptx = @embedFile("kernels_fast.ptx") };
+
+/// Launches `outOfBoundsKernel` from the debug image, whose threads past the end of the slice
+/// fail its bounds check, and checks that the launch fails with `error.Assert` and that the driver
+/// reported the panic message of the first failing thread.
+fn testPanicAssert(context: cuda.Context) void {
+    var error_log: [16 * 1024]u8 = @splat(0);
+    const module = context.loadModule(debug_image.ptx, .{ .error_log = &error_log }) catch |err| {
+        std.debug.print("gpu_cuda: cannot load the debug module: {s}\n{s}\n", .{ @errorName(err), std.mem.sliceTo(&error_log, 0) });
+        std.process.exit(1);
+    };
+    defer module.unload();
+    const kernel = module.function("outOfBoundsKernel") catch |err| return fail("find outOfBoundsKernel", err);
+    const buffer = context.alloc(u32, 64) catch |err| return fail("allocate for outOfBoundsKernel", err);
+    defer buffer.free();
+
+    var capture = OutputCapture.begin(2) catch |err| return fail("capture the standard error of outOfBoundsKernel", err);
+    defer capture.deinit();
+    kernel.launch(.linear(64, 64), .{ buffer, @as(u32, 40) }) catch |err| return fail("launch outOfBoundsKernel", err);
+    const result = context.synchronize();
+    const reported = capture.end();
+
+    const expected_message = "Assertion `index out of bounds: index 40, len 40` failed.";
+    const asserted = if (result) |_| false else |err| err == error.Assert;
+    if (!asserted or std.mem.indexOf(u8, reported, expected_message) == null or
+        std.mem.indexOf(u8, reported, "thread: [40,0,0]") == null)
+    {
+        std.debug.print("gpu_cuda: outOfBoundsKernel: expected error.Assert and the message\n  {s}\ngot {any} and:\n{s}\n", .{
+            expected_message, result, reported,
+        });
+        std.process.exit(1);
+    }
+    std.debug.print("gpu_cuda: a panic in the debug image stops the launch with its message\n", .{});
+}
 
 /// A test of one example, or of one group of kernels: it launches the kernels and checks the
 /// results.
@@ -172,35 +212,20 @@ const Runner = struct {
             r.checks += 1;
             return;
         }
-        r.reportMismatch(index, "{any}", .{expected}, "{any}", .{actual});
-    }
-
-    /// Checks a result that a transcendental function gave, which may differ from the value here
-    /// by a few units in the last place: the device uses the implementations of compiler-rt and
-    /// the host the ones of libm.
-    fn expectApprox(r: *Runner, index: usize, expected: anytype, actual: @TypeOf(expected)) void {
-        if (r.skipChecks()) return;
-        if (approxEqual(@TypeOf(expected), expected, actual)) {
-            r.checks += 1;
-            return;
+        if (comptime @typeInfo(@TypeOf(expected)) == .float) {
+            const Bits = @Int(.unsigned, @bitSizeOf(@TypeOf(expected)));
+            r.reportMismatch(index, "{d} (0x{x})", .{ expected, @as(Bits, @bitCast(expected)) }, "{d} (0x{x})", .{
+                actual, @as(Bits, @bitCast(actual)),
+            });
+        } else {
+            r.reportMismatch(index, "{any}", .{expected}, "{any}", .{actual});
         }
-        r.reportMismatch(index, "{d} ({x})", .{ expected, @as(@Int(.unsigned, @bitSizeOf(@TypeOf(expected))), @bitCast(expected)) }, "{d} ({x})", .{
-            actual, @as(@Int(.unsigned, @bitSizeOf(@TypeOf(actual))), @bitCast(actual)),
-        });
     }
 
     /// Checks every element of `actual` against `expected`.
     fn expectSlice(r: *Runner, expected: anytype, actual: anytype) void {
         for (expected, actual, 0..) |expected_value, actual_value, index| {
             r.expect(index, expected_value, actual_value);
-        }
-    }
-
-    /// Checks every element of `actual` against `expected`, with the tolerance of
-    /// `expectApprox`.
-    fn expectSliceApprox(r: *Runner, expected: anytype, actual: anytype) void {
-        for (expected, actual, 0..) |expected_value, actual_value, index| {
-            r.expectApprox(index, expected_value, actual_value);
         }
     }
 
@@ -245,32 +270,24 @@ fn block2D(tile: u32) cuda.Dim3 {
 
 fn equalValues(comptime T: type, expected: T, actual: T) bool {
     if (comptime @typeInfo(T) == .float) {
-        // Two NaNs are the same result for a test of math functions: both the device and the host
-        // call their math library, and the sign of a NaN is not part of the result.
+        // Processors produce different NaN bit patterns for the same operation, so any NaN matches
+        // any NaN; every other value must match bit for bit, including the sign of zero.
         if (std.math.isNan(expected)) return std.math.isNan(actual);
-        return expected == actual;
+        const Bits = @Int(.unsigned, @bitSizeOf(T));
+        return @as(Bits, @bitCast(expected)) == @as(Bits, @bitCast(actual));
     }
     return expected == actual;
 }
 
-/// Units in the last place by which a transcendental result may differ from the value computed
-/// here.
-const ulp_tolerance = 32;
-
-fn approxEqual(comptime T: type, expected: T, actual: T) bool {
-    if (std.math.isNan(expected) or std.math.isNan(actual)) return std.math.isNan(expected) == std.math.isNan(actual);
-    if (std.math.isInf(expected) or std.math.isInf(actual)) return expected == actual;
-    const scale = @max(@abs(expected), 1);
-    return @abs(actual - expected) <= ulp_tolerance * std.math.floatEpsAt(T, scale);
-}
-
-// The output of the device through `std.gpu.print` is written to the standard output of this
-// process, so a check of the text of a kernel reads it from a temporary file that the standard
-// output is redirected into while that kernel runs.
+// The driver writes the output of `std.gpu.print` to the standard output of this process, and
+// the message of a failed device assertion to its standard error, so a check of that text reads
+// it from a temporary file that the stream is redirected into while the kernel runs.
 
 extern "c" fn fflush(stream: ?*anyopaque) c_int;
 
-const StdoutCapture = struct {
+const OutputCapture = struct {
+    /// The file descriptor that is redirected: 1 for the standard output, 2 for standard error.
+    fd: c_int,
     path: [64:0]u8 = undefined,
     path_len: usize = 0,
     file: c_int = -1,
@@ -278,27 +295,26 @@ const StdoutCapture = struct {
     active: bool = false,
     buffer: [64 * 1024]u8 = undefined,
 
-    /// Redirects the standard output of the process into a temporary file.
-    fn begin() !StdoutCapture {
-        var capture: StdoutCapture = .{};
-        const path = try std.mem.printSentinel(capture.path[0..capture.path.len], "/tmp/zig-gpu-cuda-{d}.txt", .{std.c.getpid()}, 0);
+    /// Redirects the stream `fd` of the process into a temporary file.
+    fn begin(fd: c_int) !OutputCapture {
+        var capture: OutputCapture = .{ .fd = fd };
+        const path = try std.mem.printSentinel(capture.path[0..capture.path.len], "/tmp/zig-gpu-cuda-{d}-{d}.txt", .{ std.c.getpid(), fd }, 0);
         capture.path_len = path.len;
         const path_pointer: [*:0]const u8 = @ptrCast(&capture.path);
         capture.file = std.c.open(path_pointer, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o600));
         if (capture.file < 0) return error.OpenFailed;
-        capture.saved = std.c.dup(1);
-        if (capture.saved < 0 or std.c.dup2(capture.file, 1) < 0) return error.RedirectFailed;
+        capture.saved = std.c.dup(fd);
+        if (capture.saved < 0 or std.c.dup2(capture.file, fd) < 0) return error.RedirectFailed;
         capture.active = true;
         return capture;
     }
 
-    /// Restores the standard output and returns the text that the device wrote to it. The host
-    /// must have synchronized with the device first, because that is when the driver writes the
-    /// buffered output of the kernels.
-    fn end(capture: *StdoutCapture) []const u8 {
-        // The driver writes the output with the C standard output stream, which buffers it.
+    /// Restores the stream and returns the text that the driver wrote to it. The host must have
+    /// synchronized with the device first, because that is when the driver writes the text.
+    fn end(capture: *OutputCapture) []const u8 {
+        // The driver writes the output with the C standard streams, which buffer it.
         _ = fflush(null);
-        if (std.c.dup2(capture.saved, 1) < 0) return "";
+        if (std.c.dup2(capture.saved, capture.fd) < 0) return "";
         capture.active = false;
         if (std.c.lseek(capture.file, 0, std.c.SEEK.SET) < 0) return "";
         var total: usize = 0;
@@ -310,10 +326,10 @@ const StdoutCapture = struct {
         return capture.buffer[0..total];
     }
 
-    fn deinit(capture: *StdoutCapture) void {
+    fn deinit(capture: *OutputCapture) void {
         if (capture.active) {
             _ = fflush(null);
-            _ = std.c.dup2(capture.saved, 1);
+            _ = std.c.dup2(capture.saved, capture.fd);
             capture.active = false;
         }
         if (capture.saved >= 0) _ = std.c.close(capture.saved);
@@ -956,7 +972,7 @@ fn testBase64(r: *Runner) void {
     const round_trip_buffer = r.context.alloc(u32, 1) catch |err| return r.reportError("base64RoundTripKernel", "allocate for", err);
     defer round_trip_buffer.free();
 
-    var capture = StdoutCapture.begin() catch |err| return r.reportError("base64RoundTripKernel", "capture the output of", err);
+    var capture = OutputCapture.begin(1) catch |err| return r.reportError("base64RoundTripKernel", "capture the output of", err);
     defer capture.deinit();
     r.runLinear("base64RoundTripKernel", 1, 1, .{ round_buffer, @as(u32, round_n), round_trip_buffer });
     const printed = capture.end();
@@ -1229,7 +1245,7 @@ fn testDynamic(r: *Runner) void {
 
 fn testPrintf(r: *Runner) void {
     // One thread, so that the order of the lines is the order of the calls of that thread.
-    var capture = StdoutCapture.begin() catch |err| return r.reportError("printfKernel", "capture the output of", err);
+    var capture = OutputCapture.begin(1) catch |err| return r.reportError("printfKernel", "capture the output of", err);
     defer capture.deinit();
     r.runLinear("printfKernel", 1, 1, .{});
     const printed = capture.end();
@@ -1243,7 +1259,7 @@ fn testPrintf(r: *Runner) void {
     // `std.gpu.print` makes possible.
     r.expectContains(printed, "100%");
 
-    var capture_math = StdoutCapture.begin() catch |err| return r.reportError("mathPrintfKernel", "capture the output of", err);
+    var capture_math = OutputCapture.begin(1) catch |err| return r.reportError("mathPrintfKernel", "capture the output of", err);
     defer capture_math.deinit();
     r.runLinear("mathPrintfKernel", 1, 1, .{@as(f32, 1.5)});
     const printed_math = capture_math.end();
@@ -1274,7 +1290,7 @@ fn testPrintf(r: *Runner) void {
         r.expect(0, value * value + 2 * value + 1, result);
     }
 
-    var capture_debug = StdoutCapture.begin() catch |err| return r.reportError("debugComputeKernel", "capture the output of", err);
+    var capture_debug = OutputCapture.begin(1) catch |err| return r.reportError("debugComputeKernel", "capture the output of", err);
     defer capture_debug.deinit();
     r.runLinear("debugComputeKernel", 1, 1, .{ input_buffer, output_buffer, @as(u32, 1) });
     const printed_debug = capture_debug.end();
@@ -1295,34 +1311,51 @@ fn testHello(r: *Runner) void {
     r.expect(0, @as(u32, 42), out[0]);
 }
 
+/// The device and this process both compute the builtin math functions with the same
+/// compiler-rt code, so their results must be identical, bit for bit. The inputs cover typical
+/// arguments, large arguments, random bit patterns across every exponent, arguments right next
+/// to multiples of pi/2, and the range where `@exp` is finite. A different math library on
+/// either side, or a float operation that the PTX assembler contracts into a fused multiply-add,
+/// changes some of these results.
 fn testBuiltinMath(r: *Runner) void {
-    const values_f32 = [_]f32{ 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 8, 10, 0.1, -1.25 };
-    const n = values_f32.len;
+    testBuiltinMathSweep(f32, r, "builtinMathF32Kernel");
+    testBuiltinMathSweep(f64, r, "builtinMathF64Kernel");
+}
 
-    const input32_buffer = r.upload(f32, &values_f32) catch |err| return r.reportError("builtinMathF32Kernel", "upload to", err);
-    defer input32_buffer.free();
-    const output32_buffer = r.context.alloc(f32, n * 8) catch |err| return r.reportError("builtinMathF32Kernel", "allocate for", err);
-    defer output32_buffer.free();
-    r.runLinear("builtinMathF32Kernel", n, 32, .{ input32_buffer, output32_buffer, @as(u32, n) });
-    var results32: [n * 8]f32 = undefined;
-    output32_buffer.copyToHost(&results32) catch |err| return r.reportError("builtinMathF32Kernel", "copy the results of", err);
-    for (values_f32, 0..) |x, index| {
-        const expected = mathResults(f32, x);
-        r.expectSliceApprox(&expected, results32[index * 8 ..][0..8]);
+fn testBuiltinMathSweep(comptime T: type, r: *Runner, comptime kernel: [:0]const u8) void {
+    const class_len = 1 << 17;
+    const n = 5 * class_len;
+    const gpa = std.heap.page_allocator;
+    const inputs = gpa.alloc(T, n) catch |err| return r.reportError(kernel, "allocate the inputs of", err);
+    defer gpa.free(inputs);
+    const results = gpa.alloc(T, n * 8) catch |err| return r.reportError(kernel, "allocate the results of", err);
+    defer gpa.free(results);
+
+    var prng: std.Random.DefaultPrng = .init(0x5eed);
+    const random = prng.random();
+    for (inputs, 0..) |*x, i| {
+        const u = random.float(T);
+        x.* = switch (i / class_len) {
+            0 => (2 * u - 1) * 2 * std.math.pi,
+            1 => (2 * u - 1) * 1e6,
+            2 => while (true) {
+                const bits: T = @bitCast(random.int(@Int(.unsigned, @bitSizeOf(T))));
+                if (std.math.isFinite(bits)) break bits;
+            },
+            3 => @as(T, @floatFromInt(random.intRangeAtMost(i32, -100_000, 100_000))) * (std.math.pi / 2.0) + (u - 0.5) * 1e-6,
+            else => (2 * u - 1) * 750,
+        };
     }
 
-    var values_f64: [n]f64 = undefined;
-    for (&values_f64, values_f32) |*value, x| value.* = x;
-    const input64_buffer = r.upload(f64, &values_f64) catch |err| return r.reportError("builtinMathF64Kernel", "upload to", err);
-    defer input64_buffer.free();
-    const output64_buffer = r.context.alloc(f64, n * 8) catch |err| return r.reportError("builtinMathF64Kernel", "allocate for", err);
-    defer output64_buffer.free();
-    r.runLinear("builtinMathF64Kernel", n, 32, .{ input64_buffer, output64_buffer, @as(u32, n) });
-    var results64: [n * 8]f64 = undefined;
-    output64_buffer.copyToHost(&results64) catch |err| return r.reportError("builtinMathF64Kernel", "copy the results of", err);
-    for (values_f64, 0..) |x, index| {
-        const expected = mathResults(f64, x);
-        r.expectSliceApprox(&expected, results64[index * 8 ..][0..8]);
+    const input_buffer = r.upload(T, inputs) catch |err| return r.reportError(kernel, "upload to", err);
+    defer input_buffer.free();
+    const output_buffer = r.context.alloc(T, n * 8) catch |err| return r.reportError(kernel, "allocate for", err);
+    defer output_buffer.free();
+    r.runLinear(kernel, n, 256, .{ input_buffer, output_buffer, @as(u32, n) });
+    output_buffer.copyToHost(results) catch |err| return r.reportError(kernel, "copy the results of", err);
+    for (inputs, 0..) |x, index| {
+        const expected = mathResults(T, x);
+        r.expectSlice(&expected, results[index * 8 ..][0..8]);
     }
 }
 
