@@ -132,7 +132,11 @@ pub fn classifyWindows(init_ty: Type, zcu: *Zcu, target: *const std.Target, ctx:
             else => unreachable,
             16, 32, 64 => if (target.cpu.has(.x86, .soft_float)) .integer else .sse,
             80 => .memory,
-            128 => if (target.cpu.has(.x86, .soft_float)) .memory else .win_i128,
+            // An `f128` argument is passed by reference, but since LLVM 23 an `f128` result is
+            // returned through a pointer that the caller passes as the first argument, like
+            // MinGW GCC does, and not in XMM0 like an `i128` result. LLVM's own calls to
+            // compiler-rt, such as `__addtf3`, return it that way too.
+            128 => if (target.cpu.has(.x86, .soft_float) or ctx == .ret) .memory else .win_i128,
         },
         .vector => {
             const len = ty.vectorLen(zcu);
