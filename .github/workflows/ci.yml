@@ -1,9 +1,34 @@
 name: CI
 
+# Changes that cannot affect the compiler or its tests do not run CI: the
+# documentation, which the Site and Release workflows build, ppup, and the
+# machinery of the other workflows.
 on:
   pull_request:
+    paths-ignore:
+      - "*.md"
+      - "doc/**"
+      - "ppup/**"
+      - ".github/scripts/downloads.py"
+      - ".github/scripts/index.py"
+      - ".github/scripts/package.sh"
+      - ".github/scripts/smoke.sh"
+      - ".github/workflows/ppup.yml"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/site.yml"
   push:
     branches: [master]
+    paths-ignore:
+      - "*.md"
+      - "doc/**"
+      - "ppup/**"
+      - ".github/scripts/downloads.py"
+      - ".github/scripts/index.py"
+      - ".github/scripts/package.sh"
+      - ".github/scripts/smoke.sh"
+      - ".github/workflows/ppup.yml"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/site.yml"
   workflow_dispatch:
 
 permissions:
@@ -18,59 +43,14 @@ concurrency:
 jobs:
   x86_64-linux:
     name: x86_64 Linux
-    runs-on: ubuntu-24.04
-    timeout-minutes: 300
-    env:
-      # The bootstrap compiler is built without lib/; it uses the checkout's.
-      ZIG_LIB_DIR: ${{ github.workspace }}/lib
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          # The version comes from `git describe`, which needs the history and
-          # the tags.
-          fetch-depth: 0
+    uses: ./.github/workflows/ci-host.yml
+    with:
+      runner: ubuntu-24.04
+      target: x86_64-linux-musl
 
-      - name: Install CMake and Ninja
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
-
-      # The devkit is large, and it only changes when devkit.sh moves to a new
-      # one.
-      - name: Restore the LLVM devkit
-        uses: actions/cache@v6
-        with:
-          path: ~/deps
-          key: devkit-x86_64-linux-musl-${{ hashFiles('.github/scripts/devkit.sh') }}
-
-      - name: Build Zig++ from source
-        run: .github/scripts/bootstrap.sh
-
-      - name: Check formatting
-        run: build-bootstrap/stage3/bin/zig build test-fmt
-
-      - name: Test the standard library
-        run: build-bootstrap/stage3/bin/zig test lib/std/std.zig -lc
-
-      - name: Run the behavior tests
-        run: build-bootstrap/stage3/bin/zig test test/behavior.zig
-
-      # Debug builds for x86_64 Linux use the self-hosted back end unless -fllvm
-      # asks for LLVM, which release builds and most other targets use.
-      - name: Test the standard library with LLVM
-        run: build-bootstrap/stage3/bin/zig test lib/std/std.zig -lc -fllvm
-
-      - name: Run the behavior tests with LLVM
-        run: build-bootstrap/stage3/bin/zig test test/behavior.zig -fllvm
-
-      # Zig++ against C that the Clang in Zig++ compiled.
-      - name: Run the C ABI tests
-        run: build-bootstrap/stage3/bin/zig build test-c-abi -Dskip-non-native -Dskip-release
-
-      # -Denable-llvm adds the cases that compile with the LLVM backend, which
-      # the bootstrap compiler has.
-      - name: Run the compiler test cases
-        run: build-bootstrap/stage3/bin/zig build test-cases -Dskip-non-native -Denable-llvm
-
-      # Includes the std.gpu suite: its kernels compile for NVIDIA and AMD
-      # GPUs, and it skips itself on a runner without a GPU driver.
-      - name: Run the standalone tests
-        run: build-bootstrap/stage3/bin/zig build test-standalone -Dskip-non-native -Dskip-release
+  aarch64-macos:
+    name: aarch64 macOS
+    uses: ./.github/workflows/ci-host.yml
+    with:
+      runner: macos-latest
+      target: aarch64-macos-none

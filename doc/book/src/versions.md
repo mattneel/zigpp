@@ -35,10 +35,11 @@ publishes a release on **every push to master**, for four targets:
 | --- | --- |
 | x86_64-linux | ubuntu-24.04 |
 | aarch64-linux | ubuntu-24.04-arm |
-| aarch64-macos | macos-15 |
+| aarch64-macos | macos-latest |
 | x86_64-windows | windows-2025 |
 
-The jobs are: build a bootstrap compiler from source, pack an archive for each
+The jobs are: build a bootstrap compiler (with the newest release, or from
+source alone when the release cannot build it), pack an archive for each
 target, unpack and smoke-test each archive on a runner of that architecture,
 and publish. The smoke test runs `zig version` and `zig env`, compiles and runs
 a program that uses private fields, checks that naming a private field from

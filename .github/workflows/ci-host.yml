@@ -1,0 +1,110 @@
+name: CI host
+
+# CI on one kind of runner, called by ci.yml: a job builds the compiler, and
+# the test suites each run on a runner of their own with it, all at once.
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: GitHub-hosted runner, such as ubuntu-24.04
+        required: true
+        type: string
+      target:
+        description: Target of the runner's LLVM devkit, such as x86_64-linux-musl
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The version comes from `git describe`, which needs the history and
+          # the tags, and bootstrap.sh looks for the commit of the newest
+          # release.
+          fetch-depth: 0
+
+      # For the bootstrap from source, which bootstrap.sh falls back to.
+      - name: Install CMake and Ninja
+        run: |
+          if [ "$(uname -s)" = Darwin ]; then
+            brew install ninja
+          else
+            sudo apt-get update && sudo apt-get install -y cmake ninja-build
+          fi
+
+      # The devkit is large, and it only changes when devkit.sh moves to a new
+      # one.
+      - name: Restore the LLVM devkit
+        uses: actions/cache@v6
+        with:
+          path: ~/deps
+          key: devkit-${{ inputs.target }}-${{ hashFiles('.github/scripts/devkit.sh') }}
+
+      - name: Build Zig++
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/bootstrap.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: zig-${{ inputs.target }}
+          path: build-bootstrap/stage3/bin/zig
+          if-no-files-found: error
+          retention-days: 1
+
+  test:
+    name: ${{ matrix.name }}
+    needs: build
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Debug builds for x86_64 Linux use the self-hosted back end unless
+          # -fllvm asks for LLVM, which release builds and most other targets
+          # use.
+          - name: Standard library and behavior
+            command: |
+              zig build test-fmt
+              zig test lib/std/std.zig -lc
+              zig test test/behavior.zig
+              zig test lib/std/std.zig -lc -fllvm
+              zig test test/behavior.zig -fllvm
+          # Zig++ against C that the Clang in Zig++ compiled.
+          - name: C ABI
+            command: zig build test-c-abi -Dskip-non-native -Dskip-release
+          # -Denable-llvm adds the cases that compile with the LLVM back end,
+          # which this compiler has.
+          - name: Compiler test cases
+            command: zig build test-cases -Dskip-non-native -Denable-llvm
+          # Includes the std.gpu suite: its kernels compile for NVIDIA and AMD
+          # GPUs, and it skips itself on a runner without a GPU driver.
+          - name: Standalone
+            command: zig build test-standalone -Dskip-non-native -Dskip-release
+    env:
+      # The compiler is built without lib/; it uses the checkout's.
+      ZIG_LIB_DIR: ${{ github.workspace }}/lib
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: zig-${{ inputs.target }}
+          path: build-bootstrap/stage3/bin
+
+      # Artifacts do not keep the executable bit.
+      - name: Install the compiler
+        run: |
+          chmod +x build-bootstrap/stage3/bin/zig
+          echo "$PWD/build-bootstrap/stage3/bin" >> "$GITHUB_PATH"
+
+      - name: Test
+        run: ${{ matrix.command }}

@@ -693,6 +693,11 @@ pub noinline fn captureCurrentStackTrace(options: StackUnwindOptions, addr_buf: 
     if (!it.stratOk(options.allow_unsafe_unwind)) return empty_trace;
 
     const io = std.Options.debug_io;
+    // Unwinding can read debug information through `io`, where a cancelation request of the
+    // calling task would end a read with `error.Canceled`, which this function cannot report: the
+    // request would be used up and lost. `DebugAllocator` captures a trace on every allocation.
+    const prev = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(prev);
 
     var total_frames: usize = 0;
     var index: usize = 0;
@@ -758,6 +763,9 @@ pub noinline fn writeCurrentStackTrace(options: StackUnwindOptions, t: Io.Termin
     var wait_for = options.first_address;
     var printed_any_frame = false;
     const io = std.Options.debug_io;
+    // As in `captureCurrentStackTrace`: keep a cancelation request of the caller pending.
+    const prev = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(prev);
     while (true) switch (it.next(io)) {
         .switch_to_fp => |unwind_error| {
             switch (StackIterator.fp_usability) {
@@ -889,6 +897,9 @@ fn writeTrace(
         },
     };
     const io = std.Options.debug_io;
+    // As in `captureCurrentStackTrace`: keep a cancelation request of the caller pending.
+    const prev = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(prev);
     for (addresses) |addr| {
         // `addr` is the return address, which is *after* the function call.
         // Subtract 1 to get an address *in* the function call for a better source location.

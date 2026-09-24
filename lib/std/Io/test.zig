@@ -575,10 +575,14 @@ test "cancel sleep" {
 test "tasks spawned in group after Group.cancel are canceled" {
     const global = struct {
         fn waitThenSpawn(io: Io, group: *Io.Group) void {
-            _ = io.swapCancelProtection(.blocked);
+            const protection = io.swapCancelProtection(.blocked);
             group.concurrent(io, blockUntilCanceled, .{io}) catch {};
             io.sleep(.fromMilliseconds(10), .awake) catch unreachable;
             group.concurrent(io, blockUntilCanceled, .{io}) catch {};
+            // With every unit of concurrency busy, which happens on machines
+            // with three CPUs or fewer, `async` calls the function right here,
+            // where blocked cancelation would never reach it.
+            _ = io.swapCancelProtection(protection);
             group.async(io, blockUntilCanceled, .{io});
         }
         fn blockUntilCanceled(io: Io) Io.Cancelable!void {
