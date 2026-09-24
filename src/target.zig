@@ -460,6 +460,13 @@ pub fn canBuildLibCompilerRt(target: *const std.Target) enum { no, yes, llvm_onl
     };
 }
 
+/// Whether objects for this target must contain the compiler-rt routines that they call.
+/// NVPTX modules are loaded by the CUDA driver as they are, so no link step can supply
+/// compiler-rt; each module instead compiles in the routines it references.
+pub fn bundlesCompilerRt(target: *const std.Target) bool {
+    return target.cpu.arch.isNvptx();
+}
+
 pub fn canBuildLibUbsanRt(target: *const std.Target) enum { no, yes, llvm_only, llvm_lld_only } {
     switch (target.cpu.arch) {
         .spork8 => return .no,

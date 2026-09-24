@@ -4053,7 +4053,7 @@ fn buildFloatOp(
         .sqrt,
         .tan,
         .trunc,
-        => if (intrinsicsAllowed(.libc, scalar_ty, target)) return fg.wip.callIntrinsic(fast, .none, switch (op) {
+        => if (intrinsicsAllowed(.libc, scalar_ty, target) and !nvptxLacksInstruction(op, target)) return fg.wip.callIntrinsic(fast, .none, switch (op) {
             .fma => .fma,
             .fmax => .maxnum,
             .fmin => .minnum,
@@ -8058,6 +8058,17 @@ fn intrinsicsAllowed(kind: enum { compiler_rt, libc }, scalar_ty: Type, target: 
     return switch (std.zig.target.compilerRtFloatAbi(target, bits)) {
         .hard => true,
         .soft => false,
+    };
+}
+
+/// NVPTX has no instructions for these operations, only approximations that LLVM uses for
+/// some of them when fast-math allows it, and LLVM cannot emit library calls for NVPTX.
+/// Call the compiler-rt routines that are bundled into every NVPTX module instead.
+fn nvptxLacksInstruction(comptime op: FloatOp, target: *const std.Target) bool {
+    if (!target.cpu.arch.isNvptx()) return false;
+    return switch (op) {
+        .cos, .exp, .exp2, .log, .log10, .log2, .sin, .tan => true,
+        else => false,
     };
 }
 

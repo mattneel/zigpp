@@ -639,6 +639,20 @@ pub const Object = struct {
         );
         errdefer target_machine.dispose();
 
+        if (comp.root_mod.resolved_target.result.cpu.arch.isNvptx()) {
+            // compiler-rt is bundled into NVPTX modules with internal linkage (see
+            // `target_util.bundlesCompilerRt`). Discard the routines that this module does not
+            // reference before code generation, including in Debug mode: LLVM cannot lower some
+            // of them for NVPTX, and the CUDA driver would have to compile all of them.
+            const pass_options: *bindings.PassBuilderOptions = .create();
+            defer pass_options.dispose();
+            if (module.runPasses("globaldce", target_machine, pass_options)) |err| {
+                const message = err.getMessage();
+                defer bindings.disposeErrorMessage(message);
+                return diags.fail("LLVM failed to remove unused functions: {s}", .{message});
+            }
+        }
+
         if (comp.llvm_opt_bisect_limit >= 0) {
             context.setOptBisectLimit(comp.llvm_opt_bisect_limit);
         }
@@ -1252,6 +1266,12 @@ pub const Object = struct {
             // On AMDGCN, LLVM does not generate an alias for the kernel descriptor symbol on associated functions
             // To solve these, we rename the global
             if (workaround_alias_bugs) {
+                // The name may already belong to an extern declaration of the same symbol, such as
+                // a bundled compiler-rt routine that was called before its definition was exported.
+                // Redirect that declaration to the exported value, which also frees up the name.
+                if (o.builder.getGlobal(exp_name)) |existing_global| {
+                    if (!existing_global.eql(llvm_global, &o.builder)) try existing_global.replace(llvm_global, &o.builder);
+                }
                 try llvm_global.rename(exp_name, &o.builder);
                 break :global llvm_global;
             }

@@ -849,7 +849,7 @@ pub fn abort() noreturn {
         exit(127); // Pid 1 might not be signalled in some containers.
     }
     switch (native_os) {
-        .uefi, .wasi, .emscripten, .cuda, .amdhsa, .other, .freestanding => @trap(),
+        .uefi, .wasi, .emscripten, .cuda, .nvcl, .amdhsa, .other, .freestanding => @trap(),
         else => posix.system.abort(),
     }
 }
