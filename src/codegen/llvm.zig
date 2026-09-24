@@ -598,10 +598,15 @@ pub const Object = struct {
         const optimize_mode = comp.root_mod.optimize_mode;
 
         const opt_level: bindings.CodeGenOptLevel = if (optimize_mode == .debug)
-            // The fast register allocator of LLVM's unoptimized AMDGPU code generation miscompiles
-            // divergent loops: the lanes that leave a loop early see clobbered registers. Debug
-            // builds keep their unoptimized IR either way.
-            if (comp.root_mod.resolved_target.result.cpu.arch == .amdgcn) .Less else .None
+            // LLVM's AMDGPU code generation miscompiles the unoptimized IR of Debug builds at low
+            // optimization levels: at .None the fast register allocator clobbers registers of
+            // divergent loops, and at .Less MachineLICM hoists the materializations of private
+            // (scratch) addresses out of loops, and the longer live ranges that this creates are
+            // then spilled to VGPR lanes and read back with the wrong value, so that stores into
+            // stack arrays never reach them (std.fmt.parseFloat's Decimal.parse, for example).
+            // Debug builds keep their unoptimized IR either way; only the code generation level
+            // changes, and the AMDGPU backend is only correct from .Default on.
+            if (comp.root_mod.resolved_target.result.cpu.arch == .amdgcn) .Default else .None
         else
             .Aggressive;
 
