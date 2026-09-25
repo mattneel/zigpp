@@ -3,9 +3,11 @@
 //! add, the reduction and the kernel with scalar parameters, with the same names, the same
 //! arguments in the same order, and the same binding of every argument.
 //!
-//! Three kernels have no counterpart in `metal_kernels.metal`, because what they test is what
-//! this compiler does to a module before Apple's compiler sees it: `index2d`, `mulwide` and
-//! `constant_tables` need the high half of 64-bit multiplies and program-scope constant tables,
+//! The other kernels have no counterpart in `metal_kernels.metal`, because what they test is
+//! what this compiler does to a module before Apple's compiler sees it: the high half of 64-bit
+//! multiplies (`index2d`, `mulwide`), the flags of checked adds and subtracts (`addsub`),
+//! program-scope constants (`constant_tables`), and constant
+//! data that holds pointers (`string_table`, `error_names`, `parse_float`, `allocator_vtable`),
 //! which Apple's GPU compiler handles only in the form the backend rewrites them into.
 //!
 //! ```sh
@@ -165,6 +167,37 @@ export fn mulwide(
         @as(u32, @intFromBool(differ)) << 2;
 }
 
+/// The overflow flags of `@addWithOverflow` and `@subWithOverflow` of `x` and `y` truncated to
+/// each of u64, i64, u32, i32, u16, i16, u8 and i8: two bits per type in that order from bit 0,
+/// the flag of the sum and then the flag of the difference.
+pub fn addSubFlags(x: u64, y: u64) u32 {
+    var flags: u32 = 0;
+    inline for (.{ u64, i64, u32, i32, u16, i16, u8, i8 }, 0..) |T, k| {
+        const U = @Int(.unsigned, @bitSizeOf(T));
+        const a: T = @bitCast(@as(U, @truncate(x)));
+        const b: T = @bitCast(@as(U, @truncate(y)));
+        const sum = @addWithOverflow(a, b);
+        const difference = @subWithOverflow(a, b);
+        flags |= (@as(u32, sum[1]) | @as(u32, difference[1]) << 1) << (2 * k);
+    }
+    return flags;
+}
+
+/// `flags[i] = addSubFlags(a[i], b[i])` for the first `count` pairs. Apple's compiler gets the
+/// flags of the signed overflow intrinsics of add and subtract wrong and dies on the 8-bit ones,
+/// so the compiler rewrites every one of them (issue #26); a checked add or subtract of a Debug
+/// kernel is one.
+export fn addsub(
+    a: [*]addrspace(.global) const u64,
+    b: [*]addrspace(.global) const u64,
+    flags: [*]addrspace(.global) u32,
+    count: u32,
+) callconv(.kernel) void {
+    const i = gpu.globalId(.x);
+    if (i >= count) return;
+    flags[i] = addSubFlags(a[i], b[i]);
+}
+
 /// The tables of `constant_tables`, which `metal_host.zig` has copies of.
 pub const table_primes = [_]u32{ 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53 };
 pub const table_wide = [_]u64{
@@ -195,4 +228,109 @@ export fn constant_tables(out: [*]addrspace(.global) u32, count: u32) callconv(.
     const i = gpu.globalId(.x);
     if (i >= count) return;
     out[i] = tableValue(i);
+}
+
+/// The table of `string_table`, which `metal_host.zig` has a copy of.
+pub const table_words = [_][]const u8{ "zig", "plus", "plus", "metal", "", "constant", "address", "space" };
+
+/// A hash of word `i % 8` plus prime `i % 16` times its length.
+pub fn wordValue(i: u32) u32 {
+    const word = table_words[i % table_words.len];
+    var hash: u32 = 0;
+    for (word) |byte| hash = hash *% 31 +% byte;
+    return hash +% table_primes[i % table_primes.len] *% @as(u32, @intCast(word.len));
+}
+
+/// A table of strings, read through the pointers that the table holds: constant data that holds
+/// pointers to other constant data, which Apple's toolchain does not relocate, so the compiler
+/// stores the pointers as offsets (issue #22). `out[i] = wordValue(i)`.
+export fn string_table(out: [*]addrspace(.global) u32, count: u32) callconv(.kernel) void {
+    const i = gpu.globalId(.x);
+    if (i >= count) return;
+    out[i] = wordValue(i);
+}
+
+/// The errors of `error_names`.
+pub const KernelError = error{ OutOfMemory, InvalidCharacter, Overflow, EndOfStream };
+pub const kernel_errors = [_]KernelError{
+    error.OutOfMemory, error.InvalidCharacter, error.Overflow, error.EndOfStream,
+};
+
+/// A hash of the name of an error and its length, the length in the top byte.
+pub fn nameValue(name: []const u8) u32 {
+    var hash: u32 = 0;
+    for (name) |byte| hash = hash *% 31 +% byte;
+    return hash +% (@as(u32, @intCast(name.len)) << 24);
+}
+
+/// `@errorName` of error `i % 4`, which reads the table of the names of all errors, a table of
+/// slices in constant data like `table_words`. `out[i]` is `nameValue` of the name.
+export fn error_names(out: [*]addrspace(.global) u32, count: u32) callconv(.kernel) void {
+    const i = gpu.globalId(.x);
+    if (i >= count) return;
+    out[i] = nameValue(@errorName(kernel_errors[i % kernel_errors.len]));
+}
+
+/// The longest text of a number that `parse_float` reads.
+pub const max_float_text = 64;
+
+/// `std.fmt.parseFloat(f32, ...)` of each of the first `count` strings of `text`, which holds
+/// them back to back, string `i` starting at `starts[i]` with `lens[i]` bytes: the bits of the
+/// result and 1 in `ok`, or 0 in both for a string that is not a number.
+///
+/// The parser is the standard library's own. Its Eisel-Lemire path multiplies 64-bit integers
+/// into 128-bit products (issue #18), and its slow path reads a table of the powers of five
+/// written out as decimal strings, which holds pointers (issue #22). The string is copied into
+/// the thread's own memory first, because the parser takes a slice of generic memory, which a
+/// buffer in device memory is not.
+export fn parse_float(
+    text: [*]addrspace(.global) const u8,
+    starts: [*]addrspace(.global) const u32,
+    lens: [*]addrspace(.global) const u32,
+    bits: [*]addrspace(.global) u32,
+    ok: [*]addrspace(.global) u32,
+    count: u32,
+) callconv(.kernel) void {
+    const i = gpu.globalId(.x);
+    if (i >= count) return;
+    const start = starts[i];
+    const len = @min(lens[i], max_float_text);
+    var buffer: [max_float_text]u8 = undefined;
+    for (buffer[0..len], 0..) |*byte, k| byte.* = text[start + k];
+    if (std.fmt.parseFloat(f32, buffer[0..len])) |value| {
+        bits[i] = @bitCast(value);
+        ok[i] = 1;
+    } else |_| {
+        bits[i] = 0;
+        ok[i] = 0;
+    }
+}
+
+/// The sum of the squares of `0 ..< n`.
+pub fn squareSum(n: u32) u32 {
+    var sum: u32 = 0;
+    for (0..n) |k| sum += @intCast(k * k);
+    return sum;
+}
+
+/// Allocations through `std.mem.Allocator` from a buffer in the thread's own memory. The
+/// allocator's vtable is a program-scope constant of function pointers, which a Debug build calls
+/// through; the compiler inlines the calls that carry it, so that the calls through it become
+/// direct ones (issue #22). `out[i]` is `squareSum(8 + i % 8)`, of values allocated, filled and
+/// freed through the interface, or 0 if the allocation failed.
+export fn allocator_vtable(out: [*]addrspace(.global) u32, count: u32) callconv(.kernel) void {
+    const i = gpu.globalId(.x);
+    if (i >= count) return;
+    var buffer: [256]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buffer);
+    const allocator = fba.allocator();
+    const values = allocator.alloc(u32, 8 + i % 8) catch {
+        out[i] = 0;
+        return;
+    };
+    defer allocator.free(values);
+    for (values, 0..) |*value, k| value.* = @intCast(k * k);
+    var sum: u32 = 0;
+    for (values) |value| sum += value;
+    out[i] = sum;
 }

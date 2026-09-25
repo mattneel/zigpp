@@ -14,6 +14,16 @@
 //    Zig's anonymous constants appearing as `___anon_N` (issue #18). Every constant global
 //    moves to address space 2.
 //
+//    Apple's toolchain does not relocate the addresses inside constant data either (issue #22),
+//    so constant data is made position-independent: the constants that hold pointers to other
+//    constants (a table of slices, like std.fmt.parseFloat's powers of five written out as
+//    decimal strings or the table behind `@errorName`) and the constants they point to are laid
+//    out in one global, and each such pointer is stored as its offset into that global. A
+//    pointer loaded out of it is loaded as the offset and becomes the global's address plus the
+//    offset; the only pointers in constant data are the ones the compiler put there, so this is
+//    exact. A pointer that is a number and not an address, like the pointer of an empty slice,
+//    needs no relocation and is kept as the integer of the same bits.
+//
 //    Zig's pointer types say nothing about constant data, and an Apple GPU has no generic
 //    address space to cast a pointer into constant data to, so every pointer that comes from
 //    a constant has to be known for one wherever it is used. SROA takes apart the copies a
@@ -22,17 +32,16 @@
 //    arithmetic, the phis, the loads and the copies. Where such a pointer crosses a call, or
 //    meets thread memory at the edge of a function (a phi with a local, a store, a return),
 //    the call is inlined and inference runs again in the caller, until nothing crosses; the
-//    other functions the optimizer left stay as they are. What is left (a pointer into
-//    constant data that meets thread memory in a kernel) and a mutable program-scope
-//    variable, which has no place on an Apple GPU, are reported by name.
+//    other functions the optimizer left stay as they are. A table of function pointers, like
+//    an allocator's vtable, gets the same treatment: once the calls that carry it are inlined,
+//    the loads of its entries are constant and fold into direct calls.
 //
-//    Apple's toolchain does not relocate the addresses inside constant data: a table of
-//    strings or slices fails to link with "Undefined symbols: _unnamed_1", makes the compiler
-//    service die, or reads zeros for its strings, depending on the kernel. A constant that
-//    holds the address of another global is reported by name until the backend stores such
-//    tables without addresses (issue #22).
+//    What is left is reported by name: a pointer into constant data that meets thread memory
+//    in a kernel, the bytes of a pointer in constant data read as something else, a table of
+//    functions that a kernel still calls through, and a mutable program-scope variable, which
+//    has no place on an Apple GPU.
 //
-// 2. Wide multiplies. Apple's AIR-to-GPU compiler cannot produce the high 64 bits of a 64x64-bit
+// 2. Arithmetic. Apple's AIR-to-GPU compiler cannot produce the high 64 bits of a 64x64-bit
 //    product: its compiler service dies with XPC_ERROR_CONNECTION_INTERRUPTED instead
 //    (issue #18). Two IR shapes need that high half:
 //
@@ -49,14 +58,25 @@
 //    non-zero high half, signed overflow a high half that is not the sign extension of the low
 //    half. A 128-bit product is its low 128 bits, which do not depend on signedness. What this
 //    pass cannot rebuild is reported by name, rather than left for Apple's compiler to crash on.
+//
+//    The add and subtract overflow intrinsics, `llvm.{s,u}{add,sub}.with.overflow`, Apple's
+//    compiler gets wrong in another way: the flag of the signed ones is wrong (0 - 10 overflows
+//    an i64, it says), and the 8-bit ones make its compiler service die (issue #26). Every
+//    checked add and subtract of a Debug kernel is one, so each becomes the operation and a
+//    comparison of its operands and result.
 
 #include "zig_air.h"
 
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -81,6 +101,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -138,17 +159,162 @@ bool isProgramScopeData(const llvm::GlobalVariable &GV) {
     return GV.getAddressSpace() == 0 && !GV.use_empty() && !GV.getName().starts_with("llvm.");
 }
 
-// The global that `C` holds the address of, if any: a pointer to another constant (a table of
-// slices), a function, or an address used as an integer. Apple's toolchain does not relocate
-// the addresses inside constant data: a kernel that reads such a table fails to link with
-// "Undefined symbols: _unnamed_1", makes the compiler service die, or reads zeros where the
-// pointers should be, depending on the kernel (issue #22).
-const llvm::GlobalValue *addressIn(const llvm::Constant *C) {
-    if (auto *GV = llvm::dyn_cast<llvm::GlobalValue>(C)) return GV;
-    if (!llvm::isa<llvm::ConstantAggregate>(C) && !llvm::isa<llvm::ConstantExpr>(C)) return nullptr;
-    for (const llvm::Use &Op : C->operands())
-        if (const llvm::GlobalValue *GV = addressIn(llvm::cast<llvm::Constant>(Op.get()))) return GV;
+// The type of a constant's value with each pointer it holds replaced by an offset into the
+// blob: a pointer in address space 0 becomes an i64, of the same size and alignment in AIR, so
+// the layout does not move.
+llvm::Type *offsetType(llvm::Type *T) {
+    llvm::LLVMContext &Ctx = T->getContext();
+    if (auto *PT = llvm::dyn_cast<llvm::PointerType>(T))
+        return PT->getAddressSpace() == 0 ? llvm::Type::getInt64Ty(Ctx) : T;
+    if (auto *VT = llvm::dyn_cast<llvm::VectorType>(T)) {
+        llvm::Type *Element = offsetType(VT->getElementType());
+        return Element == VT->getElementType() ? T
+                                               : llvm::VectorType::get(Element, VT->getElementCount());
+    }
+    if (auto *AT = llvm::dyn_cast<llvm::ArrayType>(T)) {
+        llvm::Type *Element = offsetType(AT->getElementType());
+        return Element == AT->getElementType() ? T
+                                               : llvm::ArrayType::get(Element, AT->getNumElements());
+    }
+    if (auto *ST = llvm::dyn_cast<llvm::StructType>(T)) {
+        llvm::SmallVector<llvm::Type *, 8> Elements;
+        bool Changed = false;
+        for (llvm::Type *Element : ST->elements()) {
+            Elements.push_back(offsetType(Element));
+            Changed |= Elements.back() != Element;
+        }
+        return Changed ? llvm::StructType::get(Ctx, Elements, ST->isPacked()) : T;
+    }
+    return T;
+}
+
+// Whether a `T` holds a pointer in address space 0.
+bool holdsFlatPointer(llvm::Type *T) { return offsetType(T) != T; }
+
+// The globals whose addresses `C` holds.
+void addressesIn(const llvm::Constant *C, llvm::SmallPtrSetImpl<const llvm::GlobalValue *> &Out) {
+    if (auto *GV = llvm::dyn_cast<llvm::GlobalValue>(C)) {
+        Out.insert(GV);
+        return;
+    }
+    if (!llvm::isa<llvm::ConstantAggregate>(C) && !llvm::isa<llvm::ConstantExpr>(C)) return;
+    for (const llvm::Use &Op : C->operands()) addressesIn(llvm::cast<llvm::Constant>(Op.get()), Out);
+}
+
+// Apple's toolchain does not relocate the addresses inside constant data: a table of slices,
+// like std.fmt.parseFloat's powers of five written out as decimal strings or the table behind
+// `@errorName`, fails to link with "Undefined symbols: _unnamed_1", makes the compiler service
+// die, or reads zeros where its pointers should be, depending on the kernel (issue #22). So the
+// constants that hold pointers to other constants, and the constants they point to, are laid
+// out in one global, the blob, and each such pointer is stored as an offset into it; 0 stays
+// null, because the blob starts with a byte that no constant is placed at. The only pointers
+// in constant data are the ones the compiler put there, so a pointer loaded out of the blob is
+// always one of these offsets.
+struct Blob {
+    llvm::GlobalVariable *Global = nullptr;
+    // Where each constant that moved into the blob is.
+    llvm::DenseMap<const llvm::GlobalVariable *, uint64_t> Offsets;
+    // The members in the order of their offsets, with their value types as they were, pointers
+    // and all, for telling which bytes are the offsets of pointers.
+    llvm::SmallVector<std::pair<uint64_t, llvm::Type *>, 16> Layout;
+    // Whether a constant that a pointer in the blob points at holds pointers itself: whether the
+    // bytes behind a pointer loaded out of the blob may be offsets.
+    bool PointedHoldPointers = false;
+};
+
+constexpr const char *blob_name = "__zig_air_constants";
+
+// The metadata that marks what loadConstantPointers makes, until the checks after it have run:
+// the loads of offsets, which read the blob as the offsets it holds, and the pointers decoded
+// from them.
+constexpr const char *offset_load_kind = "zig.air.offset";
+constexpr const char *decoded_kind = "zig.air.decoded";
+
+// `C` with the pointers it holds replaced by their offsets into the blob, of the type offsetType
+// gives. Returns nullptr, with the offending part in `Bad`, for an address that is not one of a
+// member of the blob, or one used as an integer.
+llvm::Constant *offsetConstant(llvm::Constant *C, const Blob &B, const llvm::DataLayout &DL,
+                               const llvm::Constant *&Bad) {
+    llvm::Type *T = C->getType();
+    llvm::Type *NewT = offsetType(T);
+    llvm::Type *I64 = llvm::Type::getInt64Ty(C->getContext());
+    if (auto *GEP = llvm::dyn_cast<llvm::GEPOperator>(C); GEP || llvm::isa<llvm::GlobalValue>(C)) {
+        llvm::APInt Offset(64, 0);
+        const llvm::Value *Base = C->stripAndAccumulateConstantOffsets(DL, Offset, true);
+        auto *Member = llvm::dyn_cast<llvm::GlobalVariable>(Base);
+        auto It = Member ? B.Offsets.find(Member) : B.Offsets.end();
+        if (It == B.Offsets.end() || NewT != I64) {
+            Bad = C;
+            return nullptr;
+        }
+        return llvm::ConstantInt::get(I64, It->second + Offset.getSExtValue());
+    }
+    if (llvm::isa<llvm::ConstantAggregate>(C)) {
+        llvm::SmallVector<llvm::Constant *, 16> Ops;
+        for (llvm::Use &Op : C->operands()) {
+            llvm::Constant *New = offsetConstant(llvm::cast<llvm::Constant>(Op.get()), B, DL, Bad);
+            if (!New) return nullptr;
+            Ops.push_back(New);
+        }
+        if (llvm::isa<llvm::ConstantStruct>(C))
+            return llvm::ConstantStruct::get(llvm::cast<llvm::StructType>(NewT), Ops);
+        if (llvm::isa<llvm::ConstantArray>(C))
+            return llvm::ConstantArray::get(llvm::cast<llvm::ArrayType>(NewT), Ops);
+        return llvm::ConstantVector::get(Ops);
+    }
+    llvm::SmallPtrSet<const llvm::GlobalValue *, 4> Held;
+    addressesIn(C, Held);
+    if (!Held.empty()) {
+        Bad = C;
+        return nullptr;
+    }
+    if (NewT == T) return C;
+    if (llvm::isa<llvm::PoisonValue>(C)) return llvm::PoisonValue::get(NewT);
+    if (llvm::isa<llvm::UndefValue>(C)) return llvm::UndefValue::get(NewT);
+    if (C->isNullValue()) return llvm::Constant::getNullValue(NewT);
+    Bad = C;
     return nullptr;
+}
+
+// Whether `C` holds a pointer that is a constant expression, which the downgrader to the typed
+// pointers of the bitcode Apple's reader takes cannot write into an initializer.
+bool holdsPointerExpr(const llvm::Constant *C) {
+    if (llvm::isa<llvm::ConstantExpr>(C) && C->getType()->isPtrOrPtrVectorTy()) return true;
+    if (!llvm::isa<llvm::ConstantAggregate>(C) && !llvm::isa<llvm::ConstantExpr>(C)) return false;
+    return llvm::any_of(C->operands(), [](const llvm::Use &Op) {
+        return holdsPointerExpr(llvm::cast<llvm::Constant>(Op.get()));
+    });
+}
+
+// `C`, which holds no address, with its pointers (null, undefined, or made from an integer, like
+// the pointer of an empty slice) replaced by the integers of the same bits, of the type
+// offsetType gives. Returns nullptr for a pointer that is none of those.
+llvm::Constant *integerPointers(llvm::Constant *C) {
+    llvm::Type *T = C->getType();
+    llvm::Type *NewT = offsetType(T);
+    if (NewT == T) return C;
+    if (llvm::isa<llvm::PoisonValue>(C)) return llvm::PoisonValue::get(NewT);
+    if (llvm::isa<llvm::UndefValue>(C)) return llvm::UndefValue::get(NewT);
+    if (C->isNullValue()) return llvm::Constant::getNullValue(NewT);
+    if (auto *CE = llvm::dyn_cast<llvm::ConstantExpr>(C);
+        CE && CE->getOpcode() == llvm::Instruction::IntToPtr && NewT->isIntegerTy()) {
+        if (auto *Int = llvm::dyn_cast<llvm::ConstantInt>(CE->getOperand(0)))
+            return llvm::ConstantInt::get(
+                NewT, Int->getValue().zextOrTrunc(NewT->getIntegerBitWidth()));
+        return nullptr;
+    }
+    if (!llvm::isa<llvm::ConstantAggregate>(C)) return nullptr;
+    llvm::SmallVector<llvm::Constant *, 16> Ops;
+    for (llvm::Use &Op : C->operands()) {
+        llvm::Constant *New = integerPointers(llvm::cast<llvm::Constant>(Op.get()));
+        if (!New) return nullptr;
+        Ops.push_back(New);
+    }
+    if (llvm::isa<llvm::ConstantStruct>(C))
+        return llvm::ConstantStruct::get(llvm::cast<llvm::StructType>(NewT), Ops);
+    if (llvm::isa<llvm::ConstantArray>(C))
+        return llvm::ConstantArray::get(llvm::cast<llvm::ArrayType>(NewT), Ops);
+    return llvm::ConstantVector::get(Ops);
 }
 
 // Takes apart the stack copies a Debug build makes, whose stores and loads would hide where a
@@ -168,9 +334,17 @@ void split(llvm::Module &M) {
     runPasses(M, MPM);
 }
 
-// Moves the program-scope constants to the constant address space. Each use of one becomes a
-// cast of its new address to address space 0, where inference picks it up.
-bool moveConstants(llvm::Module &M, std::string &Err) {
+// Moves the program-scope constants to the constant address space: the ones that hold pointers
+// to other constants, and the ones those point to, into the blob, and the others each on its
+// own. Each use of one becomes a cast of its new address to address space 0, where inference
+// picks it up.
+//
+// A constant that holds the addresses of functions, like an allocator's vtable, moves on its
+// own: inlining is what makes the loads of its entries constant, so that they fold into direct
+// calls, and checkFunctionTables reports the ones still used after that. The blob is not marked
+// constant until the loads out of it have been rewritten, so that nothing folds a pointer out of
+// it into the bare offset it holds.
+bool moveConstants(llvm::Module &M, Blob &B, std::string &Err) {
     llvm::SmallVector<llvm::GlobalVariable *, 16> Constants;
     for (llvm::GlobalVariable &GV : M.globals()) {
         if (!isProgramScopeData(GV)) continue;
@@ -186,19 +360,120 @@ bool moveConstants(llvm::Module &M, std::string &Err) {
                   "in the `shared` address space";
             return false;
         }
-        if (const llvm::GlobalValue *Target = addressIn(GV.getInitializer())) {
-            Err = "air64: the program-scope constant " + GV.getName().str() +
-                  " holds the address of " + describeOperand(*Target) +
-                  ", and Apple's GPU toolchain does not relocate the addresses inside constant "
-                  "data (a table of strings or slices is one; issue #22)";
-            return false;
-        }
         Constants.push_back(&GV);
     }
 
+    llvm::SmallPtrSet<const llvm::GlobalVariable *, 16> IsConstant(Constants.begin(), Constants.end());
+    llvm::SmallPtrSet<const llvm::GlobalVariable *, 16> InBlob, Pointed, HoldsFunctions;
     for (llvm::GlobalVariable *GV : Constants) {
-        auto *New = new llvm::GlobalVariable(M, GV->getValueType(), /*isConstant=*/true,
-                                             GV->getLinkage(), GV->getInitializer(), "", GV,
+        llvm::SmallPtrSet<const llvm::GlobalValue *, 8> Held;
+        addressesIn(GV->getInitializer(), Held);
+        bool HoldsData = false;
+        for (const llvm::GlobalValue *Address : Held) {
+            if (llvm::isa<llvm::Function>(Address)) {
+                HoldsFunctions.insert(GV);
+                continue;
+            }
+            auto *Target = llvm::dyn_cast<llvm::GlobalVariable>(Address);
+            if (!Target || !IsConstant.contains(Target)) {
+                Err = "air64: the program-scope constant " + GV->getName().str() +
+                      " holds the address of " + describeOperand(*Address) +
+                      ", which an Apple GPU cannot keep in constant data: only the addresses of "
+                      "other constants are";
+                return false;
+            }
+            InBlob.insert(Target);
+            Pointed.insert(Target);
+            HoldsData = true;
+        }
+        if (HoldsData) InBlob.insert(GV);
+    }
+    for (const llvm::GlobalVariable *GV : InBlob) {
+        if (!HoldsFunctions.contains(GV)) continue;
+        Err = "air64: the program-scope constant " + GV->getName().str() +
+              " holds the address of a function, and it " +
+              (Pointed.contains(GV) ? "is pointed at by other constant data"
+                                    : "holds pointers to other constants too") +
+              "; on an Apple GPU such pointers are offsets into constant data, which the address "
+              "of a function cannot be";
+        return false;
+    }
+    for (const llvm::GlobalVariable *GV : Pointed) {
+        llvm::SmallPtrSet<const llvm::GlobalValue *, 8> Held;
+        addressesIn(GV->getInitializer(), Held);
+        if (!Held.empty()) B.PointedHoldPointers = true;
+    }
+
+    const llvm::DataLayout &DL = M.getDataLayout();
+    llvm::LLVMContext &Ctx = M.getContext();
+    if (!InBlob.empty()) {
+        llvm::Type *I8 = llvm::Type::getInt8Ty(Ctx);
+        llvm::SmallVector<llvm::Type *, 32> Fields{I8};
+        llvm::SmallVector<llvm::GlobalVariable *, 16> Members;
+        llvm::SmallVector<unsigned, 16> MemberField;
+        uint64_t Offset = 1;
+        llvm::Align BlobAlign(1);
+        for (llvm::GlobalVariable *GV : Constants) {
+            if (!InBlob.contains(GV)) continue;
+            llvm::Align A = DL.getPreferredAlign(GV);
+            uint64_t At = llvm::alignTo(Offset, A);
+            if (At > Offset) Fields.push_back(llvm::ArrayType::get(I8, At - Offset));
+            B.Offsets[GV] = At;
+            B.Layout.push_back({At, GV->getValueType()});
+            MemberField.push_back((unsigned)Fields.size());
+            Fields.push_back(offsetType(GV->getValueType()));
+            Members.push_back(GV);
+            Offset = At + DL.getTypeAllocSize(GV->getValueType()).getFixedValue();
+            BlobAlign = std::max(BlobAlign, A);
+        }
+        auto *BlobType = llvm::StructType::get(Ctx, Fields, /*isPacked=*/true);
+        llvm::SmallVector<llvm::Constant *, 32> Inits;
+        for (llvm::Type *Field : Fields) Inits.push_back(llvm::Constant::getNullValue(Field));
+        for (size_t I = 0; I < Members.size(); ++I) {
+            const llvm::Constant *Bad = nullptr;
+            llvm::Constant *Init = offsetConstant(Members[I]->getInitializer(), B, DL, Bad);
+            if (!Init) {
+                Err = "air64: the program-scope constant " + Members[I]->getName().str() +
+                      " holds " + describeOperand(*Bad) +
+                      ", an address that has no offset in the constant data of an Apple GPU";
+                return false;
+            }
+            Inits[MemberField[I]] = Init;
+        }
+        B.Global = new llvm::GlobalVariable(M, BlobType, /*isConstant=*/false,
+                                            llvm::GlobalValue::PrivateLinkage,
+                                            llvm::ConstantStruct::get(BlobType, Inits), blob_name,
+                                            nullptr, llvm::GlobalValue::NotThreadLocal,
+                                            air_constant_address_space);
+        B.Global->setAlignment(BlobAlign);
+        B.Global->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+        for (llvm::GlobalVariable *GV : Members) {
+            llvm::Constant *Address = llvm::ConstantExpr::getInBoundsGetElementPtr(
+                I8, B.Global, llvm::ConstantInt::get(llvm::Type::getInt64Ty(Ctx), B.Offsets[GV]));
+            GV->replaceAllUsesWith(llvm::ConstantExpr::getAddrSpaceCast(Address, GV->getType()));
+            GV->eraseFromParent();
+        }
+    }
+
+    for (llvm::GlobalVariable *GV : Constants) {
+        if (InBlob.contains(GV)) continue;
+        // A pointer that is a number and not an address, like the pointer of an empty slice,
+        // needs no relocation; it is kept as the integer of the same bits, because the
+        // downgrader writes no pointer expression into an initializer. A load of it as a pointer
+        // reads the same bits. The addresses in a table of functions fold away or are reported.
+        llvm::Constant *Init = GV->getInitializer();
+        if (!HoldsFunctions.contains(GV) && holdsPointerExpr(Init)) {
+            Init = integerPointers(Init);
+            if (!Init) {
+                Err = "air64: the program-scope constant " + GV->getName().str() +
+                      " holds a pointer that is neither the address of a constant nor a number, "
+                      "which an Apple GPU cannot keep in constant data: " +
+                      describe(*GV->getInitializer());
+                return false;
+            }
+        }
+        auto *New = new llvm::GlobalVariable(M, Init->getType(), /*isConstant=*/true,
+                                             GV->getLinkage(), Init, "", GV,
                                              GV->getThreadLocalMode(), air_constant_address_space);
         New->copyAttributesFrom(GV);
         New->takeName(GV);
@@ -215,6 +490,90 @@ void inferConstantSpace(llvm::Module &M) {
     FPM.addPass(llvm::InstSimplifyPass());
     FPM.addPass(llvm::InferAddressSpacesPass(0));
     runOnFunctions(M, std::move(FPM));
+}
+
+// The value of type `T` that the offsets in `V`, of type offsetType(T), stand for: a pointer
+// into the blob for each non-zero offset, null for zero, cast to the address space 0 of `T`
+// until inference carries address space 2 into the uses.
+llvm::Value *fromOffsets(llvm::IRBuilder<> &B, llvm::Value *V, llvm::Type *T,
+                         llvm::GlobalVariable *Blob, unsigned DecodedKind) {
+    if (V->getType() == T) return V;
+    if (T->isPtrOrPtrVectorTy()) {
+        llvm::LLVMContext &Ctx = T->getContext();
+        llvm::Type *ConstantPtr = llvm::PointerType::get(Ctx, air_constant_address_space);
+        if (auto *VT = llvm::dyn_cast<llvm::VectorType>(T))
+            ConstantPtr = llvm::VectorType::get(ConstantPtr, VT->getElementCount());
+        llvm::MDNode *Mark = llvm::MDNode::get(Ctx, {});
+        llvm::Value *Address = B.CreateInBoundsGEP(B.getInt8Ty(), Blob, V);
+        llvm::Value *IsNull = B.CreateICmpEQ(V, llvm::Constant::getNullValue(V->getType()));
+        llvm::Value *Pointer =
+            B.CreateSelect(IsNull, llvm::Constant::getNullValue(ConstantPtr), Address);
+        for (llvm::Value *Made : {Address, Pointer})
+            if (auto *I = llvm::dyn_cast<llvm::Instruction>(Made)) I->setMetadata(DecodedKind, Mark);
+        return B.CreateAddrSpaceCast(Pointer, T);
+    }
+    llvm::Value *Result = llvm::PoisonValue::get(T);
+    if (auto *ST = llvm::dyn_cast<llvm::StructType>(T)) {
+        for (unsigned I = 0, E = ST->getNumElements(); I != E; ++I)
+            Result = B.CreateInsertValue(
+                Result,
+                fromOffsets(B, B.CreateExtractValue(V, I), ST->getElementType(I), Blob, DecodedKind),
+                I);
+        return Result;
+    }
+    auto *AT = llvm::cast<llvm::ArrayType>(T);
+    for (unsigned I = 0, E = (unsigned)AT->getNumElements(); I != E; ++I)
+        Result = B.CreateInsertValue(
+            Result,
+            fromOffsets(B, B.CreateExtractValue(V, I), AT->getElementType(), Blob, DecodedKind), I);
+    return Result;
+}
+
+// Whether a pointer loaded through `Ptr` is one of the offsets in the blob: whether `Ptr` points
+// into the blob (or is null) and nowhere else. A kernel's scalar parameters are in the constant
+// address space too, and a pointer loaded out of one of those is a real address.
+bool readsBlobOnly(const llvm::Value *Ptr, const llvm::GlobalVariable *Blob) {
+    llvm::SmallVector<const llvm::Value *, 4> Objects;
+    llvm::getUnderlyingObjects(Ptr, Objects, nullptr, 0);
+    bool FromBlob = false;
+    for (const llvm::Value *Object : Objects) {
+        if (Object == Blob)
+            FromBlob = true;
+        else if (!llvm::isa<llvm::ConstantPointerNull>(Object) && !llvm::isa<llvm::UndefValue>(Object))
+            return false;
+    }
+    return FromBlob;
+}
+
+// A pointer that a kernel loads out of the blob is an offset into it: the load loads the offset,
+// and the pointer is the blob's address plus it. Returns whether any load changed.
+bool loadConstantPointers(llvm::Module &M, const Blob &TheBlob) {
+    if (!TheBlob.Global) return false;
+    llvm::LLVMContext &Ctx = M.getContext();
+    unsigned OffsetKind = Ctx.getMDKindID(offset_load_kind);
+    unsigned DecodedKind = Ctx.getMDKindID(decoded_kind);
+    llvm::SmallVector<llvm::LoadInst *, 8> Loads;
+    for (llvm::Function &F : M) {
+        for (llvm::Instruction &I : llvm::instructions(F)) {
+            auto *L = llvm::dyn_cast<llvm::LoadInst>(&I);
+            if (L && holdsFlatPointer(L->getType()) &&
+                readsBlobOnly(L->getPointerOperand(), TheBlob.Global))
+                Loads.push_back(L);
+        }
+    }
+    for (llvm::LoadInst *L : Loads) {
+        llvm::IRBuilder<> B(L);
+        llvm::LoadInst *New = B.CreateAlignedLoad(offsetType(L->getType()), L->getPointerOperand(),
+                                                  L->getAlign(), L->isVolatile());
+        New->setAtomic(L->getOrdering(), L->getSyncScopeID());
+        New->copyMetadata(*L, {llvm::LLVMContext::MD_tbaa, llvm::LLVMContext::MD_alias_scope,
+                               llvm::LLVMContext::MD_noalias});
+        New->setMetadata(OffsetKind, llvm::MDNode::get(Ctx, {}));
+        New->takeName(L);
+        L->replaceAllUsesWith(fromOffsets(B, New, L->getType(), TheBlob.Global, DecodedKind));
+        L->eraseFromParent();
+    }
+    return !Loads.empty();
 }
 
 // Whether `V` is, or is a constant built out of, a cast of a pointer out of the constant
@@ -252,22 +611,47 @@ bool escapesConstantSpace(const llvm::Instruction &I) {
 }
 
 // The calls to inline so that inference sees a pointer into constant data where it goes: a
-// call that is passed one, and each call of a function where one meets thread memory in
-// another way (a phi with a local, a store, a return), since the caller is where the two can
-// be told apart. A function is not inlined into itself.
+// call that is passed one; a call that is passed memory on the stack that one was stored in,
+// like a struct that holds an allocator's vtable; and each call of a function where one meets
+// thread memory in another way (a phi with a local, a store to memory of the caller, a return),
+// since the caller is where the two can be told apart. A function is not inlined into itself.
 llvm::SmallSetVector<llvm::CallBase *, 16> callsToInline(llvm::Module &M) {
     llvm::SmallSetVector<llvm::CallBase *, 16> Calls;
+    auto inlinable = [](const llvm::CallBase &Call, const llvm::Function &Caller) {
+        const llvm::Function *Callee = Call.getCalledFunction();
+        return Callee && !Callee->isDeclaration() && Callee != &Caller;
+    };
     for (llvm::Function &F : M) {
         if (F.isDeclaration()) continue;
         bool EscapesHere = false;
+        llvm::SmallPtrSet<const llvm::Value *, 4> Holders;
         for (llvm::Instruction &I : llvm::instructions(F)) {
             if (!escapesConstantSpace(I)) continue;
-            auto *Call = llvm::dyn_cast<llvm::CallBase>(&I);
-            llvm::Function *Callee = Call ? Call->getCalledFunction() : nullptr;
-            if (Callee && !Callee->isDeclaration() && Callee != &F)
+            if (auto *Call = llvm::dyn_cast<llvm::CallBase>(&I); Call && inlinable(*Call, F)) {
                 Calls.insert(Call);
-            else
-                EscapesHere = true;
+                continue;
+            }
+            if (auto *Store = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+                const llvm::Value *Object = llvm::getUnderlyingObject(Store->getPointerOperand(), 0);
+                if (llvm::isa<llvm::AllocaInst>(Object)) {
+                    Holders.insert(Object);
+                    continue;
+                }
+            }
+            EscapesHere = true;
+        }
+        if (!Holders.empty()) {
+            for (llvm::Instruction &I : llvm::instructions(F)) {
+                auto *Call = llvm::dyn_cast<llvm::CallBase>(&I);
+                if (!Call || !inlinable(*Call, F)) continue;
+                for (const llvm::Use &Arg : Call->args()) {
+                    if (Arg->getType()->isPointerTy() &&
+                        Holders.contains(llvm::getUnderlyingObject(Arg.get(), 0))) {
+                        Calls.insert(Call);
+                        break;
+                    }
+                }
+            }
         }
         if (!EscapesHere) continue;
         for (llvm::User *User : F.users()) {
@@ -305,14 +689,235 @@ bool checkConstantUses(llvm::Module &M, std::string &Err) {
     return true;
 }
 
+// Whether bytes [Begin, End) of a `T` hold part of a pointer in address space 0: in the blob,
+// part of the offset that stands for one.
+bool bytesHoldFlatPointer(const llvm::DataLayout &DL, llvm::Type *T, uint64_t Begin,
+                          uint64_t End) {
+    if (Begin >= End || !holdsFlatPointer(T)) return false;
+    if (T->isPtrOrPtrVectorTy()) return true;
+    if (auto *ST = llvm::dyn_cast<llvm::StructType>(T)) {
+        const llvm::StructLayout *Layout = DL.getStructLayout(ST);
+        for (unsigned I = 0, E = ST->getNumElements(); I != E; ++I) {
+            uint64_t Offset = Layout->getElementOffset(I).getFixedValue();
+            uint64_t Size = DL.getTypeStoreSize(ST->getElementType(I)).getFixedValue();
+            uint64_t From = std::max(Begin, Offset);
+            uint64_t To = std::min(End, Offset + Size);
+            if (From < To &&
+                bytesHoldFlatPointer(DL, ST->getElementType(I), From - Offset, To - Offset))
+                return true;
+        }
+        return false;
+    }
+    auto *AT = llvm::cast<llvm::ArrayType>(T);
+    uint64_t Stride = DL.getTypeAllocSize(AT->getElementType()).getFixedValue();
+    if (Stride == 0) return false;
+    uint64_t First = Begin / Stride;
+    uint64_t Last = (End - 1) / Stride;
+    // A whole element in between holds its pointer.
+    if (Last - First >= 2) return true;
+    for (uint64_t Index : {First, Last}) {
+        uint64_t Offset = Index * Stride;
+        uint64_t From = std::max(Begin, Offset);
+        uint64_t To = std::min(End, Offset + Stride);
+        if (From < To &&
+            bytesHoldFlatPointer(DL, AT->getElementType(), From - Offset, To - Offset))
+            return true;
+    }
+    return false;
+}
+
+// Whether a read of `Size` bytes (unknown when empty) at `Constant` plus `Variable` bytes into
+// the blob may cover part of an offset. With `AnyOffset`, the read may be anywhere in the member
+// that `Constant` is in, because a loop steps the pointer.
+bool readCoversOffset(const llvm::DataLayout &DL, const Blob &B, const llvm::APInt &Constant,
+                      const llvm::SmallMapVector<llvm::Value *, llvm::APInt, 4> &Variable,
+                      std::optional<uint64_t> Size, bool AnyOffset) {
+    if (Constant.isNegative()) return true;
+    uint64_t Offset = Constant.getZExtValue();
+    const std::pair<uint64_t, llvm::Type *> *Member = nullptr;
+    for (const auto &Entry : B.Layout)
+        if (Offset >= Entry.first &&
+            Offset < Entry.first + DL.getTypeAllocSize(Entry.second).getFixedValue())
+            Member = &Entry;
+    if (AnyOffset) return !Member || holdsFlatPointer(Member->second);
+    if (!Size) return true;
+    if (Variable.empty()) {
+        for (const auto &[Start, T] : B.Layout) {
+            uint64_t End = Start + DL.getTypeAllocSize(T).getFixedValue();
+            uint64_t From = std::max(Offset, Start);
+            uint64_t To = std::min(Offset + *Size, End);
+            if (From < To && bytesHoldFlatPointer(DL, T, From - Start, To - Start)) return true;
+        }
+        return false;
+    }
+    // A runtime index steps over whole elements of an array in the member, and the read has to
+    // stay inside one element.
+    if (!Member) return true;
+    llvm::Type *T = Member->second;
+    uint64_t Within = Offset - Member->first;
+    while (auto *AT = llvm::dyn_cast<llvm::ArrayType>(T)) {
+        uint64_t Stride = DL.getTypeAllocSize(AT->getElementType()).getFixedValue();
+        if (Stride == 0) return true;
+        bool Whole = llvm::all_of(Variable, [&](const auto &Entry) {
+            return Entry.second.srem((int64_t)Stride) == 0;
+        });
+        if (Whole) {
+            uint64_t In = Within % Stride;
+            if (In + *Size > Stride) return true;
+            return bytesHoldFlatPointer(DL, AT->getElementType(), In, In + *Size);
+        }
+        Within %= Stride;
+        T = AT->getElementType();
+    }
+    return true;
+}
+
+// Whether `Phi` is defined, through GEPs, phis and selects, in terms of itself: a pointer that a
+// loop steps.
+bool steppedInLoop(const llvm::Value *Phi) {
+    llvm::SmallVector<const llvm::Value *, 8> Work{Phi};
+    llvm::SmallPtrSet<const llvm::Value *, 16> Seen;
+    while (!Work.empty()) {
+        const llvm::Value *V = Work.pop_back_val();
+        if (!Seen.insert(V).second) {
+            if (V == Phi) return true;
+            continue;
+        }
+        if (auto *GEP = llvm::dyn_cast<llvm::GEPOperator>(V)) {
+            Work.push_back(GEP->getPointerOperand());
+        } else if (auto *P = llvm::dyn_cast<llvm::PHINode>(V)) {
+            for (const llvm::Use &In : P->incoming_values()) Work.push_back(In.get());
+        } else if (auto *S = llvm::dyn_cast<llvm::SelectInst>(V)) {
+            Work.push_back(S->getTrueValue());
+            Work.push_back(S->getFalseValue());
+        }
+    }
+    return false;
+}
+
+// Whether a read of `Size` bytes at `Ptr`, `Constant` and `Variable` bytes further on, may read
+// part of an offset in the blob as something other than the pointer it stands for.
+bool mayReadOffset(const llvm::DataLayout &DL, const Blob &B, unsigned DecodedKind,
+                   const llvm::Value *Ptr, llvm::APInt Constant,
+                   llvm::SmallMapVector<llvm::Value *, llvm::APInt, 4> Variable,
+                   std::optional<uint64_t> Size, bool AnyOffset,
+                   llvm::SmallPtrSetImpl<const llvm::Value *> &Visiting) {
+    const llvm::Value *Base = Ptr;
+    for (;;) {
+        // A pointer decoded from an offset: into a constant that a pointer in the blob points at.
+        if (auto *I = llvm::dyn_cast<llvm::Instruction>(Base); I && I->getMetadata(DecodedKind))
+            return B.PointedHoldPointers;
+        auto *GEP = llvm::dyn_cast<llvm::GEPOperator>(Base);
+        if (!GEP) break;
+        if (!GEP->collectOffset(DL, Constant.getBitWidth(), Variable, Constant)) return true;
+        Base = GEP->getPointerOperand();
+    }
+    if (Base == B.Global) return readCoversOffset(DL, B, Constant, Variable, Size, AnyOffset);
+    if (llvm::isa<llvm::ConstantPointerNull>(Base) || llvm::isa<llvm::UndefValue>(Base)) return false;
+    auto *Merge = llvm::dyn_cast<llvm::Instruction>(Base);
+    if (Merge && (llvm::isa<llvm::PHINode>(Merge) || llvm::isa<llvm::SelectInst>(Merge))) {
+        // Back at the phi of a loop the walk is in: its other incoming values tell where.
+        if (Visiting.contains(Merge)) return false;
+        bool Stepped = AnyOffset || (llvm::isa<llvm::PHINode>(Merge) && steppedInLoop(Merge));
+        Visiting.insert(Merge);
+        llvm::SmallVector<const llvm::Value *, 4> Incoming;
+        if (auto *P = llvm::dyn_cast<llvm::PHINode>(Merge)) {
+            for (const llvm::Use &In : P->incoming_values()) Incoming.push_back(In.get());
+        } else {
+            Incoming.push_back(Merge->getOperand(1));
+            Incoming.push_back(Merge->getOperand(2));
+        }
+        bool May = llvm::any_of(Incoming, [&](const llvm::Value *In) {
+            return mayReadOffset(DL, B, DecodedKind, In, Constant, Variable, Size, Stepped, Visiting);
+        });
+        Visiting.erase(Merge);
+        return May;
+    }
+    llvm::SmallVector<const llvm::Value *, 4> Objects;
+    llvm::getUnderlyingObjects(Base, Objects, nullptr, 0);
+    return llvm::is_contained(Objects, B.Global);
+}
+
+// A copy or a plain load of the bytes of an offset carries the offset, not the pointer, out of
+// the blob; only the loads of offsets that loadConstantPointers made may read them. The marks
+// come off once the reads have been checked, and the blob becomes constant.
+bool checkOffsetReads(llvm::Module &M, Blob &B, std::string &Err) {
+    if (!B.Global) return true;
+    const llvm::DataLayout &DL = M.getDataLayout();
+    llvm::LLVMContext &Ctx = M.getContext();
+    unsigned OffsetKind = Ctx.getMDKindID(offset_load_kind);
+    unsigned DecodedKind = Ctx.getMDKindID(decoded_kind);
+    for (llvm::Function &F : M) {
+        for (llvm::Instruction &I : llvm::instructions(F)) {
+            llvm::Value *Ptr = nullptr;
+            std::optional<uint64_t> Size;
+            if (auto *L = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+                if (L->getMetadata(OffsetKind)) continue;
+                Ptr = L->getPointerOperand();
+                Size = DL.getTypeStoreSize(L->getType()).getFixedValue();
+            } else if (auto *MT = llvm::dyn_cast<llvm::MemTransferInst>(&I)) {
+                Ptr = MT->getRawSource();
+                if (auto *Length = llvm::dyn_cast<llvm::ConstantInt>(MT->getLength()))
+                    Size = Length->getZExtValue();
+            } else {
+                continue;
+            }
+            llvm::SmallPtrSet<const llvm::Value *, 8> Visiting;
+            llvm::APInt Constant(DL.getIndexTypeSizeInBits(Ptr->getType()), 0);
+            if (!mayReadOffset(DL, B, DecodedKind, Ptr, Constant, {}, Size, false, Visiting)) continue;
+            Err = "air64: " + F.getName().str() +
+                  ": this reads a pointer out of program-scope constant data as plain bytes; on "
+                  "an Apple GPU such a pointer is an offset into the constant data, so the bytes "
+                  "are not the pointer: " +
+                  describe(I);
+            return false;
+        }
+    }
+    for (llvm::Function &F : M) {
+        for (llvm::Instruction &I : llvm::instructions(F)) {
+            I.setMetadata(OffsetKind, nullptr);
+            I.setMetadata(DecodedKind, nullptr);
+        }
+    }
+    B.Global->setConstant(true);
+    return true;
+}
+
+// A table of functions, like an allocator's vtable, that is still used once inlining and folding
+// have turned the calls through it into direct ones: Apple's toolchain relocates no address in
+// constant data, and an Apple GPU makes no call through a function pointer.
+bool checkFunctionTables(llvm::Module &M, std::string &Err) {
+    llvm::ModulePassManager MPM;
+    MPM.addPass(llvm::GlobalDCEPass());
+    runPasses(M, MPM);
+    for (llvm::GlobalVariable &GV : M.globals()) {
+        if (GV.getAddressSpace() != air_constant_address_space || !GV.hasInitializer()) continue;
+        llvm::SmallPtrSet<const llvm::GlobalValue *, 4> Held;
+        addressesIn(GV.getInitializer(), Held);
+        for (const llvm::GlobalValue *Address : Held) {
+            if (!llvm::isa<llvm::Function>(Address)) continue;
+            Err = "air64: the program-scope constant " + GV.getName().str() +
+                  " holds the address of " + describeOperand(*Address) +
+                  ", and a kernel calls through it where inlining did not make the call direct; "
+                  "Apple's GPU toolchain relocates no address in constant data, and an Apple GPU "
+                  "makes no indirect calls";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool moveConstantsToConstantSpace(llvm::Module &M, std::string &Err) {
     if (llvm::none_of(M.globals(), isProgramScopeData)) return true;
     split(M);
-    if (!moveConstants(M, Err)) return false;
+    Blob TheBlob;
+    if (!moveConstants(M, TheBlob, Err)) return false;
     // Each round inlines where a pointer into constant data crossed a call, so that the next
     // one follows it in the caller; the rounds are bounded, since inlining cannot take
-    // recursion apart.
+    // recursion apart. The pointers loaded out of the blob are rewritten before anything else
+    // runs, and again for each level of them that inference reaches.
     for (unsigned Round = 0;; ++Round) {
+        while (loadConstantPointers(M, TheBlob)) inferConstantSpace(M);
         inferConstantSpace(M);
         foldAddressCasts(M);
         if (Round == 32) break;
@@ -323,12 +928,16 @@ bool moveConstantsToConstantSpace(llvm::Module &M, std::string &Err) {
         }
         if (!Inlined) break;
         split(M);
+        // The GlobalDCE of split drops the blob once nothing uses it.
+        TheBlob.Global = M.getGlobalVariable(blob_name, /*AllowInternal=*/true);
     }
-    return checkConstantUses(M, Err);
+    if (!checkConstantUses(M, Err)) return false;
+    if (!checkOffsetReads(M, TheBlob, Err)) return false;
+    return checkFunctionTables(M, Err);
 }
 
 // ---------------------------------------------------------------------------------------
-// 2. Wide multiplies
+// 2. Arithmetic
 // ---------------------------------------------------------------------------------------
 
 using DeadList = llvm::SmallVectorImpl<llvm::WeakTrackingVH>;
@@ -628,7 +1237,55 @@ void expandMulOverflowVector(llvm::IntrinsicInst *II, DeadList &Dead) {
     Dead.push_back(II);
 }
 
-bool expandWideMultiplies(llvm::Module &M, std::string &Err) {
+bool isAddSubOverflow(llvm::Intrinsic::ID ID) {
+    return ID == llvm::Intrinsic::uadd_with_overflow || ID == llvm::Intrinsic::sadd_with_overflow ||
+           ID == llvm::Intrinsic::usub_with_overflow || ID == llvm::Intrinsic::ssub_with_overflow;
+}
+
+// `llvm.{s,u}{add,sub}.with.overflow`, of every width and of vectors: Apple's compiler computes
+// the flag of the signed ones wrong (0 - 10 overflows an i64, it says) and dies on the 8-bit ones
+// (issue #26), so each becomes the operation and a comparison. Unsigned, a sum overflows when it
+// is below an operand, and a difference when the subtrahend is above the minuend; signed, a sum
+// overflows when both operands have the sign that the sum does not, and a difference when the
+// operands' signs differ and the result's sign is not the minuend's.
+void expandAddSubOverflow(llvm::IntrinsicInst *II, DeadList &Dead) {
+    llvm::Intrinsic::ID ID = II->getIntrinsicID();
+    bool Signed =
+        ID == llvm::Intrinsic::sadd_with_overflow || ID == llvm::Intrinsic::ssub_with_overflow;
+    bool Sub = ID == llvm::Intrinsic::usub_with_overflow || ID == llvm::Intrinsic::ssub_with_overflow;
+    llvm::IRBuilder<> B(II);
+    llvm::Value *X = II->getArgOperand(0);
+    llvm::Value *Y = II->getArgOperand(1);
+    llvm::Value *Result = Sub ? B.CreateSub(X, Y) : B.CreateAdd(X, Y);
+    llvm::Value *Overflow;
+    if (!Signed) {
+        Overflow = Sub ? B.CreateICmpULT(X, Y) : B.CreateICmpULT(Result, X);
+    } else {
+        llvm::Value *Signs = Sub ? B.CreateAnd(B.CreateXor(X, Y), B.CreateXor(X, Result))
+                                 : B.CreateAnd(B.CreateXor(X, Result), B.CreateXor(Y, Result));
+        Overflow = B.CreateICmpSLT(Signs, llvm::Constant::getNullValue(X->getType()));
+    }
+    llvm::SmallVector<llvm::User *, 4> Users(II->users());
+    for (llvm::User *User : Users) {
+        auto *EV = llvm::dyn_cast<llvm::ExtractValueInst>(User);
+        if (EV && EV->getNumIndices() == 1) {
+            EV->replaceAllUsesWith(EV->getIndices()[0] == 0 ? Result : Overflow);
+            Dead.push_back(EV);
+            continue;
+        }
+        // A use of the whole pair: rebuild it.
+        llvm::Value *Pair = llvm::PoisonValue::get(II->getType());
+        Pair = B.CreateInsertValue(Pair, Result, {0});
+        Pair = B.CreateInsertValue(Pair, Overflow, {1});
+        User->replaceUsesOfWith(II, Pair);
+    }
+    Dead.push_back(II);
+    // The operation or the flag, when only the other was used.
+    for (llvm::Value *Made : {Result, Overflow})
+        if (auto *I = llvm::dyn_cast<llvm::Instruction>(Made)) Dead.push_back(I);
+}
+
+bool expandArithmetic(llvm::Module &M, std::string &Err) {
     // A Debug build leaves constant operations unfolded, like the zero extension of the shift
     // amount of a u128 `>> 64`, which would hide the shapes matched below.
     {
@@ -647,6 +1304,8 @@ bool expandWideMultiplies(llvm::Module &M, std::string &Err) {
                     ID == llvm::Intrinsic::smul_with_overflow) {
                     if (II->getArgOperand(0)->getType()->getScalarSizeInBits() > 32)
                         Work.push_back(II);
+                } else if (isAddSubOverflow(ID)) {
+                    Work.push_back(II);
                 }
                 continue;
             }
@@ -658,6 +1317,10 @@ bool expandWideMultiplies(llvm::Module &M, std::string &Err) {
     llvm::SmallVector<llvm::WeakTrackingVH, 32> Dead;
     for (llvm::Instruction *I : Work) {
         if (auto *II = llvm::dyn_cast<llvm::IntrinsicInst>(I)) {
+            if (isAddSubOverflow(II->getIntrinsicID())) {
+                expandAddSubOverflow(II, Dead);
+                continue;
+            }
             llvm::Type *T = II->getArgOperand(0)->getType();
             if (T->isIntegerTy() && T->getIntegerBitWidth() <= 64) {
                 expandMulOverflowScalar(II, Dead);
@@ -679,7 +1342,7 @@ bool expandWideMultiplies(llvm::Module &M, std::string &Err) {
     for (llvm::Function &F : llvm::make_early_inc_range(M)) {
         llvm::Intrinsic::ID ID = F.getIntrinsicID();
         if (F.use_empty() && (ID == llvm::Intrinsic::umul_with_overflow ||
-                              ID == llvm::Intrinsic::smul_with_overflow))
+                              ID == llvm::Intrinsic::smul_with_overflow || isAddSubOverflow(ID)))
             F.eraseFromParent();
     }
 
@@ -711,5 +1374,5 @@ bool expandWideMultiplies(llvm::Module &M, std::string &Err) {
 
 bool zigAirLowerLate(llvm::Module &M, std::string &Err) {
     if (!moveConstantsToConstantSpace(M, Err)) return false;
-    return expandWideMultiplies(M, Err);
+    return expandArithmetic(M, Err);
 }

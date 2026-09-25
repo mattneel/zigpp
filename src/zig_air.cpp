@@ -150,8 +150,8 @@ extern "C" int ZigLLVMAirLower(LLVMModuleRef module, const ZigLLVMAirOptions *op
         if (!runPipeline(M, options->opt_level, Err)) return fail(out_error, Err);
 
         // What the pipeline must not see, because it would form it again: constants outside
-        // the constant address space, and multiplies that need a high half Apple's compiler
-        // cannot produce. Moving the constants runs SROA, at opt_level 0 too, and inlines the
+        // the constant address space, multiplies that need a high half Apple's compiler
+        // cannot produce, and the overflow intrinsics of add and subtract that it gets wrong. Moving the constants runs SROA, at opt_level 0 too, and inlines the
         // calls that pointers into constant data cross.
         if (!zigAirLowerLate(M, Err)) return fail(out_error, Err);
 
