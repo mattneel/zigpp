@@ -285,6 +285,7 @@ pub const SymbolKind = enum(u16) {
     defrange_subfield_register = 4419,
     defrange_framepointer_rel_full_scope = 4420,
     defrange_register_rel = 4421,
+    defrange_register_rel_indir = 4471,
     block32 = 4355,
     label32 = 4357,
     objname = 4353,
@@ -310,6 +311,9 @@ pub const SymbolKind = enum(u16) {
     gmandata = 4381,
     lthread32 = 4370,
     gthread32 = 4371,
+    /// A kind of record that a newer PDB writer emits and this list does not name yet. The
+    /// kind is read straight out of the file, and a reader skips what it does not know.
+    _,
 };
 
 pub const TypeIndex = u32;
@@ -441,6 +445,8 @@ pub const DebugSubsectionKind = enum(u32) {
     merged_assembly_input = 0xfc,
 
     coff_symbol_rva = 0xfd,
+    /// A kind of subsection that a newer PDB writer emits and this list does not name yet.
+    _,
 };
 
 pub const DebugSubsectionHeader = extern struct {
