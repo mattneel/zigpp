@@ -27,7 +27,7 @@ the compiler was written by upstream Zig contributors.
   Upstream closed the [proposal](https://github.com/ziglang/zig/issues/9909) as
   not planned.
 - **LLVM forever**, and a blessed path to GPUs: `std.gpu` runs Zig++ and its
-  standard library on NVIDIA and AMD GPUs. See [LLVM Is Forever](#llvm-is-forever).
+  standard library on NVIDIA, AMD, and Apple GPUs. See [LLVM Is Forever](#llvm-is-forever).
 - **AI in the toolchain.** See [AI Policy](#ai-policy).
 - **Any Zig version, automatically.** A project's `build.zig.zon` can pin the
   exact compiler version it is built with, and `zig` runs that version instead
@@ -36,7 +36,8 @@ the compiler was written by upstream Zig contributors.
 - **A BDFL and one rule: talk about code.** See [Governance](#governance).
 
 **Does Zig++ compile to Zig, the way TypeScript compiles to JavaScript?** No.
-It compiles to machine code, C, WebAssembly, PTX, and AMD GPU code objects.
+It compiles to machine code, C, WebAssembly, PTX, AMD GPU code objects, and
+Metal libraries.
 
 **Is Zig++ stable?** Zig++ follows semantic versioning exactly as closely as
 TypeScript does.
@@ -52,9 +53,10 @@ Upstream Zig plans to drop its dependency on the LLVM libraries. Zig++ will
 never phase out LLVM. In `package.json` terms, LLVM stays in `dependencies`.
 
 LLVM, and MLIR above it, are how Zig++ goes the final stretch on GPUs. The
-blessed path lowers Zig++ directly to PTX and to AMD GPU code objects, with
-first-class GPU intrinsics, and its first leg works today: `std.gpu`, a port of
-[ugpu](https://github.com/mattneel/ugpu) into the standard library.
+blessed path lowers Zig++ directly to PTX, to AMD GPU code objects, and to Metal
+libraries, with first-class GPU intrinsics, and its first leg works today:
+`std.gpu`, a port of [ugpu](https://github.com/mattneel/ugpu) into the standard
+library.
 
 - Kernels are plain Zig functions. `std.gpu` has CUDA's indexing (`threadIdx`,
   `blockIdx`, `blockDim`, `gridDim`, `globalId`), `syncThreads` (the new
@@ -72,6 +74,10 @@ first-class GPU intrinsics, and its first leg works today: `std.gpu`, a port of
   the CUDA toolkit, and launches kernels from the host. `std.gpu.hip` does the
   same with the HIP runtime of AMD GPUs, on Linux and on Windows, where it needs
   no libc.
+- `std.gpu.metal` loads the Metal framework at run time and runs kernels that
+  Zig++ compiles for the `air64` target into a `.metallib`, in process, with no
+  Xcode, Metal toolchain, or macOS SDK. Apple GPUs have no `f64`, no `print`,
+  and only relaxed atomics, which are compile errors in their kernels.
 
 ```zig
 // kernels.zig
@@ -129,8 +135,17 @@ A code object only runs on the architecture that `-mcpu` names, which
 [test/standalone/gpu](test/standalone/gpu) builds the kernels both ways and
 runs every ugpu example on NVIDIA and AMD GPUs.
 
-Still to come: MLIR lowering for tensor cores and kernel fusion, and GPUs
-beyond NVIDIA's and AMD's.
+For Apple GPUs, the kernels compile to a Metal library, and the host program
+uses `std.gpu.metal`:
+
+```sh
+zig build-obj -target air64-macos -O ReleaseFast -femit-bin=kernels.metallib kernels.zig
+```
+
+The suite runs a vector add, a reduction, and a kernel with scalar arguments on
+the GPU of a Mac, which CI's macOS runners provide.
+
+Still to come: MLIR lowering for tensor cores and kernel fusion.
 
 ## AI Policy
 

@@ -21,7 +21,7 @@ where this book's sources live as `doc/book/`.
   from the file that declares its type. See
   [Private fields](what-zigpp-adds.md#private-fields).
 - **LLVM forever**, and a blessed path to GPUs: `std.gpu` runs Zig++ and its
-  standard library on NVIDIA and AMD GPUs. See
+  standard library on NVIDIA, AMD, and Apple GPUs. See
   [LLVM is forever](what-zigpp-adds.md#llvm-is-forever) and
   [GPU Programming](gpu.md).
 - **AI in the toolchain.** See [AI Policy and Governance](ai-policy.md).
@@ -34,7 +34,8 @@ where this book's sources live as `doc/book/`.
 ## Questions people ask
 
 **Does Zig++ compile to Zig, the way TypeScript compiles to JavaScript?** No.
-It compiles to machine code, C, WebAssembly, PTX, and AMD GPU code objects.
+It compiles to machine code, C, WebAssembly, PTX, AMD GPU code objects, and
+Metal libraries.
 
 **Is Zig++ stable?** Zig++ follows semantic versioning exactly as closely as
 TypeScript does. The compiler is at `0.17.0-dev`, every push to master is a
@@ -59,7 +60,7 @@ the autodocs and opens a browser tab.
 1. [Installing](installing.md) — download a release, check its SHA256SUMS, and
    run `zig`.
 2. [What Zig++ Adds](what-zigpp-adds.md) — private fields, LLVM, `std.gpu`.
-3. [GPU Programming](gpu.md) — kernels, the CUDA and HIP host APIs, and the
-   standalone test that runs them.
+3. [GPU Programming](gpu.md) — kernels, the CUDA, HIP, and Metal host APIs,
+   and the standalone test that runs them.
 4. [Building from Source](building-from-source.md) — the CMake build, the
    bootstrap compiler, and the devkits that CI uses.
