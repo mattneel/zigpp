@@ -22,16 +22,14 @@
 //! An Apple GPU takes its threadgroup memory from the pipeline, so a kernel that uses it declares
 //! it as a static variable in the `shared` address space, and the runtime finds its size when it
 //! builds the pipeline.
+//!
+//! There is no `panic` declaration here: on `air64` the default panic namespace is
+//! `std.debug.no_panic`, because the GPU has no `printf` and no `__assertfail` to report a message
+//! with. A failed safety check traps, which stops the launch and leaves the results unwritten, and
+//! the host reports a mismatch.
 
 const std = @import("std");
 const gpu = std.gpu;
-
-/// Kernels run on a GPU that has no `printf` and no `__assertfail`, and `std.gpu` makes both of
-/// them compile errors. What a kernel that fails its own check needs is a trap, which is what
-/// `no_panic` is: it stops the launch and leaves the results unwritten, which the host reports as
-/// a mismatch. Without it a Debug build of these kernels would not compile, because the checks
-/// that such a build inserts reach for the standard panic handler.
-pub const panic = std.debug.no_panic;
 
 /// Threads in a threadgroup of `reduce`: 256, like the block size of the reduction examples of the
 /// CUDA and AMD kernels.
