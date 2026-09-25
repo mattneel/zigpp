@@ -2,6 +2,7 @@
 """Writes the cumulative download index of Zig++ and the book's Downloads page.
 
     .github/scripts/downloads.py --releases <dir> --page <file> --index <file>
+        [--published <file>]
 
 Every release publishes an index.json in the format of upstream's
 https://ziglang.org/download/index.json: one "master" entry that names the
@@ -11,11 +12,18 @@ them into one cumulative index, newest first, and writes the Downloads chapter
 of the book from the same entries: the newest release, one section per release
 with a table of its archives and their hashes, and how to verify a download.
 
+An index carries only the date of a release, and a day can have several. The
+page shows when each release was published, in UTC, from a file of lines that
+each hold a tag and its release's publication time, separated by a tab: what
+the releases API reports as tag_name and published_at. A release the file does
+not name shows its index's date.
+
 mdbook renders the page, which is why it is plain CommonMark, and why no table
 holds a hash: a 64-character cell is far too wide for the page.
 """
 
 import argparse
+import datetime
 import json
 import os
 import sys
@@ -71,6 +79,12 @@ def parse_args():
         metavar="OWNER/REPO",
         help="owner/repo of the releases, when no archive URL names it",
     )
+    parser.add_argument(
+        "--published",
+        default=None,
+        metavar="FILE",
+        help="tab-separated lines of a tag and its release's publication time (ISO 8601)",
+    )
     return parser.parse_args()
 
 
@@ -103,6 +117,23 @@ def read_releases(directory):
         if name.endswith(".json") and os.path.isfile(path):
             entries.append(read_release(path))
     return entries
+
+
+def read_published(path):
+    """The publication time of each release by its tag, from a file of tab-separated lines."""
+    if path is None:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as file:
+            lines = file.read().splitlines()
+    except OSError as error:
+        sys.exit(f"{path}: cannot read: {error.strerror or error}")
+    published = {}
+    for line in lines:
+        tag, _, time = line.partition("\t")
+        if tag and time:
+            published[tag] = time
+    return published
 
 
 def version_key(entry):
@@ -162,6 +193,20 @@ def release_source(release, repo):
     return repo, "zigpp-" + release.get("version", "").partition("+")[0]
 
 
+def release_time(release, repo, published):
+    """When a release was published, as a UTC date and time, or its index's date if unknown."""
+    time = published.get(release_source(release, repo)[1])
+    if time:
+        try:
+            moment = datetime.datetime.fromisoformat(time.replace("Z", "+00:00"))
+        except ValueError:
+            sys.exit(f"{time}: not an ISO 8601 time")
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=datetime.timezone.utc)
+        return moment.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return release.get("date", "")
+
+
 def file_name(tarball):
     """The archive file name in a tarball URL, percent-decoded."""
     return urllib.parse.unquote(tarball.rsplit("/", 1)[-1]) if tarball else ""
@@ -201,13 +246,13 @@ def details_block(installing):
     ]
 
 
-def release_section(release, repo):
-    """One release's section: its date, its page, its archives, and their hashes."""
+def release_section(release, repo, published):
+    """One release's section: when it was published, its page, its archives, and their hashes."""
     owner, tag = release_source(release, repo)
     lines = [
         f"## {release.get('version', '')}",
         "",
-        f"{release.get('date', '')} · "
+        f"{release_time(release, repo, published)} · "
         f"[{tag}](https://github.com/{owner}/releases/tag/{urllib.parse.quote(tag)})",
         "",
     ]
@@ -230,7 +275,7 @@ def release_section(release, repo):
     return lines
 
 
-def render_page(releases, repo, installing):
+def render_page(releases, repo, installing, published):
     """The Downloads chapter: the newest release, then every release's section."""
     lines = ["# Downloads", ""]
     index_link = (
@@ -242,13 +287,13 @@ def render_page(releases, repo, installing):
         lines += [
             "Zig++ publishes a release on every push to master, for x86_64-linux, aarch64-linux,",
             "aarch64-macos, and x86_64-windows. The newest is "
-            f"{newest.get('version', '')}, published {newest.get('date', '')}.",
+            f"{newest.get('version', '')}, published {release_time(newest, repo, published)}.",
             "",
             *details_block(installing),
             "",
         ]
         for release in releases:
-            lines += release_section(release, repo)
+            lines += release_section(release, repo, published)
         lines += [
             "## Verifying a download",
             "",
@@ -302,7 +347,9 @@ def main():
         for release in releases:
             index[release.get("version", "")] = release
     write_text(args.index, json.dumps(index, indent=2) + "\n")
-    write_text(args.page, render_page(releases, repo, has_chapter(args.page, "installing.md")))
+    published = read_published(args.published)
+    installing = has_chapter(args.page, "installing.md")
+    write_text(args.page, render_page(releases, repo, installing, published))
 
 
 if __name__ == "__main__":
