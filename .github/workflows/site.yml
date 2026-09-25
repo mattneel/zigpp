@@ -62,25 +62,29 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       # Every release carries the index.json it was published with. Collecting
-      # them turns into the cumulative index and the Downloads chapter.
+      # them turns into the cumulative index and the Downloads chapter. An index
+      # dates its release by day only, so the tag and publication time of every
+      # release go beside them, for the page to say when each one came out.
       - name: Collect the index of every release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p dist-index
           gh api --paginate "repos/${{ github.repository }}/releases?per_page=100" \
-            --jq '.[] | select(.tag_name | startswith("zigpp-")) | .tag_name' > tags.txt
-          while read -r tag; do
+            --jq '.[] | select(.tag_name | startswith("zigpp-")) | [.tag_name, .published_at // ""] | @tsv' \
+            > published.tsv
+          while IFS=$'\t' read -r tag published; do
             url="https://github.com/${{ github.repository }}/releases/download/$tag/index.json"
             curl -fsSL -o "dist-index/$tag.json" "$url"
-            echo "$tag"
-          done < tags.txt
+            echo "$tag $published"
+          done < published.tsv
 
       - name: Write the download index and the Downloads chapter
         run: |
           mkdir -p _site/download
           python3 .github/scripts/downloads.py \
             --releases dist-index \
+            --published published.tsv \
             --page doc/book/src/downloads.md \
             --index _site/download/index.json
 
