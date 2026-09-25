@@ -129,9 +129,25 @@ Zig++ devkit, whose LLVM is 23.1.2.
 
 ## How CI builds Zig++
 
-Zig++'s CI does not install LLVM. It downloads the x86_64-linux-musl devkit,
-caches it under `~/deps`, and runs the CMake build with the devkit's Zig++ as
-the C and C++ compiler and the devkit's libraries as the search prefix:
+Zig++'s CI does not install LLVM. `.github/scripts/bootstrap.sh` downloads the
+devkit of the runner, `x86_64-linux-musl` on `ubuntu-24.04` and
+`aarch64-macos-none` on `macos-latest`, and caches it under `~/deps`. It then
+builds the compiler with the newest Zig++ release, against this checkout's
+`lib/`; on the Linux runner, that is:
+
+```sh
+ZIG_LIB_DIR="$PWD/lib" "$RELEASE/zig" build \
+  --prefix build-bootstrap/stage3 \
+  --search-prefix "$PREFIX" \
+  -Dtarget=x86_64-linux-musl -Dcpu=baseline \
+  -Denable-llvm -Dstatic-llvm -Duse-zig-libcxx \
+  -Doptimize=ReleaseFast -Dstrip -Dno-lib
+```
+
+When there is no release, when `stage1/zig1.wasm` changed since the release's
+commit, or when the release cannot build the checkout, it bootstraps from
+source instead: the CMake build, with the devkit's Zig++ as the C and C++
+compiler and the devkit's libraries as the search prefix:
 
 ```sh
 cmake .. \
@@ -148,10 +164,10 @@ cmake .. \
 ninja install
 ```
 
-`-DZIG_NO_LIB=ON` leaves `lib/` to the checkout, so the scripts point
-`ZIG_LIB_DIR` at this repository's `lib/`. The compiler that comes out is
-`build-bootstrap/stage3/bin/zig`, and the release workflow cross-compiles
-every target's archive with it.
+Either way, `lib/` stays in the checkout, so the scripts point `ZIG_LIB_DIR` at
+this repository's `lib/`. The compiler that comes out is
+`build-bootstrap/stage3/bin/zig`, and the release workflow cross-compiles every
+target's archive with it.
 
 ## Building without LLVM
 

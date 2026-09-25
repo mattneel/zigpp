@@ -125,8 +125,8 @@ produce a real Zig++ compiler. See
 [Building from Source](building-from-source.md).
 
 LLVM, and MLIR above it, are how Zig++ goes the final stretch on GPUs: the
-blessed path lowers Zig++ directly to PTX and to AMD GPU code objects, with
-first-class GPU intrinsics.
+blessed path lowers Zig++ directly to PTX, to AMD GPU code objects, and to Metal
+libraries, with first-class GPU intrinsics.
 
 ## `std.gpu`
 
@@ -151,10 +151,14 @@ the standard library as long as they avoid operating system services:
   the CUDA toolkit, and launches kernels from the host. `std.gpu.hip` does the
   same with the HIP runtime of AMD GPUs, on Linux and on Windows, where it
   needs no libc.
+- `std.gpu.metal` loads the Metal framework at run time and runs kernels that
+  Zig++ compiles for the `air64` target into a `.metallib`, in process, with no
+  Xcode, Metal toolchain, or macOS SDK. Apple GPUs have no `f64`, no `print`,
+  and only relaxed atomics, which are compile errors in their kernels.
 
 [GPU Programming](gpu.md) covers the device API, the host APIs, and how to
 build and run the kernels. Still to come: MLIR lowering for tensor cores and
-kernel fusion, and GPUs beyond NVIDIA's and AMD's.
+kernel fusion.
 
 ## AI in the toolchain
 
