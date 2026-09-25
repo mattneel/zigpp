@@ -1395,17 +1395,6 @@ test isSameFile {
     // The same path, byte for byte.
     try std.testing.expect(isSameFile(io, gpa, installed_exe, installed_exe));
 
-    // A path that reaches the file through a symlinked directory.
-    const link_path = try Dir.path.join(gpa, &.{ dir_path, "..", "link-to-the-cache" });
-    defer gpa.free(link_path);
-    Dir.cwd().deleteTree(io, link_path) catch {};
-    try Dir.cwd().symLink(io, dir_path, link_path, .{ .is_directory = true });
-    defer Dir.cwd().deleteTree(io, link_path) catch {};
-    const via_link = try Dir.path.join(gpa, &.{ link_path, "zig" });
-    defer gpa.free(via_link);
-    try std.testing.expect(isSameFile(io, gpa, installed_exe, via_link));
-    try std.testing.expect(isSameFile(io, gpa, via_link, installed_exe));
-
     // Another file, and a path that is not there at all, are not the same.
     try tmp.dir.writeFile(io, .{ .sub_path = "other", .data = "another compiler" });
     const other_exe = try Dir.path.join(gpa, &.{ dir_path, "other" });
@@ -1417,6 +1406,22 @@ test isSameFile {
     try std.testing.expect(!isSameFile(io, gpa, missing, other_exe));
     // The same name is the same name, whether or not anything is at it.
     try std.testing.expect(isSameFile(io, gpa, missing, missing));
+
+    // A path that reaches the file through a symlinked directory.
+    const link_path = try Dir.path.join(gpa, &.{ dir_path, "..", "link-to-the-cache" });
+    defer gpa.free(link_path);
+    Dir.cwd().deleteTree(io, link_path) catch {};
+    Dir.cwd().symLink(io, dir_path, link_path, .{ .is_directory = true }) catch |err| switch (err) {
+        // On Windows, a symlink takes Developer Mode or an administrator, and a file system
+        // that supports it.
+        error.AccessDenied, error.PermissionDenied, error.FileSystem => if (builtin.os.tag == .windows) return error.SkipZigTest else return err,
+        else => return err,
+    };
+    defer Dir.cwd().deleteTree(io, link_path) catch {};
+    const via_link = try Dir.path.join(gpa, &.{ link_path, "zig" });
+    defer gpa.free(via_link);
+    try std.testing.expect(isSameFile(io, gpa, installed_exe, via_link));
+    try std.testing.expect(isSameFile(io, gpa, via_link, installed_exe));
 }
 
 pub const Directories = struct {
