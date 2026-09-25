@@ -178,9 +178,9 @@ context usable.
 
 On Apple GPUs, both functions are compile errors, and the error names the
 reason: Metal has neither `printf` nor `__assertfail`. The default panic
-handler does not call them there either, so an Apple kernel that a Debug build
-checks installs its own `panic` handler, as the kernels of the test do with
-`std.debug.no_panic`.
+namespace of an `air64` module is therefore `std.debug.no_panic`: a failed
+safety check traps without formatting a message, which stops the launch and
+leaves its results unwritten.
 
 ### Allocators
 

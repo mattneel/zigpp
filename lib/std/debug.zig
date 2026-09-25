@@ -513,6 +513,10 @@ pub fn defaultPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
 
     if (use_trap_panic) @trap();
 
+    // An Apple GPU has neither `printf` nor `__assertfail` to report the message with, and its
+    // target names macOS, whose case below is the host's.
+    if (builtin.cpu.arch == .air64) @trap();
+
     switch (builtin.os.tag) {
         .freestanding,
         .other,

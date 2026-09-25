@@ -1376,6 +1376,9 @@ pub const panic: type = p: {
         }
         break :p root.panic;
     }
+    // An Apple GPU has nowhere to report a message, neither `printf` nor `__assertfail`, so its
+    // safety panics trap without formatting one.
+    if (builtin.cpu.arch == .air64) break :p std.debug.no_panic;
     break :p switch (builtin.zig_backend) {
         .stage2_loongarch,
         .stage2_powerpc,
