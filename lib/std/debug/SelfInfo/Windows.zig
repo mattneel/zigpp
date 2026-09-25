@@ -413,13 +413,29 @@ const Module = struct {
         // a binary is produced with -gdwarf, since the section names are longer than 8 bytes.
         const mapped_file: ?DebugInfo.MappedFile = mapped: {
             if (!coff_obj.strtabRequired()) break :mapped null;
-            var path_buffer: [4 + windows.PATH_MAX_WIDE]u16 = undefined;
-            path_buffer[0..4].* = .{ '\\', '?', '?', '\\' }; // openFileAbsoluteW requires the prefix to be present
+            // The loader's name for the module is a Win32 path: `C:\...` for a local file, and
+            // `\\server\share\...` for one on a network share (a program run out of a WSL
+            // checkout loads its DLLs from `\\wsl.localhost\...`), which is `\??\UNC\...` in
+            // the NT namespace that the file has to be opened in.
+            var path_buffer: [windows.PATH_MAX_WIDE:0]u16 = undefined;
             const path_slice = module.entry.FullDllName.slice();
-            @memcpy(path_buffer[4..][0..path_slice.len], path_slice);
+            if (path_slice.len > path_buffer.len) return error.InvalidDebugInfo;
+            @memcpy(path_buffer[0..path_slice.len], path_slice);
+            path_buffer[path_slice.len] = 0;
+            const nt_path = Io.Threaded.wToPrefixedFileW(
+                null,
+                path_buffer[0..path_slice.len :0],
+                .{ .allow_relative = false },
+            ) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                error.Unexpected => |e| return e,
+                error.FileNotFound => return error.MissingDebugInfo,
+                error.NameTooLong, error.BadPathName => return error.InvalidDebugInfo,
+                error.AccessDenied => return error.ReadFailed,
+            };
             const coff_file = Io.Threaded.dirOpenFileWtf16(
                 null,
-                path_buffer[0 .. 4 + path_slice.len],
+                nt_path.span(),
                 .{},
             ) catch |err| switch (err) {
                 error.Canceled => |e| return e,
