@@ -30,9 +30,10 @@ const ws2_32 = windows.ws2_32;
 /// * memory-mapping when mmap or equivalent is not available
 allocator: Allocator,
 mutex: Io.Mutex = .init,
-cond: Io.Condition = .init,
-run_queue: std.SinglyLinkedList = .{},
-join_requested: bool = false,
+/// Tasks spawned by threads that are not workers of this pool, and the overflow of the workers'
+/// own queues.
+run_queue: RunQueue = .{},
+join_requested: std.atomic.Value(bool) = .init(false),
 stack_size: usize,
 /// All threads are spawned detached; this is how we wait until they all exit.
 wait_group: WaitGroup = .init,
@@ -40,10 +41,13 @@ async_limit: Io.Limit,
 concurrent_limit: Io.Limit = .unlimited,
 /// Error from calling `std.Thread.getCpuCount` in `init`.
 cpu_count_error: ?std.Thread.CpuCountError,
-/// Number of threads that are unavailable to take tasks. To calculate
-/// available count, subtract this from either `async_limit` or
-/// `concurrent_limit`.
-busy_count: usize = 0,
+/// Number of tasks that are queued or running. A task may block the worker running it for as
+/// long as it likes, so this is what `async_limit` and `concurrent_limit` limit, and there are
+/// always at least as many workers.
+busy_count: std.atomic.Value(usize) align(std.atomic.cache_line) = .init(0),
+/// Number of workers, counting those being started.
+worker_count: std.atomic.Value(usize) align(std.atomic.cache_line) = .init(0),
+idle: Idle = .{},
 worker_threads: std.atomic.Value(?*Thread),
 pid: Pid = .unknown,
 
@@ -832,6 +836,18 @@ const Thread = struct {
     park_tid: if (ParkTid == std.Thread.Id) void else ParkTid,
 
     csprng: Csprng,
+
+    /// The pool this thread is a worker of.
+    pool: *Threaded,
+    /// The task this worker spawned last, which it runs next. Other workers take it only once
+    /// this worker's queue is empty: the likeliest reason it is still here then is that this
+    /// worker is blocked, awaiting it for instance.
+    run_next: std.atomic.Value(?*Runnable),
+    /// The rest of the tasks this worker spawned, oldest first.
+    runq: LocalQueue,
+    /// Where this worker starts when it looks through the other workers' queues, so that
+    /// thieves spread out.
+    steal_start: usize,
 
     const Handle = Handle: {
         if (std.Thread.use_pthreads) break :Handle std.c.pthread_t;
@@ -1706,9 +1722,7 @@ var global_single_threaded_instance: Threaded = .init_single_threaded;
 pub const global_single_threaded: *Threaded = &global_single_threaded_instance;
 
 pub fn setAsyncLimit(t: *Threaded, new_limit: Io.Limit) void {
-    mutexLock(&t.mutex);
-    defer mutexUnlock(&t.mutex);
-    t.async_limit = new_limit;
+    @atomicStore(Io.Limit, &t.async_limit, new_limit, .monotonic);
 }
 
 pub fn deinit(t: *Threaded) void {
@@ -1726,12 +1740,8 @@ pub fn deinit(t: *Threaded) void {
 
 fn join(t: *Threaded) void {
     if (builtin.single_threaded) return;
-    {
-        mutexLock(&t.mutex);
-        defer mutexUnlock(&t.mutex);
-        t.join_requested = true;
-    }
-    condBroadcast(&t.cond);
+    t.join_requested.store(true, .release);
+    t.wake(std.math.maxInt(u32));
     t.wait_group.wait();
 }
 
@@ -1752,6 +1762,10 @@ fn worker(t: *Threaded) void {
         .unpark_flag = unpark_flag_init,
         .park_tid = if (ParkTid == std.Thread.Id) {} else getParkTid(),
         .csprng = .uninitialized,
+        .pool = t,
+        .run_next = .init(null),
+        .runq = .{},
+        .steal_start = 0,
     };
     Thread.current = &thread;
 
@@ -1789,21 +1803,349 @@ fn worker(t: *Threaded) void {
 
     defer t.wait_group.finish();
 
-    mutexLock(&t.mutex);
-    defer mutexUnlock(&t.mutex);
-
-    while (true) {
-        while (t.run_queue.popFirst()) |runnable_node| {
-            mutexUnlock(&t.mutex);
-            thread.cancel_protection = .unblocked;
-            const runnable: *Runnable = @fieldParentPtr("node", runnable_node);
-            runnable.startFn(runnable, &thread, t);
-            mutexLock(&t.mutex);
-            t.busy_count -= 1;
-        }
-        if (t.join_requested) break;
-        condWait(&t.cond, &t.mutex);
+    var tick: u32 = 0;
+    while (t.nextRunnable(&thread, &tick)) |runnable| {
+        thread.cancel_protection = .unblocked;
+        runnable.startFn(runnable, &thread, t);
+        _ = t.busy_count.fetchSub(1, .seq_cst);
     }
+
+    // The pool is being joined. Other workers read this worker's queues while they look for work,
+    // and those are on this stack, so no worker returns until all of them have stopped looking.
+    const workers: u32 = @intCast(t.worker_count.load(.monotonic));
+    var stopped = t.idle.stopped.fetchAdd(1, .acq_rel) + 1;
+    if (stopped == workers) {
+        Thread.futexWake(&t.idle.stopped.raw, std.math.maxInt(u32));
+    } else while (stopped != workers) {
+        Thread.futexWaitUncancelable(&t.idle.stopped.raw, stopped, null);
+        stopped = t.idle.stopped.load(.acquire);
+    }
+}
+
+/// A worker that runs out of tasks looks this many times through the other workers' queues, while
+/// some queued task may have no worker on its way to it, before it parks.
+const search_rounds = 4;
+
+/// The first worker to start searching also spins this many times, checking cheaply for work,
+/// before it parks. Spawners wake nobody while a worker searches, so a spawner that spawns tasks
+/// faster than a parked worker wakes up does not pay for a wake per task.
+const spin_limit = 256;
+
+/// Tasks spawned by threads that are not workers of this pool, and the overflow of the workers'
+/// own queues, oldest first.
+const RunQueue = struct {
+    mutex: Io.Mutex align(std.atomic.cache_line) = .init,
+    head: ?*Runnable = null,
+    tail: ?*Runnable = null,
+    /// Written under `mutex`; read without it to see whether there is anything to take.
+    len: std.atomic.Value(usize) = .init(0),
+
+    /// Appends the `n` runnables linked from `first` to `last` through `Runnable.node`, and
+    /// returns whether the queue was empty.
+    fn push(q: *RunQueue, first: *Runnable, last: *Runnable, n: usize) bool {
+        last.node.next = null;
+        mutexLock(&q.mutex);
+        defer mutexUnlock(&q.mutex);
+        if (q.tail) |tail| tail.node.next = &first.node else q.head = first;
+        q.tail = last;
+        const len = q.len.raw;
+        q.len.store(len + n, .seq_cst); // see `notify`
+        return len == 0;
+    }
+};
+
+/// A worker's own queue of the tasks it spawned. Only that worker pushes. It takes from the front
+/// one at a time, and other workers take half of the queue at a time.
+const LocalQueue = struct {
+    head: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
+    tail: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
+    slots: [capacity]?*Runnable align(std.atomic.cache_line) = @splat(null),
+
+    const capacity = 256;
+
+    // A worker may read a slot for a runnable that another worker takes first, so every access
+    // to the slots is atomic.
+    fn load(q: *LocalQueue, index: u32) *Runnable {
+        return @atomicLoad(?*Runnable, &q.slots[index % capacity], .unordered).?;
+    }
+    fn store(q: *LocalQueue, index: u32, runnable: *Runnable) void {
+        @atomicStore(?*Runnable, &q.slots[index % capacity], runnable, .unordered);
+    }
+
+    /// Owner only. Appends `runnable`. When the queue is full, moves its older half and
+    /// `runnable` to `overflow` instead.
+    fn push(q: *LocalQueue, runnable: *Runnable, overflow: *RunQueue) void {
+        while (true) {
+            const head = q.head.load(.acquire); // acquire: other workers are done with their slots
+            const tail = q.tail.raw;
+            if (tail -% head < capacity) {
+                q.store(tail, runnable);
+                q.tail.store(tail +% 1, .seq_cst); // release the slot; `.seq_cst`: see `notify`
+                return;
+            }
+            const n = (tail -% head) / 2;
+            var batch: [capacity / 2 + 1]*Runnable = undefined;
+            for (batch[0..n], 0..) |*b, i| b.* = q.load(head +% @as(u32, @intCast(i)));
+            // Take them the way another worker would. If one got there first, there is room now.
+            if (q.head.cmpxchgStrong(head, head +% n, .acq_rel, .monotonic) != null) continue;
+            batch[n] = runnable;
+            for (batch[0..n], batch[1 .. n + 1]) |b, next| b.node.next = &next.node;
+            _ = overflow.push(batch[0], batch[n], n + 1);
+            return;
+        }
+    }
+
+    /// Owner only. Takes the oldest runnable.
+    fn pop(q: *LocalQueue) ?*Runnable {
+        var head = q.head.load(.acquire);
+        while (head != q.tail.raw) {
+            const runnable = q.load(head);
+            head = q.head.cmpxchgWeak(head, head +% 1, .acq_rel, .acquire) orelse return runnable;
+        }
+        return null;
+    }
+
+    /// Owner of `q` only, and only while `q` is empty. Moves the older half of `victim`'s
+    /// runnables, rounded up, into `q` without publishing them, and returns how many.
+    fn grab(q: *LocalQueue, victim: *LocalQueue) u32 {
+        const tail = q.tail.raw;
+        while (true) {
+            const victim_head = victim.head.load(.acquire);
+            const victim_tail = victim.tail.load(.seq_cst); // see `notify`
+            const available = victim_tail -% victim_head;
+            const n = available - available / 2;
+            if (n == 0) return 0;
+            if (n > capacity / 2) continue; // `victim_head` was read before `victim_tail` moved on
+            for (0..n) |i| {
+                const offset: u32 = @intCast(i);
+                q.store(tail +% offset, victim.load(victim_head +% offset));
+            }
+            if (victim.head.cmpxchgWeak(victim_head, victim_head +% n, .acq_rel, .monotonic) == null) return n;
+        }
+    }
+};
+
+const Idle = struct {
+    /// Workers looking through the other workers' queues.
+    searching: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
+    /// Workers waiting on `epoch`, or about to.
+    parked: std.atomic.Value(u32) = .init(0),
+    /// Incremented to wake parked workers.
+    epoch: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
+    /// Workers that have stopped for good because the pool is being joined.
+    stopped: std.atomic.Value(u32) = .init(0),
+};
+
+/// Counts one more queued or running task against `limit`, and starts a worker if there are no
+/// more workers than such tasks already. Returns `false`, having counted nothing, if the limit is
+/// reached or a worker could not be started.
+fn reserve(t: *Threaded, limit: Io.Limit) bool {
+    // `.seq_cst`: see `anyPending`.
+    var busy = t.busy_count.load(.seq_cst);
+    while (true) {
+        if (busy >= @backingInt(limit)) return false;
+        busy = t.busy_count.cmpxchgWeak(busy, busy + 1, .seq_cst, .seq_cst) orelse break;
+    }
+    var workers = t.worker_count.load(.monotonic);
+    while (workers <= busy) {
+        workers = t.worker_count.cmpxchgWeak(workers, workers + 1, .monotonic, .monotonic) orelse {
+            t.wait_group.start();
+            const thread = std.Thread.spawn(.{ .stack_size = t.stack_size }, worker, .{t}) catch {
+                t.wait_group.finish();
+                _ = t.worker_count.fetchSub(1, .monotonic);
+                _ = t.busy_count.fetchSub(1, .seq_cst);
+                return false;
+            };
+            thread.detach();
+            return true;
+        };
+    }
+    return true;
+}
+
+/// Queues `runnable`, counted by `reserve`: on the calling thread's own queue if it is a worker of
+/// this pool, on the shared queue otherwise.
+fn enqueue(t: *Threaded, runnable: *Runnable) void {
+    if (Thread.current) |thread| {
+        if (thread.pool == t) {
+            // The newest task goes where this worker looks first. The one it displaces goes to the
+            // back of this worker's queue.
+            if (thread.run_next.swap(runnable, .seq_cst)) |displaced| { // `.seq_cst`: see `notify`
+                thread.runq.push(displaced, &t.run_queue);
+            }
+            return t.notify();
+        }
+    }
+    // Only the task that makes the shared queue non-empty wakes a worker. Whoever takes from the
+    // queue and leaves some behind wakes the next one, so a thread spawning many tasks does not
+    // pay for waking a worker for each.
+    if (t.run_queue.push(runnable, runnable, 1)) t.notify();
+}
+
+/// Wakes a parked worker to take what was just queued, unless a worker is already looking.
+///
+/// Queueing is a `.seq_cst` store after a `.seq_cst` update of `busy_count`, and the loads here
+/// are `.seq_cst`. A worker about to park announces it with a `.seq_cst` update, then counts the
+/// busy tasks and looks at the queues with `.seq_cst` loads. So either this sees the worker
+/// searching or parked, or the worker sees the new task.
+fn notify(t: *Threaded) void {
+    if (t.idle.searching.load(.seq_cst) != 0) return;
+    if (t.idle.parked.load(.seq_cst) == 0) return;
+    t.wake(1);
+}
+
+/// Whether some queued task may have no worker on its way to it: whether there are more queued
+/// and running tasks than workers that are neither parked nor searching. Each of those is running
+/// a task or about to look for one, so a queued task can go unaccounted for here only while some
+/// worker is between the two, and the last worker to become idle sees every task.
+///
+/// Every update of `busy_count` and of the idle counters is `.seq_cst`, as are the loads here, so
+/// a worker checking this after announcing that it is idle counts every task whose spawner did
+/// not see it idle.
+fn anyPending(t: *Threaded) bool {
+    const idle = t.idle.parked.load(.seq_cst) + t.idle.searching.load(.seq_cst);
+    return t.busy_count.load(.seq_cst) + idle > t.worker_count.load(.seq_cst);
+}
+
+/// Wakes a parked worker if some queued task may have no worker on its way to it. A searching
+/// worker that finds a task calls this when it stops searching, because spawners wake nobody while
+/// a worker searches, and it takes only one task.
+fn wakeIfPending(t: *Threaded) void {
+    if (t.idle.parked.load(.seq_cst) == 0) return;
+    if (t.idle.searching.load(.seq_cst) != 0) return;
+    if (t.anyPending()) t.wake(1);
+}
+
+fn wake(t: *Threaded, n: u32) void {
+    _ = t.idle.epoch.fetchAdd(1, .release);
+    Thread.futexWake(&t.idle.epoch.raw, n);
+}
+
+/// The next runnable for `thread` to run, or `null` once the pool is being joined and none is left.
+fn nextRunnable(t: *Threaded, thread: *Thread, tick: *u32) ?*Runnable {
+    tick.* +%= 1;
+    // Now and then the shared queue goes first, so that tasks spawned by other threads are not
+    // starved by workers whose own tasks keep spawning more.
+    if (tick.* % 61 == 0) {
+        if (t.takeShared(thread)) |runnable| return runnable;
+    }
+    if (thread.run_next.load(.monotonic) != null) {
+        if (thread.run_next.swap(null, .acquire)) |runnable| return runnable;
+    }
+    if (thread.runq.pop()) |runnable| return runnable;
+    if (t.takeShared(thread)) |runnable| return runnable;
+    return t.searchOrPark(thread);
+}
+
+/// Takes the oldest runnable of the shared queue, and moves a fair share of the rest to `thread`'s
+/// own queue, so that it can run those without the lock. Wakes another worker if it leaves some.
+fn takeShared(t: *Threaded, thread: *Thread) ?*Runnable {
+    const q = &t.run_queue;
+    if (q.len.load(.seq_cst) == 0) return null; // see `notify`
+    const first, const left = take: {
+        mutexLock(&q.mutex);
+        defer mutexUnlock(&q.mutex);
+        const len = q.len.raw;
+        if (len == 0) return null;
+        const local = &thread.runq;
+        const tail = local.tail.raw;
+        const room: usize = LocalQueue.capacity - (tail -% local.head.load(.acquire));
+        const n = @min(len, len / t.worker_count.load(.monotonic) + 1, LocalQueue.capacity / 2, room + 1);
+        const first = q.head.?;
+        var next = first.node.next;
+        for (0..n - 1) |i| {
+            const runnable: *Runnable = @fieldParentPtr("node", next.?);
+            local.store(tail +% @as(u32, @intCast(i)), runnable);
+            next = runnable.node.next;
+        }
+        if (next) |node| {
+            q.head = @as(*Runnable, @fieldParentPtr("node", node));
+        } else {
+            q.head = null;
+            q.tail = null;
+        }
+        q.len.store(len - n, .monotonic);
+        if (n > 1) local.tail.store(tail +% @as(u32, @intCast(n - 1)), .seq_cst);
+        break :take .{ first, len - n };
+    };
+    if (left != 0) t.wakeIfPending();
+    return first;
+}
+
+/// Looks for a runnable in the other workers' queues and the shared queue, a few times, then parks
+/// until one is queued. Returns `null` once the pool is being joined and none is left.
+fn searchOrPark(t: *Threaded, thread: *Thread) ?*Runnable {
+    while (true) {
+        // One spinning worker is enough to spare spawners their wakes, so only the first one to
+        // start searching spins. The others look while there is work, then park.
+        const spins: usize = if (t.idle.searching.fetchAdd(1, .seq_cst) == 0) spin_limit else 0;
+        var rounds: usize = 0;
+        var i: usize = 0;
+        while (rounds < search_rounds) : (i += 1) {
+            // Looking through every other worker's queue is what an idle worker spends its time
+            // on, so it only looks while some queued task may have no worker on its way to it.
+            if (t.anyPending()) {
+                // The shared queue first, since it takes one load to see that it is empty. The
+                // first rounds leave other workers the task they spawned last, which they are
+                // likeliest to be about to run themselves.
+                if (t.takeShared(thread) orelse t.steal(thread, rounds >= 2)) |runnable| {
+                    if (t.idle.searching.fetchSub(1, .seq_cst) == 1) t.wakeIfPending();
+                    return runnable;
+                }
+                rounds += 1;
+            } else if (i >= spins) break;
+            std.atomic.spinLoopHint();
+        }
+        // Park, having looked once more after announcing it: a spawner that saw this worker
+        // searching woke nobody, and one that did not see it parked queued its task before this
+        // last look.
+        _ = t.idle.searching.fetchSub(1, .seq_cst);
+        _ = t.idle.parked.fetchAdd(1, .seq_cst);
+        const epoch = t.idle.epoch.load(.acquire);
+        if (t.anyPending()) {
+            if (t.takeShared(thread) orelse t.steal(thread, true)) |runnable| {
+                _ = t.idle.parked.fetchSub(1, .seq_cst);
+                t.wakeIfPending();
+                return runnable;
+            }
+        }
+        if (t.join_requested.load(.acquire)) {
+            _ = t.idle.parked.fetchSub(1, .seq_cst);
+            return null;
+        }
+        Thread.futexWaitUncancelable(&t.idle.epoch.raw, epoch, null);
+        _ = t.idle.parked.fetchSub(1, .seq_cst);
+    }
+}
+
+/// Takes runnables from another worker: the older half of its queue, or, if its queue is empty and
+/// `take_next` is set, the task it spawned last.
+fn steal(t: *Threaded, thread: *Thread, take_next: bool) ?*Runnable {
+    const first = t.worker_threads.load(.acquire) orelse return null;
+    thread.steal_start +%= 1;
+    var start = first;
+    for (0..thread.steal_start % t.worker_count.load(.monotonic)) |_| start = start.next orelse first;
+    var victim = start;
+    while (true) {
+        if (victim != thread) {
+            if (stealFrom(thread, victim, take_next)) |runnable| return runnable;
+        }
+        victim = victim.next orelse first;
+        if (victim == start) return null;
+    }
+}
+
+fn stealFrom(thread: *Thread, victim: *Thread, take_next: bool) ?*Runnable {
+    const n = thread.runq.grab(&victim.runq);
+    if (n == 0) {
+        if (!take_next or victim.run_next.load(.seq_cst) == null) return null; // see `notify`
+        return victim.run_next.swap(null, .acquire);
+    }
+    // Run the last one taken, and let other workers take the rest.
+    const tail = thread.runq.tail.raw;
+    const runnable = thread.runq.load(tail +% n -% 1);
+    if (n > 1) thread.runq.tail.store(tail +% n -% 1, .seq_cst);
+    return runnable;
 }
 
 pub fn io(t: *Threaded) Io {
@@ -2084,37 +2426,12 @@ fn async(
         },
     };
 
-    mutexLock(&t.mutex);
-
-    const busy_count = t.busy_count;
-
-    if (busy_count >= @backingInt(t.async_limit)) {
-        mutexUnlock(&t.mutex);
+    if (!t.reserve(@atomicLoad(Io.Limit, &t.async_limit, .monotonic))) {
         future.destroy(gpa);
         start(context.ptr, result.ptr);
         return null;
     }
-
-    t.busy_count = busy_count + 1;
-
-    const pool_size = t.wait_group.value();
-    if (pool_size - busy_count == 0) {
-        t.wait_group.start();
-        const thread = std.Thread.spawn(.{ .stack_size = t.stack_size }, worker, .{t}) catch {
-            t.wait_group.finish();
-            t.busy_count = busy_count;
-            mutexUnlock(&t.mutex);
-            future.destroy(gpa);
-            start(context.ptr, result.ptr);
-            return null;
-        };
-        thread.detach();
-    }
-
-    t.run_queue.prepend(&future.runnable.node);
-
-    mutexUnlock(&t.mutex);
-    condSignal(&t.cond);
+    t.enqueue(&future.runnable);
     return @ptrCast(future);
 }
 
@@ -2134,33 +2451,12 @@ fn concurrent(
     const future = Future.create(gpa, result_len, result_alignment, context, context_alignment, start) catch |err| switch (err) {
         error.OutOfMemory => return error.ConcurrencyUnavailable,
     };
-    errdefer future.destroy(gpa);
 
-    mutexLock(&t.mutex);
-    defer mutexUnlock(&t.mutex);
-
-    const busy_count = t.busy_count;
-
-    if (busy_count >= @backingInt(t.concurrent_limit))
+    if (!t.reserve(@atomicLoad(Io.Limit, &t.concurrent_limit, .monotonic))) {
+        future.destroy(gpa);
         return error.ConcurrencyUnavailable;
-
-    t.busy_count = busy_count + 1;
-    errdefer t.busy_count = busy_count;
-
-    const pool_size = t.wait_group.value();
-    if (pool_size - busy_count == 0) {
-        t.wait_group.start();
-        errdefer t.wait_group.finish();
-
-        const thread = std.Thread.spawn(.{ .stack_size = t.stack_size }, worker, .{t}) catch
-            return error.ConcurrencyUnavailable;
-
-        thread.detach();
     }
-
-    t.run_queue.prepend(&future.runnable.node);
-
-    condSignal(&t.cond);
+    t.enqueue(&future.runnable);
     return @ptrCast(future);
 }
 
@@ -2181,43 +2477,19 @@ fn groupAsync(
         error.OutOfMemory => return groupAsyncEager(start, context.ptr),
     };
 
-    mutexLock(&t.mutex);
-
-    const busy_count = t.busy_count;
-
-    if (busy_count >= @backingInt(t.async_limit)) {
-        mutexUnlock(&t.mutex);
+    if (!t.reserve(@atomicLoad(Io.Limit, &t.async_limit, .monotonic))) {
         task.destroy(gpa);
         return groupAsyncEager(start, context.ptr);
     }
 
-    t.busy_count = busy_count + 1;
-
-    const pool_size = t.wait_group.value();
-    if (pool_size - busy_count == 0) {
-        t.wait_group.start();
-        const thread = std.Thread.spawn(.{ .stack_size = t.stack_size }, worker, .{t}) catch {
-            t.wait_group.finish();
-            t.busy_count = busy_count;
-            mutexUnlock(&t.mutex);
-            task.destroy(gpa);
-            return groupAsyncEager(start, context.ptr);
-        };
-        thread.detach();
-    }
-
-    // TODO: if this logic is changed to be lock-free, this `fetchAdd` must be released by the queue
-    // prepend so that the task doesn't finish without observing this and try to decrement the count
-    // below zero.
+    // Queueing `task` releases this count, and the worker that takes the task acquires it, so the
+    // count is up before the task can finish and count itself down.
     _ = g.status().fetchAdd(.{
         .num_running = 1,
         .have_awaiter = false,
         .canceled = false,
     }, .monotonic);
-    t.run_queue.prepend(&task.runnable.node);
-
-    mutexUnlock(&t.mutex);
-    condSignal(&t.cond);
+    t.enqueue(&task.runnable);
 }
 fn groupAsyncEager(
     start: *const fn (context: *const anyopaque) void,
@@ -2242,41 +2514,19 @@ fn groupConcurrent(
     const task = Group.Task.create(gpa, g, context, context_alignment, start) catch |err| switch (err) {
         error.OutOfMemory => return error.ConcurrencyUnavailable,
     };
-    errdefer task.destroy(gpa);
 
-    mutexLock(&t.mutex);
-    defer mutexUnlock(&t.mutex);
-
-    const busy_count = t.busy_count;
-
-    if (busy_count >= @backingInt(t.concurrent_limit))
+    if (!t.reserve(@atomicLoad(Io.Limit, &t.concurrent_limit, .monotonic))) {
+        task.destroy(gpa);
         return error.ConcurrencyUnavailable;
-
-    t.busy_count = busy_count + 1;
-    errdefer t.busy_count = busy_count;
-
-    const pool_size = t.wait_group.value();
-    if (pool_size - busy_count == 0) {
-        t.wait_group.start();
-        errdefer t.wait_group.finish();
-
-        const thread = std.Thread.spawn(.{ .stack_size = t.stack_size }, worker, .{t}) catch
-            return error.ConcurrencyUnavailable;
-
-        thread.detach();
     }
 
-    // TODO: if this logic is changed to be lock-free, this `fetchAdd` must be released by the queue
-    // prepend so that the task doesn't finish without observing this and try to decrement the count
-    // below zero.
+    // See `groupAsync`.
     _ = g.status().fetchAdd(.{
         .num_running = 1,
         .have_awaiter = false,
         .canceled = false,
     }, .monotonic);
-    t.run_queue.prepend(&task.runnable.node);
-
-    condSignal(&t.cond);
+    t.enqueue(&task.runnable);
 }
 
 fn groupAwait(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *anyopaque) Io.Cancelable!void {
@@ -19009,76 +19259,6 @@ fn eventSet(event: *Io.Event) void {
     switch (@atomicRmw(Io.Event, event, .Xchg, .is_set, .release)) {
         .unset, .is_set => {},
         .waiting => Thread.futexWake(@ptrCast(event), std.math.maxInt(u32)),
-    }
-}
-
-/// Same as `Io.Condition.broadcast` but avoids the VTable.
-fn condBroadcast(cond: *Io.Condition) void {
-    var prev_state = cond.state.load(.monotonic);
-    while (prev_state.waiters > prev_state.signals) {
-        @branchHint(.unlikely);
-        prev_state = cond.state.cmpxchgWeak(prev_state, .{
-            .waiters = prev_state.waiters,
-            .signals = prev_state.waiters,
-        }, .release, .monotonic) orelse {
-            // Update the epoch to tell the waiting threads that there are new signals for them.
-            // Note that a waiting thread could miss a take if *exactly* (1<<32)-1 wakes happen
-            // between it observing the epoch and sleeping on it, but this is extraordinarily
-            // unlikely due to the precise number of calls required.
-            _ = cond.epoch.fetchAdd(1, .release); // `.release` to ensure ordered after `state` update
-            Thread.futexWake(&cond.epoch.raw, prev_state.waiters - prev_state.signals);
-            return;
-        };
-    }
-}
-
-/// Same as `Io.Condition.signal` but avoids the VTable.
-fn condSignal(cond: *Io.Condition) void {
-    var prev_state = cond.state.load(.monotonic);
-    while (prev_state.waiters > prev_state.signals) {
-        @branchHint(.unlikely);
-        prev_state = cond.state.cmpxchgWeak(prev_state, .{
-            .waiters = prev_state.waiters,
-            .signals = prev_state.signals + 1,
-        }, .release, .monotonic) orelse {
-            // Update the epoch to tell the waiting threads that there are new signals for them.
-            // Note that a waiting thread could miss a take if *exactly* (1<<32)-1 wakes happen
-            // between it observing the epoch and sleeping on it, but this is extraordinarily
-            // unlikely due to the precise number of calls required.
-            _ = cond.epoch.fetchAdd(1, .release); // `.release` to ensure ordered after `state` update
-            Thread.futexWake(&cond.epoch.raw, 1);
-            return;
-        };
-    }
-}
-
-/// Same as `Io.Condition.waitUncancelable` but avoids the VTable.
-fn condWait(cond: *Io.Condition, mutex: *Io.Mutex) void {
-    var epoch = cond.epoch.load(.acquire); // `.acquire` to ensure ordered before state load
-
-    {
-        const prev_state = cond.state.fetchAdd(.{ .waiters = 1, .signals = 0 }, .monotonic);
-        assert(prev_state.waiters < std.math.maxInt(u16)); // overflow caused by too many waiters
-    }
-
-    mutexUnlock(mutex);
-    defer mutexLock(mutex);
-
-    while (true) {
-        Thread.futexWaitUncancelable(&cond.epoch.raw, epoch, null);
-
-        epoch = cond.epoch.load(.acquire); // `.acquire` to ensure ordered before `state` laod
-
-        var prev_state = cond.state.load(.monotonic);
-        while (prev_state.signals > 0) {
-            prev_state = cond.state.cmpxchgWeak(prev_state, .{
-                .waiters = prev_state.waiters - 1,
-                .signals = prev_state.signals - 1,
-            }, .acquire, .monotonic) orelse {
-                // We successfully consumed a signal.
-                return;
-            };
-        }
     }
 }
 
