@@ -46,6 +46,11 @@ a program that uses private fields, checks that naming a private field from
 another file is rejected, and compiles and runs C with the Clang and libc the
 archive carries.
 
+A newer push to master cancels the release run of an older one that is still
+in progress: the newer release supersedes it. Pushes that change only the book,
+the proposals, ppup, or the other workflows publish no release, since the
+archives would not change.
+
 A pull request that changes the release machinery builds the archives and
 checks them, and publishes nothing.
 

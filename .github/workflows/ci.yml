@@ -34,11 +34,11 @@ on:
 permissions:
   contents: read
 
-# A newer push to a pull request cancels the run of the older one; pushes to
-# master and manual runs always finish.
+# A newer push cancels the run of an older one, on a pull request and on master
+# alike: the newer run tests everything the older one would have.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   x86_64-linux:
