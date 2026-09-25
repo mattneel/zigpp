@@ -86,16 +86,21 @@
 //! overflow check of every safety-checked multiplication of `u64` and `usize` needs, and so does
 //! 128-bit arithmetic such as the Eisel-Lemire path of `std.fmt.parseFloat`: the backend rebuilds
 //! those multiplications out of 32-bit ones after the optimizer has run, since the optimizer
-//! would form the 128-bit idiom again. Program-scope constants (string literals, lookup tables)
-//! live in the constant address space, where Metal keeps them; the backend carries that address
-//! space through every pointer derived from a constant, inlining the calls such a pointer
-//! crosses. Metal has no generic address space, so a pointer into constant data that meets a
-//! pointer to thread memory in a kernel, in a phi or a store, is a compile error that names the
-//! kernel. So is a constant that holds pointers, such as a table of strings or slices, because
-//! Apple's toolchain does not relocate the addresses inside constant data; `std.fmt.parseFloat`
-//! has one, so it does not compile for an Apple GPU yet (issue #22). The target (the address spaces, the
-//! builtins, the intrinsics above and the container) is exercised by `test/standalone/gpu`,
-//! which compiles its Apple kernels for `air64-macos` on every host and runs them on a Mac.
+//! would form the 128-bit idiom again. It also gets the overflow flag of a signed add or subtract
+//! wrong and dies on the 8-bit ones, and those checks are rebuilt out of the operation and a
+//! comparison. Program-scope constants (string literals, lookup tables) live in the constant
+//! address space, where Metal keeps them, and the backend carries that address space through every
+//! pointer derived from a constant, inlining the calls such a pointer crosses. Apple's toolchain
+//! does not relocate addresses inside constant data, so the constants that hold pointers to other
+//! constants, like a table of strings or the table behind `@errorName`, keep them as offsets into
+//! one block of constant data, and a pointer loaded out of it is decoded where it is loaded. A
+//! table of function pointers, like an allocator's vtable, works where inlining makes the calls
+//! through it direct. Metal has no generic address space and no indirect calls, so a pointer into
+//! constant data that meets a pointer to thread memory in a kernel, and a call through a table of
+//! functions that stays indirect, are compile errors that name the kernel or the table. The target
+//! (the address spaces, the builtins, the intrinsics above and the container) is exercised by
+//! `test/standalone/gpu`, which compiles its Apple kernels for `air64-macos` on every host and runs
+//! them on a Mac.
 //!
 //! The device-side functions in this namespace are implemented for NVPTX, AMDGPU and air64. The
 //! indexing functions and `syncThreads` use builtins that also exist for SPIR-V.

@@ -68,9 +68,11 @@ void zigAirRetypeBufferGEPs(llvm::Module &module, std::string &err);
 
 /* The lowerings that must follow the optimization pipeline, because the pipeline would form
  * again what they remove (src/zig_air_lower.cpp): program-scope constants move into the
- * constant address space, with the calls that pointers derived from them cross inlined, and
- * multiplies whose high 64 bits are needed, which Apple's GPU compiler cannot lower, become
- * 32-bit pieces. On failure returns false and sets `err`. */
+ * constant address space, the pointers inside constant data become offsets, and the calls
+ * that pointers into constant data cross are inlined; multiplies whose high 64 bits are
+ * needed, which Apple's GPU compiler cannot lower, become 32-bit pieces; and the overflow
+ * intrinsics of add and subtract, which it gets wrong, become the operation and a
+ * comparison. On failure returns false and sets `err`. */
 bool zigAirLowerLate(llvm::Module &module, std::string &err);
 
 #endif // __cplusplus

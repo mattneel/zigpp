@@ -525,9 +525,11 @@ and a fast variant, installs the two containers next to the host program
 partial sums go through threadgroup memory and a device atomic counter, a
 kernel with scalar parameters, an index computed with a `usize` multiply (which
 a debug build checks for overflow), the 128-bit products and overflow flags of
-64-bit multiplies, and tables of integers and of structs in the constant address
-space, checking the results against the CPU bit for bit and reporting the SIMD
-width of the kernels;
+64-bit multiplies, the overflow flags of adds and subtracts of every width,
+tables of integers and of structs in the constant address
+space, a table of strings, `@errorName`, `std.fmt.parseFloat`, and allocations
+through `std.mem.Allocator`, checking the results against the CPU bit for bit
+and reporting the SIMD width of the kernels;
 `-Dmetallib=a.metallib,b.metallib` adds the containers that Apple's own `metal`
 compiler or the spike built, to compare Apple's code with this one's. A machine
 without the Metal framework skips every library it was given, a library without
@@ -563,11 +565,12 @@ compiles its kernels for all three vendors and then skips itself.
   that meets a pointer to thread memory is a compile error naming the function,
   and a checked multiplication of `i128` values is supported only where both
   operands fit in 64 bits.
-- On Apple GPUs, a program-scope constant that holds pointers, such as a table
-  of strings or slices, is a compile error, because Apple's toolchain does not
-  relocate the addresses inside constant data. `std.fmt.parseFloat` has such a
-  table, so it does not compile for Apple GPUs yet
-  ([#22](https://github.com/mattneel/zigpp/issues/22)).
+- On Apple GPUs, a table of function pointers, like an allocator's vtable,
+  works only where inlining makes the calls through it direct, as it does for
+  `std.heap.FixedBufferAllocator` through `std.mem.Allocator`. A call through
+  such a table that stays indirect is a compile error that names the table,
+  because Metal has no indirect calls and Apple's toolchain relocates no address
+  in constant data.
 - The AIR version, the Metal language version, and the container version of a
   Metal library are the ones of the macOS release row that the deployment target
   selects, not a choice of the program.

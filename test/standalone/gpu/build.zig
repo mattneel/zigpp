@@ -115,9 +115,11 @@ fn addHipTest(
 
 /// The Metal arm of this suite: `metal_host.zig` runs the vector add, the reduction, and the
 /// kernel with scalar parameters through `std.gpu.metal`, with the same kernels and the same
-/// arguments as the CUDA and HIP hosts, plus the kernels of the multiplies and the constant tables
+/// arguments as the CUDA and HIP hosts, plus the kernels of the arithmetic and the constant data
 /// that Apple's compiler only takes as this compiler rewrites them (a Debug build's checked `usize`
-/// multiply, 128-bit products, constant tables), and checks the results against the CPU.
+/// multiply, 128-bit products, the overflow flags of adds and subtracts, constant tables, a table
+/// of strings, `@errorName`, `std.fmt.parseFloat`, an allocator's vtable), and checks the results
+/// against the CPU.
 ///
 /// Its kernels are `.metallib` files, not objects of this directory, because the container is what
 /// a Metal GPU is given. The ones that this step always builds are the kernels of

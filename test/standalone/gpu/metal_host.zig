@@ -18,9 +18,11 @@
 //!   container writer.
 //!
 //! `metal_kernels.zig` also has kernels that only Zig++ builds, because what they test is what it
-//! does to a module before Apple's compiler sees it (issue #18): the checked `usize` multiply of a
-//! Debug build, the 128-bit products and overflow flags of 64-bit multiplies, and tables of
-//! integers and of structs in the constant address space.
+//! does to a module before Apple's compiler sees it: the checked `usize` multiply of a Debug build
+//! and the 128-bit products and overflow flags of 64-bit multiplies (issue #18), the overflow
+//! flags of adds and subtracts at every width (issue #26), and constant
+//! data: tables of integers and of structs, a table of strings, `@errorName`,
+//! `std.fmt.parseFloat`, and an allocator's vtable (issue #22).
 //!
 //! The program is cross-compiled from Linux, where there is no Metal framework and no macOS SDK,
 //! and runs on the Mac:
@@ -110,6 +112,23 @@ const mulwide_edges = [_][2]u64{
 };
 const mulwide_len = 128;
 
+/// The kernel of the overflow flags of adds and subtracts, and a copy of what it computes: two
+/// bits per type (u64, i64, u32, i32, u16, i16, u8, i8), the flag of the sum and then the flag of
+/// the difference. It runs on the pairs of `mulwide`.
+const addsub_name = "addsub";
+fn addSubFlags(x: u64, y: u64) u32 {
+    var flags: u32 = 0;
+    inline for (.{ u64, i64, u32, i32, u16, i16, u8, i8 }, 0..) |T, k| {
+        const U = @Int(.unsigned, @bitSizeOf(T));
+        const a: T = @bitCast(@as(U, @truncate(x)));
+        const b: T = @bitCast(@as(U, @truncate(y)));
+        const sum = @addWithOverflow(a, b);
+        const difference = @subWithOverflow(a, b);
+        flags |= (@as(u32, sum[1]) | @as(u32, difference[1]) << 1) << (2 * k);
+    }
+    return flags;
+}
+
 /// The kernel of program-scope constant tables, the tables themselves and the function of them
 /// that it computes (copies of those of `metal_kernels.zig`, which this program cannot import:
 /// its kernels are exported for the GPU), and its number of threads.
@@ -134,6 +153,77 @@ fn tableValue(i: u32) u32 {
     return (mixed +% step.scale *% i +% step.bias) >> @intCast(step.shift);
 }
 const constant_tables_len = 256;
+
+/// The kernel of the table of strings, and a copy of the table.
+const string_table_name = "string_table";
+const table_words = [_][]const u8{ "zig", "plus", "plus", "metal", "", "constant", "address", "space" };
+fn wordValue(i: u32) u32 {
+    const word = table_words[i % table_words.len];
+    var hash: u32 = 0;
+    for (word) |byte| hash = hash *% 31 +% byte;
+    return hash +% table_primes[i % table_primes.len] *% @as(u32, @intCast(word.len));
+}
+
+/// The kernel of `@errorName`, and the names of its errors in their order.
+const error_names_name = "error_names";
+const kernel_error_names = [_][]const u8{ "OutOfMemory", "InvalidCharacter", "Overflow", "EndOfStream" };
+fn nameValue(name: []const u8) u32 {
+    var hash: u32 = 0;
+    for (name) |byte| hash = hash *% 31 +% byte;
+    return hash +% (@as(u32, @intCast(name.len)) << 24);
+}
+
+/// The kernel of allocations through `std.mem.Allocator`, and what it computes.
+const allocator_vtable_name = "allocator_vtable";
+fn squareSum(n: u32) u32 {
+    var sum: u32 = 0;
+    for (0..n) |k| sum += @intCast(k * k);
+    return sum;
+}
+
+/// The number of threads of the tests of constant data above.
+const constant_data_len = 256;
+
+/// The kernel of `std.fmt.parseFloat(f32, ...)` on the GPU, and the texts it parses: the edges
+/// of `f32`, the paths of the parser (the fast path, Eisel-Lemire, hex floats, the special
+/// values, and the slow path, which the halfway cases with more significant digits than a u64
+/// holds take, and which reads the table of the powers of five as decimal strings), and texts
+/// that are not numbers.
+const parse_float_name = "parse_float";
+const parse_float_block: u32 = 32;
+const float_texts = [_][]const u8{
+    "1.5",
+    "-0.0",
+    "0",
+    "3.14159265358979323846",
+    "1e10",
+    "1e-10",
+    "6.02214076e23",
+    "3.4028235e38", // the largest f32
+    "3.4028236e38",
+    "1e39", // infinity
+    "1.17549435e-38", // the smallest normal f32
+    "1.4e-45", // the smallest subnormal f32
+    "1e-50", // zero
+    "0x1.8p1",
+    "inf",
+    "-inf",
+    "nan",
+    "123456789012345678901234567890",
+    "1.000000059604644775390625", // halfway between 1 and the next f32: ties to even
+    "1.00000005960464477539062500000000000001", // just above halfway
+    "1.00000017881393432617187499", // just below the halfway point above 1 + 2^-23
+    "16777217", // halfway between 2^24 and 2^24 + 2: ties to even
+    "16777217.000000000000000000001", // just above halfway
+    "0.1",
+    "0.2",
+    "0.3",
+    "7.038531e-26",
+    "abc",
+    "",
+    "1.2.3",
+    "--1",
+};
 
 /// The library of the reference kernels has no kernel of a name that the tests above use, so the
 /// name of this one is not in any library: it is what the test of a missing function asks for.
@@ -437,17 +527,7 @@ fn testMulwide(run: *Run, report: *Report, context: metal.Context, module: metal
 
     var a: [mulwide_len]u64 = undefined;
     var b: [mulwide_len]u64 = undefined;
-    var prng: std.Random.DefaultPrng = .init(0x5eed_2026);
-    const random = prng.random();
-    for (&a, &b, 0..) |*x, *y, i| {
-        if (i < mulwide_edges.len) {
-            x.*, y.* = mulwide_edges[i];
-        } else {
-            x.* = random.int(u64);
-            // Every other pair has a narrow second operand, which overflows less often.
-            y.* = if (i % 2 == 0) random.int(u64) else random.int(u32);
-        }
-    }
+    widePairs(&a, &b);
 
     var hi: [mulwide_len]u64 = @splat(0);
     var lo: [mulwide_len]u64 = @splat(0);
@@ -511,6 +591,62 @@ fn testMulwide(run: *Run, report: *Report, context: metal.Context, module: metal
     });
 }
 
+/// The pairs of the `mulwide` and `addsub` tests: the edges in `mulwide_edges`, then
+/// pseudo-random pairs, every other one with a narrow second operand, which overflows less often.
+fn widePairs(a: *[mulwide_len]u64, b: *[mulwide_len]u64) void {
+    var prng: std.Random.DefaultPrng = .init(0x5eed_2026);
+    const random = prng.random();
+    for (a, b, 0..) |*x, *y, i| {
+        if (i < mulwide_edges.len) {
+            x.*, y.* = mulwide_edges[i];
+        } else {
+            x.* = random.int(u64);
+            y.* = if (i % 2 == 0) random.int(u64) else random.int(u32);
+        }
+    }
+}
+
+/// `addsub`: the overflow flags of adds and subtracts at every width, signed and unsigned, of the
+/// pairs of `mulwide`, compared bit for bit with the CPU.
+fn testAddsub(run: *Run, report: *Report, context: metal.Context, module: metal.Module) !void {
+    const function = (try findFunction(module, report, addsub_name)) orelse return;
+    defer function.release();
+    const pipeline = (try compilePipeline(function, report, run, addsub_name)) orelse return;
+    defer pipeline.release();
+
+    var a: [mulwide_len]u64 = undefined;
+    var b: [mulwide_len]u64 = undefined;
+    widePairs(&a, &b);
+    var flags: [mulwide_len]u32 = @splat(0xdeadbeef);
+    const buffer_a = try context.alloc(u64, mulwide_len);
+    defer buffer_a.free();
+    const buffer_b = try context.alloc(u64, mulwide_len);
+    defer buffer_b.free();
+    const buffer_flags = try context.alloc(u32, mulwide_len);
+    defer buffer_flags.free();
+    buffer_a.copyFromHost(&a);
+    buffer_b.copyFromHost(&b);
+    buffer_flags.copyFromHost(&flags);
+
+    try pipeline.launch(metal.LaunchConfig.linear(mulwide_len, mulwide_block), .{
+        buffer_a, buffer_b, buffer_flags, @as(u32, mulwide_len),
+    });
+    try context.synchronize();
+    buffer_flags.copyToHost(&flags);
+
+    var overflows: usize = 0;
+    for (a, b, flags, 0..) |x, y, actual, i| {
+        const want = addSubFlags(x, y);
+        overflows += @popCount(want);
+        if (actual != want) {
+            return report.fail("addsub: pair {d}, 0x{x} and 0x{x}: expected flags 0b{b:0>16}, got 0b{b:0>16}", .{ i, x, y, want, actual });
+        }
+    }
+    try report.pass("addsub: {d} pairs, the overflow flags of adds and subtracts of 8 to 64 bits, signed and unsigned ({d} overflows), bit for bit", .{
+        mulwide_len, overflows,
+    });
+}
+
 /// `constant_tables`: one thread per element, each reading tables of integers and of structs in
 /// the constant address space, compared with the same reads on the CPU.
 fn testConstantTables(run: *Run, report: *Report, context: metal.Context, module: metal.Module) !void {
@@ -538,6 +674,118 @@ fn testConstantTables(run: *Run, report: *Report, context: metal.Context, module
     }
     try report.pass("constant_tables: {d} reads of tables of integers and of structs in the constant address space", .{
         constant_tables_len,
+    });
+}
+
+/// One thread per element of `constant_data_len` `u32`, which a kernel of constant data computes
+/// from the thread's index, compared with `expected` of the index on the CPU.
+fn runIndexed(
+    run: *Run,
+    report: *Report,
+    context: metal.Context,
+    module: metal.Module,
+    name: [:0]const u8,
+    expected: *const fn (u32) u32,
+    what: []const u8,
+) !void {
+    const function = (try findFunction(module, report, name)) orelse return;
+    defer function.release();
+    const pipeline = (try compilePipeline(function, report, run, name)) orelse return;
+    defer pipeline.release();
+
+    var out: [constant_data_len]u32 = @splat(0xdeadbeef);
+    const buffer = try context.alloc(u32, constant_data_len);
+    defer buffer.free();
+    buffer.copyFromHost(&out);
+
+    try pipeline.launch(metal.LaunchConfig.linear(constant_data_len, 64), .{
+        buffer, @as(u32, constant_data_len),
+    });
+    try context.synchronize();
+    buffer.copyToHost(&out);
+
+    for (out, 0..) |actual, i| {
+        const want = expected(@intCast(i));
+        if (actual != want) {
+            return report.fail("{s}: element {d}: expected 0x{x:0>8}, got 0x{x:0>8}", .{ name, i, want, actual });
+        }
+    }
+    try report.pass("{s}: {d} threads, {s}", .{ name, constant_data_len, what });
+}
+
+fn errorNameValue(i: u32) u32 {
+    return nameValue(kernel_error_names[i % kernel_error_names.len]);
+}
+
+fn allocatorValue(i: u32) u32 {
+    return squareSum(8 + i % 8);
+}
+
+/// `parse_float`: `std.fmt.parseFloat(f32, ...)` of every text of `float_texts` on the GPU,
+/// compared bit for bit, errors included, with the same call on the CPU.
+fn testParseFloat(run: *Run, report: *Report, context: metal.Context, module: metal.Module) !void {
+    const function = (try findFunction(module, report, parse_float_name)) orelse return;
+    defer function.release();
+    const pipeline = (try compilePipeline(function, report, run, parse_float_name)) orelse return;
+    defer pipeline.release();
+
+    const count = float_texts.len;
+    const text_len = comptime len: {
+        var sum: usize = 0;
+        for (float_texts) |text| sum += text.len;
+        break :len sum;
+    };
+    var text: [text_len]u8 = undefined;
+    var starts: [count]u32 = undefined;
+    var lens: [count]u32 = undefined;
+    var at: usize = 0;
+    for (float_texts, &starts, &lens) |t, *start, *len| {
+        @memcpy(text[at..][0..t.len], t);
+        start.* = @intCast(at);
+        len.* = @intCast(t.len);
+        at += t.len;
+    }
+
+    var bits: [count]u32 = @splat(0xdeadbeef);
+    var ok: [count]u32 = @splat(0xdeadbeef);
+    const buffer_text = try context.alloc(u8, text_len);
+    defer buffer_text.free();
+    const buffer_starts = try context.alloc(u32, count);
+    defer buffer_starts.free();
+    const buffer_lens = try context.alloc(u32, count);
+    defer buffer_lens.free();
+    const buffer_bits = try context.alloc(u32, count);
+    defer buffer_bits.free();
+    const buffer_ok = try context.alloc(u32, count);
+    defer buffer_ok.free();
+    buffer_text.copyFromHost(&text);
+    buffer_starts.copyFromHost(&starts);
+    buffer_lens.copyFromHost(&lens);
+    buffer_bits.copyFromHost(&bits);
+    buffer_ok.copyFromHost(&ok);
+
+    try pipeline.launch(metal.LaunchConfig.linear(count, parse_float_block), .{
+        buffer_text, buffer_starts, buffer_lens, buffer_bits, buffer_ok, @as(u32, count),
+    });
+    try context.synchronize();
+    buffer_bits.copyToHost(&bits);
+    buffer_ok.copyToHost(&ok);
+
+    var numbers: usize = 0;
+    for (float_texts, bits, ok) |t, actual_bits, actual_ok| {
+        const want_ok: u32, const want_bits: u32 = if (std.fmt.parseFloat(f32, t)) |value|
+            .{ 1, floatBits(value) }
+        else |_|
+            .{ 0, 0 };
+        numbers += want_ok;
+        if (actual_ok != want_ok or actual_bits != want_bits) {
+            return report.fail("parse_float: \"{s}\": expected ok {d} bits 0x{x:0>8}, got ok {d} bits 0x{x:0>8}", .{
+                t, want_ok, want_bits, actual_ok, actual_bits,
+            });
+        }
+    }
+    try report.pass("parse_float: std.fmt.parseFloat(f32) of {d} texts, {d} numbers and {d} errors, bit for bit", .{
+        count, numbers, count - numbers,
     });
 }
 
@@ -672,7 +920,12 @@ fn runLibrary(out: *Io.Writer, run: *Run, path: []const u8, bytes: []const u8) !
     try testScale(run, &report, context, module);
     try testIndex2d(run, &report, context, module);
     try testMulwide(run, &report, context, module);
+    try testAddsub(run, &report, context, module);
     try testConstantTables(run, &report, context, module);
+    try runIndexed(run, &report, context, module, string_table_name, wordValue, "strings read through a table of slices in constant data");
+    try runIndexed(run, &report, context, module, error_names_name, errorNameValue, "@errorName read through the table of error names");
+    try runIndexed(run, &report, context, module, allocator_vtable_name, allocatorValue, "allocations through std.mem.Allocator and its vtable");
+    try testParseFloat(run, &report, context, module);
     try report.summary();
     return report.failures == 0;
 }
