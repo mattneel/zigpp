@@ -1,11 +1,24 @@
 name: Release
 
-# Every push to master publishes a release of that commit for each target, with
-# a download index in the format of ziglang.org's. A pull request that changes
-# the release machinery builds and checks the archives without publishing them.
+# Every push to master that changes what the archives hold publishes a release
+# of that commit for each target, with a download index in the format of
+# ziglang.org's. A pull request that changes the release machinery builds and
+# checks the archives without publishing them.
 on:
   push:
     branches: [master]
+    # The book, the proposals, ppup, and the other workflows are not in the
+    # archives. README.md and the language reference are, so they still release.
+    paths-ignore:
+      - "doc/assets/**"
+      - "doc/book/**"
+      - "doc/proposals/**"
+      - "ppup/**"
+      - ".github/scripts/downloads.py"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/ci-host.yml"
+      - ".github/workflows/ppup.yml"
+      - ".github/workflows/site.yml"
   pull_request:
     paths:
       - ".github/workflows/release.yml"
@@ -15,10 +28,13 @@ on:
 permissions:
   contents: read
 
-# Releases publish one at a time, in push order.
+# A newer push cancels the release run of an older one, which the newer release
+# supersedes. This also keeps an old run from publishing after master has moved
+# on: GitHub refuses a workflow token's release at a commit behind master when
+# the newer commits change a workflow.
 concurrency:
   group: release-${{ github.event.pull_request.number || 'master' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 jobs:
   bootstrap:
