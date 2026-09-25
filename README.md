@@ -143,7 +143,7 @@ zig build-obj -target air64-macos -O ReleaseFast -femit-bin=kernels.metallib ker
 ```
 
 The suite runs a vector add, a reduction, and a kernel with scalar arguments on
-the GPU of a Mac, which CI's macOS runners provide.
+the GPU of a Mac, which CI's M4 provides.
 
 Still to come: MLIR lowering for tensor cores and kernel fusion.
 

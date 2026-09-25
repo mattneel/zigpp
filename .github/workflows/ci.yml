@@ -40,17 +40,23 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# The jobs run on the project's own machines: WSL2 and Windows on a laptop
+# with an RTX 5090 Laptop GPU, and an M4 Mac.
 jobs:
   x86_64-linux:
     name: x86_64 Linux
     uses: ./.github/workflows/ci-host.yml
     with:
-      runner: ubuntu-24.04
-      target: x86_64-linux-musl
+      runner: wsl2
+
+  x86_64-windows:
+    name: x86_64 Windows
+    uses: ./.github/workflows/ci-host.yml
+    with:
+      runner: windows
 
   aarch64-macos:
     name: aarch64 macOS
     uses: ./.github/workflows/ci-host.yml
     with:
-      runner: macos-latest
-      target: aarch64-macos-none
+      runner: m4

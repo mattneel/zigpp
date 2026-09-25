@@ -43,9 +43,9 @@ Language proposals are welcome. Zig++ is made of them.
 ## Contributing
 
 The source, the issues, and the pull requests are at
-[github.com/mattneel/zigpp](https://github.com/mattneel/zigpp). CI builds Zig++
-once on x86_64 Linux and once on aarch64 macOS, then runs four jobs on each at
-the same time:
+[github.com/mattneel/zigpp](https://github.com/mattneel/zigpp). CI runs on the
+project's own machines: x86_64 Linux under WSL2 and x86_64 Windows, on a laptop
+with an RTX 5090 Laptop GPU, and an M4 Mac. On each it builds Zig++ and runs:
 
 ```sh
 # The standard library and behavior tests, with both back ends.
@@ -62,10 +62,12 @@ zig build test-standalone -Dskip-non-native -Dskip-release
 
 The standalone tests include the [GPU suite](gpu.md): its kernels compile for
 NVIDIA, AMD, and Apple GPUs, and it runs them wherever a GPU driver is present.
-The macOS runners run the Metal kernels, and the suite skips itself on a machine
-without a GPU driver.
+The Linux machine runs the CUDA kernels on the RTX 5090 Laptop GPU, and the
+Mac runs the Metal kernels on the M4; the suite skips what a machine has no
+driver for.
 
 A pull request that changes only documentation, ppup, or the other workflows
-does not run CI.
+does not run CI, and neither does one from a fork: the machines run only
+branches of the repository itself.
 [Building from Source](building-from-source.md) has the same bootstrap the CI
 job uses, so a change can be tested against the compiler CI builds.
