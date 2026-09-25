@@ -131,9 +131,11 @@ Zig++ devkit, whose LLVM is 23.1.2.
 
 Zig++'s CI does not install LLVM. `.github/scripts/bootstrap.sh` downloads the
 devkit of the machine, `x86_64-linux-musl`, `x86_64-windows-gnu` (in Git Bash),
-or `aarch64-macos-none`, into `~/deps`, where it stays for the next run. It then
-builds the compiler with the newest Zig++ release, against this checkout's
-`lib/`; on the Linux machine, that is:
+or `aarch64-macos-none`, into `~/deps`, where it stays for the next run, and
+unpacks the newest release's compiler there too, in a directory named for the
+release's version, so a run whose newest release has not moved downloads
+nothing. It then builds the compiler with the release's compiler, against this
+checkout's `lib/`; on the Linux machine, that is:
 
 ```sh
 ZIG_LIB_DIR="$PWD/lib" "$RELEASE/zig" build \
@@ -167,7 +169,20 @@ ninja install
 Either way, `lib/` stays in the checkout, so the scripts point `ZIG_LIB_DIR` at
 this repository's `lib/`. The compiler that comes out is
 `build-bootstrap/stage3/bin/zig`, and the release workflow cross-compiles every
-target's archive with it.
+target's archive with it, builds the language reference once with it and hands
+that to the per-target package jobs, which build with `-Dno-langref`.
+
+A CI job points `ZIG_LOCAL_CACHE_DIR` and `ZIG_GLOBAL_CACHE_DIR` at directories
+under the runner's tool cache, which `actions/checkout` leaves alone, so a run
+starts with what the run before it built. The compiler is one build step, its
+C++ glue inside it, so a run that changes the Zig source rebuilds that step: on
+the WSL2 machine, 326 s against 415 s with no cache, and 0.04 s for a commit
+that has already been built once. A run of the suites leaves about 6 GB in the
+local cache and the compiler's share of the global one under 1 GB, so each
+directory is wiped whole when it passes 32 GiB, several runs of history: a Zig
+cache entry may not be deleted on its own, because a manifest may outlive the
+output it names, and one rebuild is cheaper than a machine whose disk has
+quietly filled.
 
 ## Building without LLVM
 

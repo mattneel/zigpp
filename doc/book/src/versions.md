@@ -39,12 +39,12 @@ publishes a release on **every push to master**, for four targets:
 | x86_64-windows | windows-2025 |
 
 The jobs are: build a bootstrap compiler (with the newest release, or from
-source alone when the release cannot build it), pack an archive for each
-target, unpack and smoke-test each archive on a runner of that architecture,
-and publish. The smoke test runs `zig version` and `zig env`, compiles and runs
-a program that uses private fields, checks that naming a private field from
-another file is rejected, and compiles and runs C with the Clang and libc the
-archive carries.
+source alone when the release cannot build it) and, with it, the one language
+reference every archive carries, pack an archive for each target, unpack and
+smoke-test each archive on a runner of that architecture, and publish. The
+smoke test runs `zig version` and `zig env`, compiles and runs a program that
+uses private fields, checks that naming a private field from another file is
+rejected, and compiles and runs C with the Clang and libc the archive carries.
 
 A newer push to master cancels the release run of an older one that is still
 in progress: the newer release supersedes it. Pushes that change only the book,

@@ -66,6 +66,18 @@ jobs:
         id: version
         run: echo "version=$(ZIG_LIB_DIR=$PWD/lib build-bootstrap/stage3/bin/zig version)" >> "$GITHUB_OUTPUT"
 
+      # The language reference is one file for every target, and every target
+      # used to build its own; it is built here, once, and handed to the
+      # package jobs, which build with -Dno-langref.
+      - name: Build the language reference
+        run: ZIG_LIB_DIR=$PWD/lib build-bootstrap/stage3/bin/zig build langref --prefix langref
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: langref
+          path: langref/doc/langref.html
+          if-no-files-found: error
+
       - uses: actions/upload-artifact@v7
         with:
           name: bootstrap
@@ -89,13 +101,41 @@ jobs:
           name: bootstrap
           path: build-bootstrap/stage3/bin
 
+      - uses: actions/download-artifact@v8
+        with:
+          name: langref
+          path: langref/doc
+
       - name: Restore the LLVM devkit
         uses: actions/cache@v6
         with:
           path: ~/deps
           key: devkit-${{ matrix.target }}-${{ hashFiles('.github/scripts/devkit.sh') }}
 
+      # Zig's caches hold what the compiler built for the target -- libc++ and
+      # compiler-rt above all -- which follows the target and not the release,
+      # so each target keeps its caches from one release to the next: the
+      # commit in the key saves them, and the target's restore-key falls back
+      # to the newest older one.
+      - name: Restore Zig's caches
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/zig-package/${{ matrix.target }}/local
+            ~/.cache/zig-package/${{ matrix.target }}/global
+          key: zig-cache-${{ matrix.target }}-${{ github.sha }}
+          restore-keys: zig-cache-${{ matrix.target }}-
+
+      - name: Point Zig++ at its caches
+        run: |
+          root="$HOME/.cache/zig-package/${{ matrix.target }}"
+          mkdir -p "$root/local" "$root/global"
+          echo "ZIG_LOCAL_CACHE_DIR=$root/local" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$root/global" >> "$GITHUB_ENV"
+
       - name: Build and pack
+        env:
+          LANGLREF: ${{ github.workspace }}/langref/doc/langref.html
         run: |
           chmod +x build-bootstrap/stage3/bin/zig
           .github/scripts/package.sh ${{ matrix.target }}

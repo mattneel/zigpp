@@ -15,7 +15,10 @@
 # know), and when the release fails to build this source.
 #
 # The release comes from GITHUB_REPOSITORY (mattneel/zigpp by default) through
-# gh, which needs a token in GH_TOKEN on CI.
+# gh, which needs a token in GH_TOKEN on CI. Its unpacked compiler stays under
+# ${DEPS_DIR:-$HOME/deps}, next to the devkit and named for the release's
+# version, so a run that finds the newest release unchanged there does not
+# download it again.
 #
 # The compiler is left at build-bootstrap/stage3/bin/zig, without lib/: point
 # ZIG_LIB_DIR at the lib/ of this checkout to use it.
@@ -52,19 +55,37 @@ from_release() {
   arch=${TARGET%%-*}
   os=${TARGET#*-}
   os=${os%%-*}
-  release=build-bootstrap/release
+  deps=${DEPS_DIR:-"$HOME/deps"}
+  asset="zig-$arch-$os"
 
   tag=$(gh release view --repo "$repo" --json tagName --jq .tagName) || return 1
-  rm -rf "$release" && mkdir -p "$release" || return 1
-  gh release download "$tag" --repo "$repo" --dir "$release" \
-    --pattern "zig-$arch-$os-*.$extension" || return 1
-  archive=$(cd "$release" && echo zig-*."$extension")
-  case $extension in
-    zip) (cd "$release" && unzip -q "$archive") || return 1 ;;
-    tar.xz) tar -xJf "$release/$archive" -C "$release" || return 1 ;;
-  esac
-  name=${archive%."$extension"}
-  version=${name#"zig-$arch-$os-"}
+  # The archive is named for the release's version, which carries the commit
+  # that the check below compares against, so the version comes from the asset
+  # and not from the tag, which has no build metadata.
+  version=$(gh release view "$tag" --repo "$repo" --json assets --jq "
+    .assets[].name | select(startswith(\"$asset-\"))
+      | select(endswith(\".$extension\"))
+      | ltrimstr(\"$asset-\") | rtrimstr(\".$extension\")") || return 1
+  [ -n "$version" ] || return 1
+  release="$deps/$asset-$version"
+
+  if [ ! -d "$release" ]; then
+    # Download and unpack next to the destination and move the result into
+    # place, so that an interrupted download never leaves a partial release
+    # where the next run would take it for a complete one.
+    mkdir -p "$deps" || return 1
+    work=$(mktemp -d "$deps/.release.XXXXXX") || return 1
+    trap 'rm -rf "$work"' EXIT
+    gh release download "$tag" --repo "$repo" --dir "$work" \
+      --pattern "$asset-*.$extension" || return 1
+    case $extension in
+      zip) (cd "$work" && unzip -q "$asset-$version.$extension") || return 1 ;;
+      tar.xz) tar -xJf "$work/$asset-$version.$extension" -C "$work" || return 1 ;;
+    esac
+    mv "$work/$asset-$version" "$release" || return 1
+    rm -rf "$work"
+    trap - EXIT
+  fi
 
   if ! git diff --quiet "${version##*+zigpp.}" HEAD -- stage1/zig1.wasm; then
     echo "stage1/zig1.wasm changed since Zig++ $version" >&2
@@ -73,7 +94,7 @@ from_release() {
 
   # The compiler must be built with the standard library of this checkout,
   # not the release's.
-  ZIG_LIB_DIR="$PWD/lib" "$release/$name/zig" build \
+  ZIG_LIB_DIR="$PWD/lib" "$release/zig" build \
     --prefix build-bootstrap/stage3 \
     --search-prefix "$PREFIX" \
     ${maxrss:+--maxrss "$maxrss"} \

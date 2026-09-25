@@ -45,7 +45,10 @@ Language proposals are welcome. Zig++ is made of them.
 The source, the issues, and the pull requests are at
 [github.com/mattneel/zigpp](https://github.com/mattneel/zigpp). CI runs on the
 project's own machines: x86_64 Linux under WSL2 and x86_64 Windows, on a laptop
-with an RTX 5090 Laptop GPU, and an M4 Mac. On each it builds Zig++ and runs:
+with an RTX 5090 Laptop GPU, and an M4 Mac. On each it builds Zig++ against the
+caches the run before it left, and runs all four suites at the same time, a
+quarter of the machine's cores each through `-j`, printing their logs when they
+have all finished:
 
 ```sh
 # The standard library and behavior tests, with both back ends.
