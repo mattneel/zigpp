@@ -2,8 +2,10 @@ name: CI host
 
 # CI on one of the project's own machines, called by ci.yml: the job builds
 # the compiler and runs every test suite with it. The machines keep their
-# LLVM devkit under ~/deps and their Zig caches between runs, so there is no
-# cache to restore and no compiler to hand from one job to another.
+# LLVM devkit and the newest release's compiler under ~/deps, and their Zig
+# caches under the runner's own tool cache; checkout leaves both alone, so
+# there is no cache to restore and no compiler to hand from one job to
+# another.
 on:
   workflow_call:
     inputs:
@@ -39,6 +41,35 @@ jobs:
           # release.
           fetch-depth: 0
 
+      # Zig's caches go under the runner's tool cache: the one directory of a
+      # self-hosted runner that checkout never cleans, so a run starts with
+      # what the run before it built. Measured on the WSL2 machine, building
+      # the compiler took 415 s with no cache, 326 s with the caches after a
+      # change to one src/*.zig file -- the compiler is one build step, with
+      # the C++ glue compiled inside it, so a source change rebuilds all of it
+      # -- and 0.04 s for a commit that changed nothing. A cache is wiped
+      # whole, never entry by entry, because a manifest may outlive the output
+      # it names. A run of the suites leaves about 6 GB in the local cache and
+      # the compiler's own share of the global one under 1 GB, so a 32 GiB cap
+      # is several runs of history, and a wipe costs one rebuild. A tool cache
+      # path is a Windows path on Windows, and the shell there wants it in
+      # slashes.
+      - name: Keep the Zig caches between runs
+        run: |
+          root='${{ runner.tool_cache }}/zigpp-cache'
+          root=${root//\\//}
+          cap=$(( 32 * 1024 * 1024 )) # KiB: 32 GiB
+          for kind in local global; do
+            dir="$root/$kind"
+            if [ -d "$dir" ] && [ "$(du -sk "$dir" | cut -f1)" -gt "$cap" ]; then
+              echo "wiping $dir, past its $(( cap / 1024 / 1024 )) GiB cap"
+              rm -rf "$dir"
+            fi
+            mkdir -p "$dir"
+          done
+          echo "ZIG_LOCAL_CACHE_DIR=$root/local" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$root/global" >> "$GITHUB_ENV"
+
       - name: Build Zig++
         id: build
         env:
@@ -46,38 +77,78 @@ jobs:
         run: .github/scripts/bootstrap.sh
 
       # Every suite runs once the compiler is built, whether an earlier one
-      # failed or not, so that a run reports all of its failures. Debug builds
-      # for x86_64 use the self-hosted back end unless -fllvm asks for LLVM,
-      # which release builds and most other targets use.
-      - name: Standard library and behavior
+      # failed or not, so that a run reports all of its failures. They run at
+      # the same time, one process each, with a quarter of the cores apiece --
+      # 8 on the laptop's machines, 2 on the M4 -- and a log of its own that the
+      # step prints once they have all finished. The four of them peaked at
+      # 14 GiB of the WSL2 machine's 30 GB at that share.
+      # Debug builds for x86_64 use the self-hosted back end unless -fllvm asks
+      # for LLVM, which release builds and most other targets use.
+      - name: Test suites
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           export PATH="$PWD/build-bootstrap/stage3/bin:$PATH"
-          zig build test-fmt
-          zig test lib/std/std.zig -lc
-          zig test test/behavior.zig
-          zig test lib/std/std.zig -lc -fllvm
-          zig test test/behavior.zig -fllvm
+          cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo "${NUMBER_OF_PROCESSORS:-4}")
+          share=$(( cores / 4 ))
+          mkdir -p .suite-logs
 
-      # Zig++ against C that the Clang in Zig++ compiled.
-      - name: C ABI
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: |
-          export PATH="$PWD/build-bootstrap/stage3/bin:$PATH"
-          zig build test-c-abi -Dskip-non-native -Dskip-release
+          standard_library() {
+            zig build test-fmt -j"$share"
+            zig test lib/std/std.zig -lc -j"$share"
+            zig test test/behavior.zig -j"$share"
+            zig test lib/std/std.zig -lc -fllvm -j"$share"
+            zig test test/behavior.zig -fllvm -j"$share"
+          }
 
-      # -Denable-llvm adds the cases that compile with the LLVM back end,
-      # which this compiler has.
-      - name: Compiler test cases
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: |
-          export PATH="$PWD/build-bootstrap/stage3/bin:$PATH"
-          zig build test-cases -Dskip-non-native -Denable-llvm
+          # Zig++ against C that the Clang in Zig++ compiled.
+          c_abi() {
+            zig build test-c-abi -Dskip-non-native -Dskip-release -j"$share"
+          }
 
-      # Includes the std.gpu suite, which runs its kernels on the GPU of the
-      # machine: CUDA on the RTX 5090 Laptop GPU under WSL2, Metal on the M4.
-      - name: Standalone
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: |
-          export PATH="$PWD/build-bootstrap/stage3/bin:$PATH"
-          zig build test-standalone -Dskip-non-native -Dskip-release
+          # -Denable-llvm adds the cases that compile with the LLVM back end,
+          # which this compiler has.
+          test_cases() {
+            zig build test-cases -Dskip-non-native -Denable-llvm -j"$share"
+          }
+
+          # Includes the std.gpu suite, which runs its kernels on the GPU of the
+          # machine: CUDA on the RTX 5090 Laptop GPU under WSL2, Metal on the M4.
+          standalone() {
+            zig build test-standalone -Dskip-non-native -Dskip-release -j"$share"
+          }
+
+          names=(standard-library c-abi test-cases standalone)
+          funcs=(standard_library c_abi test_cases standalone)
+          pids=()
+          for i in "${!names[@]}"; do
+            # Each suite writes its own seconds: waiting on one of them says
+            # when that one ended, which is not the same thing.
+            (
+              start=$SECONDS
+              if "${funcs[$i]}" >".suite-logs/${names[$i]}.log" 2>&1; then
+                status=0
+              else
+                status=$?
+              fi
+              echo "$(( SECONDS - start ))" >".suite-logs/${names[$i]}.seconds"
+              exit "$status"
+            ) &
+            pids[i]=$!
+          done
+
+          failed=""
+          for i in "${!names[@]}"; do
+            wait "${pids[$i]}" || failed="$failed ${names[$i]}"
+            printf '%s took %s seconds\n' "${names[$i]}" \
+              "$(cat ".suite-logs/${names[$i]}.seconds" 2>/dev/null || echo '?')"
+          done
+          for name in "${names[@]}"; do
+            echo "::group::$name"
+            cat ".suite-logs/$name.log"
+            echo "::endgroup::"
+          done
+
+          if [ -n "$failed" ]; then
+            echo "::error::failing suites:$failed"
+            exit 1
+          fi
