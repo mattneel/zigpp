@@ -3,7 +3,8 @@
 # Builds Zig++ from source for the machine it runs on: a static compiler with
 # the LLVM 23.1.2 of zigpp-bootstrap's devkit for this host, which every other
 # build starts from, because an upstream Zig cannot build Zig++. Hosts: x86_64
-# and aarch64 Linux, and aarch64 macOS.
+# and aarch64 Linux, aarch64 macOS, and x86_64 Windows in Git Bash, where only
+# the release's compiler builds it.
 #
 # The compiler of the newest Zig++ release builds it when it can. Otherwise it
 # is built from source alone, the way upstream's ci/*-release.sh scripts start:
@@ -24,7 +25,12 @@ case "$(uname -s)-$(uname -m)" in
   Linux-x86_64) TARGET=x86_64-linux-musl ;;
   Linux-aarch64) TARGET=aarch64-linux-musl ;;
   Darwin-arm64) TARGET=aarch64-macos-none ;;
+  MINGW64_NT-*-x86_64) TARGET=x86_64-windows-gnu ;;
   *) echo "no devkit for $(uname -s) $(uname -m)" >&2; exit 1 ;;
+esac
+case $TARGET in
+  *-windows-*) extension=zip ;;
+  *) extension=tar.xz ;;
 esac
 MCPU=baseline
 PREFIX=$(.github/scripts/devkit.sh "$TARGET")
@@ -51,10 +57,13 @@ from_release() {
   tag=$(gh release view --repo "$repo" --json tagName --jq .tagName) || return 1
   rm -rf "$release" && mkdir -p "$release" || return 1
   gh release download "$tag" --repo "$repo" --dir "$release" \
-    --pattern "zig-$arch-$os-*.tar.xz" || return 1
-  archive=$(cd "$release" && echo zig-*.tar.xz)
-  tar -xJf "$release/$archive" -C "$release" || return 1
-  name=${archive%.tar.xz}
+    --pattern "zig-$arch-$os-*.$extension" || return 1
+  archive=$(cd "$release" && echo zig-*."$extension")
+  case $extension in
+    zip) (cd "$release" && unzip -q "$archive") || return 1 ;;
+    tar.xz) tar -xJf "$release/$archive" -C "$release" || return 1 ;;
+  esac
+  name=${archive%."$extension"}
   version=${name#"zig-$arch-$os-"}
 
   if ! git diff --quiet "${version##*+zigpp.}" HEAD -- stage1/zig1.wasm; then
@@ -101,6 +110,14 @@ from_source() {
 }
 
 if ! from_release; then
+  case $TARGET in
+    *-windows-*)
+      # The source bootstrap is CMake and Ninja driving the devkit's Zig++ as
+      # the C compiler, which this script only does on a POSIX host.
+      echo "no release can build this checkout, and Windows builds only from a release" >&2
+      exit 1
+      ;;
+  esac
   echo "building Zig++ from source alone" >&2
   from_source
 fi

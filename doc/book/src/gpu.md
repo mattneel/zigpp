@@ -547,8 +547,9 @@ CI runs it as part of the standalone tests:
 zig build test-standalone -Dskip-non-native -Dskip-release
 ```
 
-The GPU suite compiles its kernels for all three vendors on a runner with no
-GPU driver, where the suite then skips itself.
+CI's Linux machine runs the CUDA variant on an RTX 5090 Laptop GPU, and its Mac
+runs the Metal variant on an M4. On a machine with no GPU driver, the suite
+compiles its kernels for all three vendors and then skips itself.
 
 ## What is not there yet
 
