@@ -20,8 +20,78 @@ var base_allocator_instance = std.heap.FixedBufferAllocator.init("");
 pub var allocator_instance: std.heap.SafeAllocator = undefined;
 pub const allocator = if (builtin.is_test) allocator_instance.allocator() else @compileError("not testing");
 
-pub var io_instance: Io.Threaded = undefined;
+pub var io_instance: IoInstance = undefined;
 pub const io = if (builtin.is_test) io_instance.io() else @compileError("not testing");
+
+/// The implementation behind `io`, chosen by the test runner for each run: `Io.Threaded` by
+/// default, or `Io.Threadz` when the runner is given `--io=threadz`. `io` stays comptime-known
+/// because it points at this instance's storage and at a copy of the chosen vtable.
+pub const IoInstance = struct {
+    kind: Kind,
+    /// Holds the chosen implementation. Plain bytes rather than a union, so that nothing reads
+    /// the whole of it while its workers run.
+    storage: [storage_len]u8 align(storage_align),
+    vtable: Io.VTable,
+
+    const Threadz = if (Kind.threadz_available) Io.Threadz else void;
+    const storage_len = @max(@sizeOf(Io.Threaded), @sizeOf(Threadz));
+    const storage_align = @max(@alignOf(Io.Threaded), @alignOf(Threadz));
+
+    pub const Kind = enum {
+        threaded,
+        threadz,
+
+        /// Threadz runs the tests on Linux. The other cores join when they are rewritten on
+        /// the shared scheduler.
+        pub const threadz_available = builtin.os.tag == .linux and Io.Threadz != void;
+    };
+
+    pub const Options = struct {
+        argv0: Io.Threaded.Argv0 = .empty,
+        environ: Environ = .empty,
+    };
+
+    fn threaded(ii: *IoInstance) *Io.Threaded {
+        return @ptrCast(&ii.storage);
+    }
+
+    fn threadz(ii: *IoInstance) *Threadz {
+        return @ptrCast(&ii.storage);
+    }
+
+    pub fn init(ii: *IoInstance, kind: Kind, gpa: std.mem.Allocator, options: Options) void {
+        ii.kind = kind;
+        switch (kind) {
+            .threaded => {
+                ii.threaded().* = .init(gpa, .{
+                    .argv0 = options.argv0,
+                    .environ = options.environ,
+                });
+                ii.vtable = ii.threaded().io().vtable.*;
+            },
+            .threadz => if (!Kind.threadz_available) {
+                std.debug.panic("Io.Threadz is not available on {t}", .{builtin.os.tag});
+            } else {
+                ii.threadz().init(gpa, .{
+                    .argv0 = options.argv0,
+                    .environ = options.environ,
+                }) catch |err| std.debug.panic("unable to start Io.Threadz: {t}", .{err});
+                ii.vtable = ii.threadz().io().vtable.*;
+            },
+        }
+    }
+
+    pub fn deinit(ii: *IoInstance) void {
+        switch (ii.kind) {
+            .threaded => ii.threaded().deinit(),
+            .threadz => if (Kind.threadz_available) ii.threadz().deinit() else unreachable,
+        }
+    }
+
+    pub fn io(ii: *IoInstance) Io {
+        return .{ .userdata = &ii.storage, .vtable = &ii.vtable };
+    }
+};
 
 pub var environ: Environ = if (builtin.is_test) undefined else @compileError("not testing");
 

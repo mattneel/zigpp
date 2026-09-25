@@ -1,5 +1,6 @@
 const addressFromPosix = Io.Threaded.addressFromPosix;
 const addressToPosix = Io.Threaded.addressToPosix;
+const addressUnixToPosix = Io.Threaded.addressUnixToPosix;
 const Alignment = std.mem.Alignment;
 const Allocator = std.mem.Allocator;
 const Argv0 = Io.Threaded.Argv0;
@@ -42,33 +43,18 @@ const statxKind = Io.Threaded.statxKind;
 const std = @import("../std.zig");
 const timestampFromPosix = Io.Threaded.timestampFromPosix;
 const unexpectedErrno = std.posix.unexpectedErrno;
+const UnixAddress = Io.Threaded.UnixAddress;
 const winsize = std.posix.winsize;
-
-const tracy = if (@hasDecl(@import("root"), "tracy")) @import("root").tracy else struct {
-    const enable = false;
-    inline fn fiberEnter(fiber: [*:0]const u8) void {
-        _ = fiber;
-    }
-    inline fn fiberLeave() void {}
-};
-
-/// Empirically saw >128KB being used by the self-hosted backend to panic.
-/// Empirically saw glibc complain about 256KB.
-const idle_stack_size = 512 * 1024;
-
-const max_idle_search = 1;
-const max_steal_ready_search = 2;
-const max_steal_free_search = 4;
+const scheduler = @import("Threadz/scheduler.zig");
+const Scheduler = scheduler.Scheduler(Evented);
+const Fiber = Scheduler.Task;
 
 backing_allocator_needs_mutex: bool,
 backing_allocator_mutex: Io.Mutex,
 /// Does not need to be thread-safe if not used elsewhere.
 backing_allocator: Allocator,
-main_fiber_buffer: [
-    std.mem.alignForward(usize, @sizeOf(Fiber), @alignOf(Completion)) + @sizeOf(Completion)
-]u8 align(@max(@alignOf(Fiber), @alignOf(Completion))),
 log2_ring_entries: u4,
-threads: Thread.List,
+sched: Scheduler,
 sync_limit: ?Io.Semaphore,
 
 stderr_writer_initialized: bool = false,
@@ -91,38 +77,18 @@ random_fd: CachedFd,
 csprng_mutex: Io.Mutex,
 csprng: Csprng,
 
+/// A worker's io_uring and the state that goes with it.
 const Thread = struct {
-    required_align: void align(4),
-    thread: std.Thread,
-    idle_context: Io.fiber.Context,
-    current_context: *Io.fiber.Context,
-    ready_queue: ?*Fiber,
-    free_queue: ?*Fiber,
     io_uring: IoUring,
-    idle_search_index: u32,
-    steal_ready_search_index: u32,
-    steal_free_search_index: u32,
-    name_arena: if (tracy.enable) std.heap.ArenaAllocator.State else struct {},
     csprng: Csprng,
 
-    threadlocal var self: ?*Thread = null;
-
-    noinline fn current() *Thread {
-        return self.?;
-    }
-
-    fn deinit(thread: *Thread, gpa: Allocator) void {
-        var next_fiber = thread.free_queue;
-        while (next_fiber) |free_fiber| {
-            next_fiber = free_fiber.status.free_next;
-            gpa.free(free_fiber.allocatedSlice());
-        }
-        thread.io_uring.deinit();
+    fn current() *Thread {
+        return &Scheduler.Worker.current().backend;
     }
 
     fn currentFiber(thread: *Thread) *Fiber {
-        assert(thread.current_context != &thread.idle_context);
-        return @fieldParentPtr("context", thread.current_context);
+        const worker: *Scheduler.Worker = @alignCast(@fieldParentPtr("backend", thread));
+        return worker.currentTask();
     }
 
     fn enqueue(thread: *Thread) *linux.io_uring_sqe {
@@ -138,279 +104,10 @@ const Thread = struct {
             else => |e| @panic(@errorName(e)),
         };
     }
-
-    const List = struct {
-        allocated: []Thread,
-        reserved: u32,
-        active: u32,
-    };
 };
 
-const Fiber = struct {
-    required_align: void align(4),
-    context: Io.fiber.Context,
-    link: union {
-        awaiter: ?*Fiber,
-        group: struct { prev: ?*Fiber, next: ?*Fiber },
-    },
-    status: union(enum) {
-        queue_next: ?*Fiber,
-        awaiting_group: Group,
-        free_next: ?*Fiber,
-    },
-    cancel_status: CancelStatus,
-    cancel_protection: CancelProtection,
-    name: if (tracy.enable) [*:0]const u8 else void,
-
-    var next_name: u64 = 0;
-
-    const CancelStatus = packed struct(u32) {
-        requested: bool,
-        awaiting: Awaiting,
-
-        const unrequested: CancelStatus = .{ .requested = false, .awaiting = .nothing };
-
-        const Awaiting = enum(u31) {
-            nothing = std.math.maxInt(u31),
-            group = std.math.maxInt(u31) - 1,
-            /// An io_uring fd.
-            _,
-
-            fn subWrap(lhs: Awaiting, rhs: Awaiting) Awaiting {
-                return @fromBackingInt(@intCast(@backingInt(lhs) -% @backingInt(rhs)));
-            }
-
-            fn fromIoUringFd(fd: fd_t) Awaiting {
-                const awaiting: Awaiting = @fromBackingInt(@intCast(fd));
-                switch (awaiting) {
-                    .nothing, .group => unreachable,
-                    _ => return awaiting,
-                }
-            }
-
-            fn toIoUringFd(awaiting: Awaiting) fd_t {
-                switch (awaiting) {
-                    .nothing, .group => unreachable,
-                    _ => return @backingInt(awaiting),
-                }
-            }
-        };
-
-        fn changeAwaiting(
-            cancel_status: *CancelStatus,
-            old_awaiting: Awaiting,
-            new_awaiting: Awaiting,
-        ) bool {
-            const old_cancel_status = @atomicRmw(CancelStatus, cancel_status, .Add, .{
-                .requested = false,
-                .awaiting = new_awaiting.subWrap(old_awaiting),
-            }, .monotonic);
-            assert(old_cancel_status.awaiting == old_awaiting);
-            return old_cancel_status.requested;
-        }
-    };
-
-    const CancelProtection = packed struct {
-        user: Io.CancelProtection,
-        acknowledged: bool,
-
-        const unblocked: CancelProtection = .{ .user = .unblocked, .acknowledged = false };
-
-        fn check(cancel_protection: CancelProtection) Io.CancelProtection {
-            return @fromBackingInt(@intCast(@intFromBool(cancel_protection != unblocked)));
-        }
-
-        fn acknowledge(cancel_protection: *CancelProtection) void {
-            assert(!cancel_protection.acknowledged);
-            cancel_protection.acknowledged = true;
-        }
-
-        fn recancel(cancel_protection: *CancelProtection) void {
-            assert(cancel_protection.acknowledged);
-            cancel_protection.acknowledged = false;
-        }
-
-        test check {
-            try std.testing.expectEqual(Io.CancelProtection.unblocked, check(.unblocked));
-            try std.testing.expectEqual(Io.CancelProtection.blocked, check(.{
-                .user = .unblocked,
-                .acknowledged = true,
-            }));
-            try std.testing.expectEqual(Io.CancelProtection.blocked, check(.{
-                .user = .blocked,
-                .acknowledged = false,
-            }));
-            try std.testing.expectEqual(Io.CancelProtection.blocked, check(.{
-                .user = .blocked,
-                .acknowledged = true,
-            }));
-        }
-    };
-
-    const finished: ?*Fiber = @ptrFromInt(@alignOf(Fiber));
-
-    const max_result_align: Alignment = .@"16";
-    const max_result_size = max_result_align.forward(512);
-    /// This includes any stack realignments that need to happen, and also the
-    /// initial frame return address slot and argument frame, depending on target.
-    const min_stack_size = 60 * 1024 * 1024;
-    const max_context_align: Alignment = .@"16";
-    const max_context_size = max_context_align.forward(1024);
-    const max_closure_size: usize = @sizeOf(AsyncClosure);
-    const max_closure_align: Alignment = .of(AsyncClosure);
-    const allocation_size = std.mem.alignForward(
-        usize,
-        max_closure_align.max(max_context_align).forward(
-            max_result_align.forward(@sizeOf(Fiber)) + max_result_size + min_stack_size,
-        ) + max_closure_size + max_context_size,
-        std.heap.page_size_max,
-    );
-    comptime {
-        assert(max_result_align.compare(.gte, .of(Completion)));
-        assert(max_result_size >= @sizeOf(Completion));
-    }
-
-    fn create(ev: *Evented) error{OutOfMemory}!*Fiber {
-        const thread: *Thread = .current();
-        if (@atomicRmw(?*Fiber, &thread.free_queue, .Xchg, finished, .acquire)) |free_fiber| {
-            assert(free_fiber != finished);
-            @atomicStore(?*Fiber, &thread.free_queue, free_fiber.status.free_next, .release);
-            return free_fiber;
-        }
-        const active_threads = @atomicLoad(u32, &ev.threads.active, .acquire);
-        for (0..@min(max_steal_free_search, active_threads)) |_| {
-            defer thread.steal_free_search_index += 1;
-            if (thread.steal_free_search_index == active_threads) thread.steal_free_search_index = 0;
-            const steal_free_search_thread =
-                &ev.threads.allocated[0..active_threads][thread.steal_free_search_index];
-            if (steal_free_search_thread == thread) continue;
-            const free_fiber =
-                @atomicLoad(?*Fiber, &steal_free_search_thread.free_queue, .monotonic) orelse continue;
-            if (free_fiber == finished) continue;
-            if (@cmpxchgWeak(
-                ?*Fiber,
-                &steal_free_search_thread.free_queue,
-                free_fiber,
-                null,
-                .acquire,
-                .monotonic,
-            )) |_| continue;
-            @atomicStore(?*Fiber, &thread.free_queue, free_fiber.status.free_next, .release);
-            return free_fiber;
-        }
-        @atomicStore(?*Fiber, &thread.free_queue, null, .monotonic);
-        return @ptrCast(try ev.allocator().alignedAlloc(u8, .of(Fiber), allocation_size));
-    }
-
-    fn destroy(fiber: *Fiber) void {
-        const thread: *Thread = .current();
-        assert(fiber.status.queue_next == null);
-        fiber.status = .{ .free_next = @atomicLoad(?*Fiber, &thread.free_queue, .acquire) };
-        while (true) fiber.status.free_next = @cmpxchgWeak(
-            ?*Fiber,
-            &thread.free_queue,
-            fiber.status.free_next,
-            fiber,
-            .acq_rel,
-            .acquire,
-        ) orelse break;
-    }
-
-    fn allocatedSlice(f: *Fiber) []align(@alignOf(Fiber)) u8 {
-        return @as([*]align(@alignOf(Fiber)) u8, @ptrCast(f))[0..allocation_size];
-    }
-
-    fn allocatedEnd(f: *Fiber) [*]u8 {
-        const allocated_slice = f.allocatedSlice();
-        return allocated_slice[allocated_slice.len..].ptr;
-    }
-
-    fn resultPointer(f: *Fiber, comptime Result: type) *Result {
-        return @ptrCast(@alignCast(f.resultBytes(.of(Result))));
-    }
-
-    fn resultBytes(f: *Fiber, alignment: Alignment) [*]u8 {
-        return @ptrFromInt(alignment.forward(@intFromPtr(f) + @sizeOf(Fiber)));
-    }
-
-    const Queue = struct { head: *Fiber, tail: *Fiber };
-
-    /// Like a `*Fiber`, but 2 bits smaller than a pointer (because the LSBs are always 0 due to
-    /// alignment) so that those two bits can be used in a `packed struct`.
-    const PackedPtr = enum(@Int(.unsigned, @bitSizeOf(usize) - 2)) {
-        null = 0,
-        all_ones = std.math.maxInt(@Int(.unsigned, @bitSizeOf(usize) - 2)),
-        _,
-
-        const Split = packed struct(usize) { low: u2, high: PackedPtr };
-        fn pack(ptr: ?*Fiber) PackedPtr {
-            const split: Split = @bitCast(@intFromPtr(ptr));
-            assert(split.low == 0);
-            return split.high;
-        }
-        fn unpack(ptr: PackedPtr) ?*Fiber {
-            const split: Split = .{ .low = 0, .high = ptr };
-            return @ptrFromInt(@as(usize, @bitCast(split)));
-        }
-    };
-
-    fn requestCancel(fiber: *Fiber, ev: *Evented) void {
-        const cancel_status = @atomicRmw(
-            Fiber.CancelStatus,
-            &fiber.cancel_status,
-            .Or,
-            .{ .requested = true, .awaiting = @fromBackingInt(@intCast(0)) },
-            .acquire,
-        );
-        assert(!cancel_status.requested);
-        switch (cancel_status.awaiting) {
-            .nothing => {},
-            .group => {
-                // The awaiter received a cancelation request while awaiting a group,
-                // so propagate the cancelation to the group.
-                if (fiber.status.awaiting_group.cancel(ev, null)) {
-                    fiber.status = .{ .queue_next = null };
-                    _ = ev.schedule(.current(), .{ .head = fiber, .tail = fiber });
-                }
-            },
-            _ => |awaiting| {
-                const awaiting_io_uring_fd = awaiting.toIoUringFd();
-                const thread: *Thread = .current();
-                thread.enqueue().* = if (thread.io_uring.fd == awaiting_io_uring_fd) .{
-                    .opcode = .ASYNC_CANCEL,
-                    .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-                    .ioprio = 0,
-                    .fd = 0,
-                    .off = 0,
-                    .addr = @intFromPtr(fiber),
-                    .len = 0,
-                    .rw_flags = 0,
-                    .user_data = @backingInt(Completion.Userdata.wakeup),
-                    .buf_index = 0,
-                    .personality = 0,
-                    .splice_fd_in = 0,
-                    .addr3 = 0,
-                    .resv = 0,
-                } else .{
-                    .opcode = .MSG_RING,
-                    .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-                    .ioprio = 0,
-                    .fd = awaiting_io_uring_fd,
-                    .off = @intFromPtr(fiber) | 0b01,
-                    .addr = @backingInt(linux.IORING_MSG_RING_COMMAND.DATA),
-                    .len = 0,
-                    .rw_flags = 0,
-                    .user_data = @backingInt(Completion.Userdata.cleanup),
-                    .buf_index = 0,
-                    .personality = 0,
-                    .splice_fd_in = 0,
-                    .addr3 = 0,
-                    .resv = 0,
-                };
-            },
-        }
-    }
-};
+/// For the scheduler: a worker's state in this backend.
+pub const Worker = Thread;
 
 const CancelRegion = struct {
     fiber: *Fiber,
@@ -452,6 +149,9 @@ const CancelRegion = struct {
             status.awaiting,
         )) {
             @branchHint(.unlikely);
+            // The request arrived first, so nothing is pending that it could cancel. Leave the
+            // fiber awaiting nothing, since `deinit` does not run for an unrequested region.
+            _ = cancel_region.fiber.cancel_status.changeAwaiting(status.awaiting, .nothing);
             cancel_region.fiber.cancel_protection.acknowledge();
             cancel_region.status = .unrequested;
             return error.Canceled;
@@ -460,7 +160,7 @@ const CancelRegion = struct {
     }
     fn awaitIoUring(cancel_region: *CancelRegion) Io.Cancelable!*Thread {
         const thread: *Thread = .current();
-        try cancel_region.await(.fromIoUringFd(thread.io_uring.fd));
+        try cancel_region.await(.fromToken(@intCast(thread.io_uring.fd)));
         return thread;
     }
     fn completion(cancel_region: *const CancelRegion) Completion {
@@ -665,21 +365,21 @@ pub fn io(ev: *Evented) Io {
     return .{
         .userdata = ev,
         .vtable = &.{
-            .crashHandler = crashHandler,
+            .crashHandler = Scheduler.crashHandler,
 
-            .async = async,
-            .concurrent = concurrent,
-            .await = await,
-            .cancel = cancel,
+            .async = Scheduler.async,
+            .concurrent = Scheduler.concurrent,
+            .await = Scheduler.await,
+            .cancel = Scheduler.cancel,
 
-            .groupAsync = groupAsync,
-            .groupConcurrent = groupConcurrent,
-            .groupAwait = groupAwait,
-            .groupCancel = groupCancel,
+            .groupAsync = Scheduler.groupAsync,
+            .groupConcurrent = Scheduler.groupConcurrent,
+            .groupAwait = Scheduler.groupAwait,
+            .groupCancel = Scheduler.groupCancel,
 
-            .recancel = recancel,
-            .swapCancelProtection = swapCancelProtection,
-            .checkCancel = checkCancel,
+            .recancel = Scheduler.recancel,
+            .swapCancelProtection = Scheduler.swapCancelProtection,
+            .checkCancel = Scheduler.checkCancel,
 
             .futexWait = futexWait,
             .futexWaitUncancelable = futexWaitUncancelable,
@@ -771,19 +471,19 @@ pub fn io(ev: *Evented) Io {
             .random = random,
             .randomSecure = randomSecure,
 
-            .netListenIp = netListenIpUnavailable,
-            .netAccept = netAcceptUnavailable,
+            .netListenIp = netListenIp,
+            .netAccept = netAccept,
             .netBindIp = netBindIp,
-            .netConnectIp = netConnectIpUnavailable,
-            .netListenUnix = netListenUnixUnavailable,
-            .netConnectUnix = netConnectUnixUnavailable,
-            .netSocketCreatePair = netSocketCreatePairUnavailable,
-            .netWriteFile = netWriteFileUnavailable,
+            .netConnectIp = netConnectIp,
+            .netListenUnix = netListenUnix,
+            .netConnectUnix = netConnectUnix,
+            .netSocketCreatePair = netSocketCreatePair,
+            .netWriteFile = netWriteFile,
             .netClose = netClose,
             .netShutdown = netShutdown,
-            .netInterfaceNameResolve = netInterfaceNameResolveUnavailable,
-            .netInterfaceName = netInterfaceNameUnavailable,
-            .netLookup = netLookupUnavailable,
+            .netInterfaceNameResolve = netInterfaceNameResolve,
+            .netInterfaceName = netInterfaceName,
+            .netLookup = netLookup,
         },
     };
 }
@@ -799,6 +499,10 @@ pub const InitOptions = struct {
 
     log2_ring_entries: u4 = 3,
 
+    /// The stack reserved for each task, unless its spawn says otherwise. The OS commits the
+    /// pages as the task touches them, and a guard page below the stack catches an overflow.
+    stack_size: usize = scheduler.default_stack_size,
+
     /// Affects the following operations:
     /// * `processExecutablePath` on OpenBSD and Haiku.
     argv0: Argv0 = .empty,
@@ -808,26 +512,15 @@ pub const InitOptions = struct {
     environ: process.Environ = .empty,
 };
 
+/// Makes the calling thread the first worker, running as the main task. `ev` must stay put
+/// until `deinit`, which must be called from the main task.
 pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !void {
-    const threads_size = @sizeOf(Thread) * if (options.thread_limit) |thread_limit|
-        1 + thread_limit
-    else
-        @max(std.Thread.getCpuCount() catch 1, 1);
-    const idle_stack_end_offset =
-        std.mem.alignForward(usize, threads_size + idle_stack_size, std.heap.pageSize());
-    const allocated_slice = try backing_allocator.alignedAlloc(u8, .of(Thread), idle_stack_end_offset);
-    errdefer backing_allocator.free(allocated_slice);
     ev.* = .{
         .backing_allocator_needs_mutex = options.backing_allocator_needs_mutex,
         .backing_allocator_mutex = .init,
         .backing_allocator = backing_allocator,
-        .main_fiber_buffer = undefined,
         .log2_ring_entries = options.log2_ring_entries,
-        .threads = .{
-            .allocated = @ptrCast(allocated_slice[0..threads_size]),
-            .reserved = 1,
-            .active = 1,
-        },
+        .sched = undefined,
         .sync_limit = if (options.sync_limit.toInt()) |sync_limit| .{ .permits = sync_limit } else null,
 
         .stderr_writer_initialized = false,
@@ -850,240 +543,52 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
         .csprng_mutex = .init,
         .csprng = .uninitialized,
     };
-    const main_fiber: *Fiber = @ptrCast(&ev.main_fiber_buffer);
-    main_fiber.* = .{
-        .required_align = {},
-        .context = undefined,
-        .link = .{ .awaiter = null },
-        .status = .{ .queue_next = null },
-        .cancel_status = .unrequested,
-        .cancel_protection = .unblocked,
-        .name = if (tracy.enable) "main task",
-    };
-    const main_thread = &ev.threads.allocated[0];
-    Thread.self = main_thread;
-    main_thread.* = .{
-        .required_align = {},
-        .thread = undefined,
-        .idle_context = switch (builtin.cpu.arch) {
-            .aarch64 => .{
-                .sp = @intFromPtr(allocated_slice[idle_stack_end_offset..].ptr),
-                .fp = @intFromPtr(ev),
-                .pc = @intFromPtr(&mainIdleEntry),
-            },
-            .riscv64 => .{
-                .sp = @intFromPtr(allocated_slice[idle_stack_end_offset..].ptr),
-                .fp = @intFromPtr(ev),
-                .pc = @intFromPtr(&mainIdleEntry),
-            },
-            .x86_64 => .{
-                .rsp = @intFromPtr(allocated_slice[idle_stack_end_offset..].ptr),
-                .rbp = @intFromPtr(ev),
-                .rip = @intFromPtr(&mainIdleEntry),
-            },
-            else => @compileError("unimplemented architecture"),
-        },
-        .current_context = &main_fiber.context,
-        .ready_queue = null,
-        .free_queue = null,
-        .io_uring = try .init(
-            @as(u16, 1) << ev.log2_ring_entries,
-            linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER,
-        ),
-        .idle_search_index = 1,
-        .steal_ready_search_index = 1,
-        .steal_free_search_index = 1,
-        .name_arena = .{},
-        .csprng = .uninitialized,
-    };
-    errdefer main_thread.io_uring.deinit();
-    if (tracy.enable) tracy.fiberEnter(main_fiber.name);
+    try ev.sched.init(backing_allocator, .{
+        .workers = if (options.thread_limit) |thread_limit| 1 + thread_limit else null,
+        .stack_size = options.stack_size,
+    });
 }
 
+/// Called from the main task once every other task has been awaited. Returns on the thread that
+/// called `init`.
 pub fn deinit(ev: *Evented) void {
-    const main_fiber: *Fiber = @ptrCast(&ev.main_fiber_buffer);
-    assert(Thread.current().currentFiber() == main_fiber);
-    const active_threads = @atomicLoad(u32, &ev.threads.active, .acquire);
-    for (ev.threads.allocated[0..active_threads]) |*thread| {
-        const ready_fiber = @atomicLoad(?*Fiber, &thread.ready_queue, .monotonic);
-        assert(ready_fiber == null or ready_fiber == Fiber.finished); // pending async
-    }
-    ev.yield(null, .exit);
+    ev.sched.deinit(ev.backing_allocator);
     ev.null_fd.close();
     ev.random_fd.close();
-    const allocated_ptr: [*]align(@alignOf(Thread)) u8 = @ptrCast(@alignCast(ev.threads.allocated.ptr));
-    const idle_stack_end_offset = std.mem.alignForward(
-        usize,
-        ev.threads.allocated.len * @sizeOf(Thread) + idle_stack_size,
-        std.heap.pageSize(),
-    );
-    for (ev.threads.allocated[1..active_threads]) |*thread| thread.thread.join();
-    for (ev.threads.allocated[0..active_threads]) |*thread| thread.deinit(ev.backing_allocator);
-    assert(active_threads == ev.threads.active); // spawned threads while there was no pending async?
-    ev.backing_allocator.free(allocated_ptr[0..idle_stack_end_offset]);
     ev.* = undefined;
 }
 
-fn findReadyFiber(ev: *Evented, thread: *Thread) ?*Fiber {
-    if (@atomicRmw(?*Fiber, &thread.ready_queue, .Xchg, Fiber.finished, .acquire)) |ready_fiber| {
-        assert(ready_fiber != Fiber.finished);
-        @atomicStore(?*Fiber, &thread.ready_queue, ready_fiber.status.queue_next, .release);
-        ready_fiber.status.queue_next = null;
-        return ready_fiber;
-    }
-    const active_threads = @atomicLoad(u32, &ev.threads.active, .acquire);
-    for (0..@min(max_steal_ready_search, active_threads)) |_| {
-        defer thread.steal_ready_search_index += 1;
-        if (thread.steal_ready_search_index == active_threads) thread.steal_ready_search_index = 0;
-        const steal_ready_search_thread =
-            &ev.threads.allocated[0..active_threads][thread.steal_ready_search_index];
-        if (steal_ready_search_thread == thread) continue;
-        const ready_fiber =
-            @atomicLoad(?*Fiber, &steal_ready_search_thread.ready_queue, .monotonic) orelse continue;
-        if (ready_fiber == Fiber.finished) continue;
-        if (@cmpxchgWeak(
-            ?*Fiber,
-            &steal_ready_search_thread.ready_queue,
-            ready_fiber,
-            null,
-            .acquire,
-            .monotonic,
-        )) |_| continue;
-        @atomicStore(?*Fiber, &thread.ready_queue, ready_fiber.status.queue_next, .release);
-        ready_fiber.status.queue_next = null;
-        return ready_fiber;
-    }
-    // couldn't find anything to do, so we are now open for business
-    @atomicStore(?*Fiber, &thread.ready_queue, null, .monotonic);
-    return null;
+pub const SpawnOptions = scheduler.SpawnOptions;
+pub const Affinity = scheduler.Affinity;
+
+/// `Io.concurrent`, with a stack size and an affinity for the task.
+pub fn concurrentWith(
+    ev: *Evented,
+    options: SpawnOptions,
+    function: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(function)),
+) Io.ConcurrentError!Io.Future(@typeInfo(@TypeOf(function)).@"fn".return_type.?) {
+    return ev.sched.concurrentWith(options, function, args);
 }
 
-fn yield(ev: *Evented, maybe_ready_fiber: ?*Fiber, pending_task: SwitchMessage.PendingTask) void {
-    const thread: *Thread = .current();
-    const ready_context = if (maybe_ready_fiber orelse ev.findReadyFiber(thread)) |ready_fiber|
-        &ready_fiber.context
-    else
-        &thread.idle_context;
-    const message: SwitchMessage = .{
-        .contexts = .{
-            .old = thread.current_context,
-            .new = ready_context,
-        },
-        .pending_task = pending_task,
-    };
-    contextSwitch(&message).handle(ev);
+/// `Io.Group.concurrent`, with a stack size and an affinity for the task.
+pub fn groupConcurrentWith(
+    ev: *Evented,
+    group: *Io.Group,
+    options: SpawnOptions,
+    function: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(function)),
+) Io.ConcurrentError!void {
+    return ev.sched.groupConcurrentWith(group, options, function, args);
 }
 
-fn schedule(ev: *Evented, thread: *Thread, ready_queue: Fiber.Queue) bool {
-    // shared fields of previous `Thread` must be initialized before later ones are marked as active
-    const new_thread_index = @atomicLoad(u32, &ev.threads.active, .acquire);
-    for (0..@min(max_idle_search, new_thread_index)) |_| {
-        defer thread.idle_search_index += 1;
-        if (thread.idle_search_index == new_thread_index) thread.idle_search_index = 0;
-        const idle_search_thread = &ev.threads.allocated[0..new_thread_index][thread.idle_search_index];
-        if (idle_search_thread == thread) continue;
-        if (@cmpxchgWeak(
-            ?*Fiber,
-            &idle_search_thread.ready_queue,
-            null,
-            ready_queue.head,
-            .release,
-            .monotonic,
-        )) |_| continue;
-        thread.enqueue().* = .{
-            .opcode = .MSG_RING,
-            .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-            .ioprio = 0,
-            .fd = idle_search_thread.io_uring.fd,
-            .off = @backingInt(Completion.Userdata.wakeup),
-            .addr = @backingInt(linux.IORING_MSG_RING_COMMAND.DATA),
-            .len = 0,
-            .rw_flags = 0,
-            .user_data = @backingInt(Completion.Userdata.wakeup),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
-        return true;
-    }
-    spawn_thread: {
-        // previous failed reservations must have completed before retrying
-        if (new_thread_index == ev.threads.allocated.len or @cmpxchgWeak(
-            u32,
-            &ev.threads.reserved,
-            new_thread_index,
-            new_thread_index + 1,
-            .acquire,
-            .monotonic,
-        ) != null) break :spawn_thread;
-        const new_thread = &ev.threads.allocated[new_thread_index];
-        const next_thread_index = new_thread_index + 1;
-        var params = std.mem.zeroInit(linux.io_uring_params, .{
-            .flags = linux.IORING_SETUP_ATTACH_WQ |
-                linux.IORING_SETUP_R_DISABLED |
-                linux.IORING_SETUP_COOP_TASKRUN |
-                linux.IORING_SETUP_SINGLE_ISSUER,
-            .wq_fd = @as(u32, @intCast(ev.threads.allocated[0].io_uring.fd)),
-        });
-        new_thread.* = .{
-            .required_align = {},
-            .thread = undefined,
-            .idle_context = undefined,
-            .current_context = &new_thread.idle_context,
-            .ready_queue = ready_queue.head,
-            .free_queue = null,
-            .io_uring = IoUring.init_params(@as(u16, 1) << ev.log2_ring_entries, &params) catch |err| {
-                @atomicStore(u32, &ev.threads.reserved, new_thread_index, .release);
-                // no more access to `thread` after giving up reservation
-                log.warn("unable to create worker thread due to io_uring init failure: {s}", .{
-                    @errorName(err),
-                });
-                break :spawn_thread;
-            },
-            .idle_search_index = 0,
-            .steal_ready_search_index = 0,
-            .steal_free_search_index = 0,
-            .name_arena = .{},
-            .csprng = .uninitialized,
-        };
-        new_thread.thread = std.Thread.spawn(.{
-            .stack_size = idle_stack_size,
-            .allocator = ev.allocator(),
-        }, threadEntry, .{ ev, new_thread_index }) catch |err| {
-            new_thread.io_uring.deinit();
-            @atomicStore(u32, &ev.threads.reserved, new_thread_index, .release);
-            // no more access to `thread` after giving up reservation
-            log.warn("unable to create worker thread due spawn failure: {s}", .{@errorName(err)});
-            break :spawn_thread;
-        };
-        // shared fields of `Thread` must be initialized before being marked active
-        @atomicStore(u32, &ev.threads.active, next_thread_index, .release);
-        return false;
-    }
-    // nobody wanted it, so just queue it on ourselves
-    while (true) ready_queue.tail.status.queue_next = @cmpxchgWeak(
-        ?*Fiber,
-        &thread.ready_queue,
-        ready_queue.tail.status.queue_next,
-        ready_queue.head,
-        .acq_rel,
-        .acquire,
-    ) orelse break;
-    return false;
+/// Starts no more than `n` workers, counting the thread that called `init`, and no more than
+/// `InitOptions.thread_limit` allowed. Workers already running keep running.
+pub fn setWorkerLimit(ev: *Evented, n: usize) void {
+    ev.sched.setWorkerLimit(n);
 }
 
-fn threadEntry(ev: *Evented, index: u32) void {
-    const thread: *Thread = &ev.threads.allocated[index];
-    Thread.self = thread;
-    switch (linux.errno(linux.io_uring_register(thread.io_uring.fd, .REGISTER_ENABLE_RINGS, null, 0))) {
-        .SUCCESS => ev.idle(thread),
-        else => |err| @panic(@tagName(err)),
-    }
-}
-
-const Completion = struct {
+pub const Completion = struct {
     result: i32,
     flags: u32,
 
@@ -1093,830 +598,251 @@ const Completion = struct {
         futex_wake,
         close,
         cleanup,
-        exit,
         /// If bit 0 is 1, a pointer to the `context` field of `Io.Batch.Storage.Pending`.
         /// If bits 0 and 1 are 0, a `*Fiber`.
         _,
     };
 
     fn errno(completion: Completion) linux.E {
-        return linux.errno(@bitCast(@as(isize, completion.result)));
+        return linux.errno(@as(isize, completion.result));
     }
 };
 
-fn mainIdleEntry() callconv(.naked) void {
-    switch (builtin.cpu.arch) {
-        .aarch64 => asm volatile (
-            \\ mov x0, fp
-            \\ mov fp, #0
-            \\ b %[mainIdle]
-            :
-            : [mainIdle] "X" (&mainIdle),
-        ),
-        .riscv64 => asm volatile (
-            \\ mv a0, fp
-            \\ mv fp, zero
-            \\ tail %[mainIdle]@plt
-            :
-            : [mainIdle] "X" (&mainIdle),
-        ),
-        .x86_64 => asm volatile (
-            \\ movq %%rbp, %%rdi
-            \\ xor %%ebp, %%ebp
-            \\ jmp %[mainIdle:P]
-            :
-            : [mainIdle] "X" (&mainIdle),
-        ),
-        else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
+/// For the scheduler: sets up worker `worker.index`'s ring. Workers after the first share the
+/// first one's kernel worker pool, and start disabled until their own thread enables them.
+pub fn workerInit(ev: *Evented, worker: *Scheduler.Worker) !void {
+    const entries = @as(u16, 1) << ev.log2_ring_entries;
+    worker.backend = .{
+        .io_uring = if (worker.index == 0)
+            try .init(entries, linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER)
+        else ring: {
+            var params = std.mem.zeroInit(linux.io_uring_params, .{
+                .flags = linux.IORING_SETUP_ATTACH_WQ |
+                    linux.IORING_SETUP_R_DISABLED |
+                    linux.IORING_SETUP_COOP_TASKRUN |
+                    linux.IORING_SETUP_SINGLE_ISSUER,
+                .wq_fd = @as(u32, @intCast(ev.sched.workers[0].backend.io_uring.fd)),
+            });
+            break :ring try .init_params(entries, &params);
+        },
+        .csprng = .uninitialized,
+    };
+}
+
+/// For the scheduler: on the worker's own thread, which becomes the ring's only submitter.
+pub fn workerStart(ev: *Evented, worker: *Scheduler.Worker) void {
+    _ = ev;
+    if (worker.index == 0) return;
+    switch (linux.errno(linux.io_uring_register(worker.backend.io_uring.fd, .REGISTER_ENABLE_RINGS, null, 0))) {
+        .SUCCESS => {},
+        else => |err| @panic(@tagName(err)),
     }
 }
 
-fn mainIdle(
-    ev: *Evented,
-    contexts: *const Io.fiber.Switch,
-) callconv(.withStackAlign(.c, @max(@alignOf(Thread), @alignOf(Io.fiber.Context)))) noreturn {
-    const message: *const SwitchMessage = @fieldParentPtr("contexts", contexts);
-    message.handle(ev);
-    ev.idle(&ev.threads.allocated[0]);
-    ev.yield(@ptrCast(&ev.main_fiber_buffer), .nothing);
-    unreachable; // switched to dead fiber
+/// For the scheduler.
+pub fn workerDeinit(ev: *Evented, worker: *Scheduler.Worker) void {
+    _ = ev;
+    worker.backend.io_uring.deinit();
 }
 
-fn idle(ev: *Evented, thread: *Thread) void {
-    var maybe_ready_fiber: ?*Fiber = null;
+/// For the scheduler: submits this worker's queued operations, then hands each task whose
+/// operation finished back to the scheduler. `.block` first waits for at least one completion.
+pub fn poll(ev: *Evented, worker: *Scheduler.Worker, mode: scheduler.PollMode) void {
+    const thread = &worker.backend;
+    _ = thread.io_uring.submit_and_wait(switch (mode) {
+        .nonblocking => 0,
+        .block => 1,
+    }) catch |err| switch (err) {
+        error.SignalInterrupt => {},
+        else => |e| @panic(@errorName(e)),
+    };
     while (true) {
-        while (maybe_ready_fiber orelse ev.findReadyFiber(thread)) |ready_fiber| {
-            ev.yield(ready_fiber, .nothing);
-            maybe_ready_fiber = null;
-        }
-        _ = thread.io_uring.submit_and_wait(1) catch |err| switch (err) {
-            error.SignalInterrupt => {},
+        var cqes_buffer: [1 << 8]linux.io_uring_cqe = undefined;
+        const cqes = cqes_buffer[0 .. thread.io_uring.copy_cqes(&cqes_buffer, 0) catch |err| switch (err) {
+            error.SignalInterrupt => 0,
             else => |e| @panic(@errorName(e)),
+        }];
+        if (cqes.len == 0) return;
+        for (cqes) |cqe| if (cqe.flags & linux.IORING_CQE_F_SKIP == 0) switch (@as(
+            Completion.Userdata,
+            @fromBackingInt(@intCast(cqe.user_data)),
+        )) {
+            .unused => unreachable, // bad submission queued?
+            .wakeup => {},
+            .futex_wake => switch (Completion.errno(.{ .result = cqe.res, .flags = cqe.flags })) {
+                .SUCCESS => recoverableOsBugDetected(), // success is skipped
+                .INVAL => {}, // invalid futex_wait() on ptr done elsewhere
+                .INTR, .CANCELED => recoverableOsBugDetected(), // `Completion.Userdata.futex_wake` is not cancelable
+                .FAULT => {}, // pointer became invalid while doing the wake
+                else => recoverableOsBugDetected(), // deadlock due to operating system bug
+            },
+            .close => switch (Completion.errno(.{ .result = cqe.res, .flags = cqe.flags })) {
+                .BADF => recoverableOsBugDetected(), // Always a race condition.
+                .INTR => {}, // This is still a success. See https://github.com/ziglang/zig/issues/2425
+                else => {},
+            },
+            .cleanup => @panic("failed to notify another worker"),
+            _ => if (@as(?*Fiber, ready_fiber: switch (@as(u2, @truncate(cqe.user_data))) {
+                0b00 => {
+                    const ready_fiber: *Fiber = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
+                    ready_fiber.resultPointer(Completion).* = .{
+                        .result = cqe.res,
+                        .flags = cqe.flags,
+                    };
+                    break :ready_fiber ready_fiber;
+                },
+                0b01 => {
+                    // Another worker asks this ring to cancel an operation it holds.
+                    thread.enqueue().* = .{
+                        .opcode = .ASYNC_CANCEL,
+                        .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
+                        .ioprio = 0,
+                        .fd = 0,
+                        .off = 0,
+                        .addr = cqe.user_data & ~@as(usize, 0b11),
+                        .len = 0,
+                        .rw_flags = 0,
+                        .user_data = @backingInt(Completion.Userdata.wakeup),
+                        .buf_index = 0,
+                        .personality = 0,
+                        .splice_fd_in = 0,
+                        .addr3 = 0,
+                        .resv = 0,
+                    };
+                    break :ready_fiber null;
+                },
+                0b10 => {
+                    const batch_userdata: *Io.Operation.Storage.Pending.Userdata =
+                        @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
+                    const batch: *Io.Batch = @ptrFromInt(batch_userdata[0]);
+                    var next: usize = 0b00;
+                    batch_userdata[0..3].* = .{ next, @as(u32, @bitCast(cqe.res)), cqe.flags };
+                    while (true) {
+                        next = @cmpxchgWeak(
+                            usize,
+                            @as(*usize, @ptrCast(&batch.userdata)),
+                            next,
+                            cqe.user_data,
+                            .release,
+                            .acquire,
+                        ) orelse break;
+                        batch_userdata[0] = next;
+                    }
+                    break :ready_fiber switch (@as(u2, @truncate(next))) {
+                        0b00, 0b01 => @ptrFromInt(next & ~@as(usize, 0b11)),
+                        0b10, 0b11 => null,
+                    };
+                },
+                0b11 => switch (Completion.errno(.{ .result = cqe.res, .flags = cqe.flags })) {
+                    .SUCCESS => unreachable, // no event count specified
+                    .TIME => {
+                        const context: *usize = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
+                        const fiber = @atomicRmw(usize, context, .Add, 0b01, .acquire);
+                        break :ready_fiber switch (@as(u2, @truncate(fiber))) {
+                            else => unreachable, // timeout completed multiple times
+                            0b00 => @ptrFromInt(fiber & ~@as(usize, 0b11)),
+                            0b10 => null,
+                        };
+                    },
+                    .CANCELED => null, // user data may have been invalidated
+                    else => |err| unexpectedErrno(err) catch null,
+                },
+            })) |ready_fiber| ev.sched.readyFromPoll(worker, ready_fiber),
         };
-        var maybe_ready_queue: ?Fiber.Queue = null;
-        while (true) {
-            var cqes_buffer: [1 << 8]linux.io_uring_cqe = undefined;
-            const cqes = cqes_buffer[0 .. thread.io_uring.copy_cqes(&cqes_buffer, 0) catch |err| switch (err) {
-                error.SignalInterrupt => 0,
-                else => |e| @panic(@errorName(e)),
-            }];
-            if (cqes.len == 0) break;
-            for (cqes) |cqe| if (cqe.flags & linux.IORING_CQE_F_SKIP == 0) switch (@as(
-                Completion.Userdata,
-                @fromBackingInt(@intCast(cqe.user_data)),
-            )) {
-                .unused => unreachable, // bad submission queued?
-                .wakeup => {},
-                .futex_wake => switch (Completion.errno(.{ .result = cqe.res, .flags = cqe.flags })) {
-                    .SUCCESS => recoverableOsBugDetected(), // success is skipped
-                    .INVAL => {}, // invalid futex_wait() on ptr done elsewhere
-                    .INTR, .CANCELED => recoverableOsBugDetected(), // `Completion.Userdata.futex_wake` is not cancelable
-                    .FAULT => {}, // pointer became invalid while doing the wake
-                    else => recoverableOsBugDetected(), // deadlock due to operating system bug
-                },
-                .close => switch (Completion.errno(.{ .result = cqe.res, .flags = cqe.flags })) {
-                    .BADF => recoverableOsBugDetected(), // Always a race condition.
-                    .INTR => {}, // This is still a success. See https://github.com/ziglang/zig/issues/2425
-                    else => {},
-                },
-                .cleanup => @panic("failed to notify other threads that we are exiting"),
-                .exit => {
-                    assert(maybe_ready_fiber == null and maybe_ready_queue == null); // pending async
-                    return;
-                },
-                _ => if (@as(?*Fiber, ready_fiber: switch (@as(u2, @truncate(cqe.user_data))) {
-                    0b00 => {
-                        const ready_fiber: *Fiber = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
-                        ready_fiber.resultPointer(Completion).* = .{
-                            .result = cqe.res,
-                            .flags = cqe.flags,
-                        };
-                        break :ready_fiber ready_fiber;
-                    },
-                    0b01 => {
-                        thread.enqueue().* = .{
-                            .opcode = .ASYNC_CANCEL,
-                            .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-                            .ioprio = 0,
-                            .fd = 0,
-                            .off = 0,
-                            .addr = cqe.user_data & ~@as(usize, 0b11),
-                            .len = 0,
-                            .rw_flags = 0,
-                            .user_data = @backingInt(Completion.Userdata.wakeup),
-                            .buf_index = 0,
-                            .personality = 0,
-                            .splice_fd_in = 0,
-                            .addr3 = 0,
-                            .resv = 0,
-                        };
-                        break :ready_fiber null;
-                    },
-                    0b10 => {
-                        const batch_userdata: *Io.Operation.Storage.Pending.Userdata =
-                            @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
-                        const batch: *Io.Batch = @ptrFromInt(batch_userdata[0]);
-                        var next: usize = 0b00;
-                        batch_userdata[0..3].* = .{ next, @as(u32, @bitCast(cqe.res)), cqe.flags };
-                        while (true) {
-                            next = @cmpxchgWeak(
-                                usize,
-                                @as(*usize, @ptrCast(&batch.userdata)),
-                                next,
-                                cqe.user_data,
-                                .release,
-                                .acquire,
-                            ) orelse break;
-                            batch_userdata[0] = next;
-                        }
-                        break :ready_fiber switch (@as(u2, @truncate(next))) {
-                            0b00, 0b01 => @ptrFromInt(next & ~@as(usize, 0b11)),
-                            0b10, 0b11 => null,
-                        };
-                    },
-                    0b11 => switch (Completion.errno(.{ .result = cqe.res, .flags = cqe.flags })) {
-                        .SUCCESS => unreachable, // no event count specified
-                        .TIME => {
-                            const context: *usize = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
-                            const fiber = @atomicRmw(usize, context, .Add, 0b01, .acquire);
-                            break :ready_fiber switch (@as(u2, @truncate(fiber))) {
-                                else => unreachable, // timeout completed multiple times
-                                0b00 => @ptrFromInt(fiber & ~@as(usize, 0b11)),
-                                0b10 => null,
-                            };
-                        },
-                        .CANCELED => null, // user data may have been invalidated
-                        else => |err| unexpectedErrno(err) catch null,
-                    },
-                })) |ready_fiber| {
-                    assert(ready_fiber.status.queue_next == null);
-                    if (maybe_ready_fiber == null) {
-                        maybe_ready_fiber = ready_fiber;
-                    } else if (maybe_ready_queue) |*ready_queue| {
-                        ready_queue.tail.status.queue_next = ready_fiber;
-                        ready_queue.tail = ready_fiber;
-                    } else maybe_ready_queue = .{ .head = ready_fiber, .tail = ready_fiber };
-                },
-            };
-        }
-        if (maybe_ready_queue) |ready_queue| _ = ev.schedule(thread, ready_queue);
     }
 }
 
-const SwitchMessage = struct {
-    contexts: Io.fiber.Switch,
-    pending_task: PendingTask,
-
-    const PendingTask = union(enum) {
-        nothing,
-        reschedule,
-        await: *Fiber,
-        group_await: Group,
-        group_cancel: Group,
-        batch_await: *Io.Batch,
-        destroy,
-        exit,
-    };
-
-    fn handle(message: *const SwitchMessage, ev: *Evented) void {
-        const thread: *Thread = .current();
-        thread.current_context = message.contexts.new;
-        if (tracy.enable) {
-            if (message.contexts.new != &thread.idle_context) {
-                const fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.new));
-                tracy.fiberEnter(fiber.name);
-            } else tracy.fiberLeave();
-        }
-        switch (message.pending_task) {
-            .nothing => {},
-            .reschedule => if (message.contexts.old != &thread.idle_context) {
-                const fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
-                assert(fiber.status.queue_next == null);
-                _ = ev.schedule(thread, .{ .head = fiber, .tail = fiber });
-            },
-            .await => |awaiting| {
-                const awaiter: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
-                assert(awaiter.status.queue_next == null);
-                if (@atomicRmw(?*Fiber, &awaiting.link.awaiter, .Xchg, awaiter, .acq_rel) ==
-                    Fiber.finished) _ = ev.schedule(thread, .{ .head = awaiter, .tail = awaiter });
-            },
-            .group_await => |group| {
-                const fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
-                if (group.await(ev, fiber))
-                    _ = ev.schedule(thread, .{ .head = fiber, .tail = fiber });
-            },
-            .group_cancel => |group| {
-                const fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
-                if (group.cancel(ev, fiber))
-                    _ = ev.schedule(thread, .{ .head = fiber, .tail = fiber });
-            },
-            .batch_await => |batch| {
-                const fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
-                if (@cmpxchgStrong(
-                    ?*anyopaque,
-                    &batch.userdata,
-                    null,
-                    fiber,
-                    .release,
-                    .monotonic,
-                )) |head| {
-                    assert(@as(u2, @truncate(@intFromPtr(head))) != 0b00);
-                    _ = ev.schedule(thread, .{ .head = fiber, .tail = fiber });
-                }
-            },
-            .destroy => {
-                const fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
-                fiber.destroy();
-            },
-            .exit => for (
-                ev.threads.allocated[0..@atomicLoad(u32, &ev.threads.active, .acquire)],
-            ) |*each_thread| {
-                thread.enqueue().* = .{
-                    .opcode = .MSG_RING,
-                    .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-                    .ioprio = 0,
-                    .fd = each_thread.io_uring.fd,
-                    .off = @backingInt(Completion.Userdata.exit),
-                    .addr = @backingInt(linux.IORING_MSG_RING_COMMAND.DATA),
-                    .len = 0,
-                    .rw_flags = 0,
-                    .user_data = @backingInt(Completion.Userdata.cleanup),
-                    .buf_index = 0,
-                    .personality = 0,
-                    .splice_fd_in = 0,
-                    .addr3 = 0,
-                    .resv = 0,
-                };
-            },
-        }
-    }
-};
-
-inline fn contextSwitch(message: *const SwitchMessage) *const SwitchMessage {
-    return @fieldParentPtr("contexts", Io.fiber.contextSwitch(&message.contexts));
-}
-
-fn crashHandler(userdata: ?*anyopaque) void {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
+/// For the scheduler: makes `to`'s current or next blocking `poll` return.
+pub fn wake(ev: *Evented, from: *Scheduler.Worker, to: *Scheduler.Worker) void {
     _ = ev;
-    const thread = Thread.self orelse std.process.abort();
-    if (thread.current_context == &thread.idle_context) std.process.abort();
-    const fiber = thread.currentFiber();
-    @atomicStore(
-        Fiber.CancelStatus,
-        &fiber.cancel_status,
-        .{ .requested = true, .awaiting = .nothing },
+    const thread = &from.backend;
+    thread.enqueue().* = .{
+        .opcode = .MSG_RING,
+        .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
+        .ioprio = 0,
+        .fd = to.backend.io_uring.fd,
+        .off = @backingInt(Completion.Userdata.wakeup),
+        .addr = @backingInt(linux.IORING_MSG_RING_COMMAND.DATA),
+        .len = 0,
+        .rw_flags = 0,
+        .user_data = @backingInt(Completion.Userdata.wakeup),
+        .buf_index = 0,
+        .personality = 0,
+        .splice_fd_in = 0,
+        .addr3 = 0,
+        .resv = 0,
+    };
+    thread.submit();
+}
+
+/// For the scheduler: cancels the operation `fiber` waits for in the ring `token`, directly if
+/// it is this worker's, or by asking the worker that owns it.
+pub fn cancelOperation(ev: *Evented, from: *Scheduler.Worker, fiber: *Fiber, token: u31) void {
+    _ = ev;
+    const thread = &from.backend;
+    thread.enqueue().* = if (thread.io_uring.fd == token) .{
+        .opcode = .ASYNC_CANCEL,
+        .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
+        .ioprio = 0,
+        .fd = 0,
+        .off = 0,
+        .addr = @intFromPtr(fiber),
+        .len = 0,
+        .rw_flags = 0,
+        .user_data = @backingInt(Completion.Userdata.wakeup),
+        .buf_index = 0,
+        .personality = 0,
+        .splice_fd_in = 0,
+        .addr3 = 0,
+        .resv = 0,
+    } else .{
+        .opcode = .MSG_RING,
+        .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
+        .ioprio = 0,
+        .fd = token,
+        .off = @intFromPtr(fiber) | 0b01,
+        .addr = @backingInt(linux.IORING_MSG_RING_COMMAND.DATA),
+        .len = 0,
+        .rw_flags = 0,
+        .user_data = @backingInt(Completion.Userdata.cleanup),
+        .buf_index = 0,
+        .personality = 0,
+        .splice_fd_in = 0,
+        .addr3 = 0,
+        .resv = 0,
+    };
+    thread.submit();
+}
+
+/// Registers `fiber` to be resumed by the batch's next completion, once `fiber` is saved.
+fn batchAwaitPending(s: *Scheduler, fiber: *Fiber, context: *anyopaque) void {
+    const batch: *Io.Batch = @ptrCast(@alignCast(context));
+    if (@cmpxchgStrong(
+        ?*anyopaque,
+        &batch.userdata,
+        null,
+        fiber,
+        .release,
         .monotonic,
-    );
-    fiber.cancel_protection = .{ .user = .blocked, .acknowledged = true };
+    )) |head| {
+        assert(@as(u2, @truncate(@intFromPtr(head))) != 0b00);
+        s.ready(.current(), fiber);
+    }
 }
 
-const AsyncClosure = struct {
-    evented: *Evented,
-    fiber: *Fiber,
-    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
-    result_align: Alignment,
-
-    fn fromFiber(fiber: *Fiber) *AsyncClosure {
-        return @ptrFromInt(Fiber.max_context_align.max(.of(AsyncClosure)).backward(
-            @intFromPtr(fiber.allocatedEnd()) - Fiber.max_context_size,
-        ) - @sizeOf(AsyncClosure));
-    }
-
-    fn contextPointer(closure: *AsyncClosure) [*]align(Fiber.max_context_align.toByteUnits()) u8 {
-        return @alignCast(@as([*]u8, @ptrCast(closure)) + @sizeOf(AsyncClosure));
-    }
-
-    fn entry() callconv(.naked) void {
-        switch (builtin.cpu.arch) {
-            .aarch64 => asm volatile (
-                \\ mov x0, sp
-                \\ b %[call]
-                :
-                : [call] "X" (&call),
-            ),
-            .riscv64 => asm volatile (
-                \\ mv a0, sp
-                \\ tail %[call]@plt
-                :
-                : [call] "X" (&call),
-            ),
-            .x86_64 => asm volatile (
-                \\ leaq 8(%%rsp), %%rdi
-                \\ jmp %[call:P]
-                :
-                : [call] "X" (&call),
-            ),
-            else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
-        }
-    }
-
-    fn call(
-        closure: *AsyncClosure,
-        contexts: *const Io.fiber.Switch,
-    ) callconv(.withStackAlign(.c, @alignOf(AsyncClosure))) noreturn {
-        const message: *const SwitchMessage = @fieldParentPtr("contexts", contexts);
-        const ev = closure.evented;
-        const fiber = closure.fiber;
-        message.handle(ev);
-        closure.start(closure.contextPointer(), fiber.resultBytes(closure.result_align));
-        ev.yield(@atomicRmw(?*Fiber, &fiber.link.awaiter, .Xchg, Fiber.finished, .acq_rel), .nothing);
-        unreachable; // switched to dead fiber
-    }
-};
-
-fn async(
-    userdata: ?*anyopaque,
-    result: []u8,
-    result_alignment: Alignment,
-    context: []const u8,
-    context_alignment: Alignment,
-    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
-) ?*std.Io.AnyFuture {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    return concurrent(ev, result.len, result_alignment, context, context_alignment, start) catch {
-        start(context.ptr, result.ptr);
-        return null;
-    };
-}
-
-fn concurrent(
-    userdata: ?*anyopaque,
-    result_len: usize,
-    result_alignment: Alignment,
-    context: []const u8,
-    context_alignment: Alignment,
-    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
-) Io.ConcurrentError!*std.Io.AnyFuture {
-    assert(result_alignment.compare(.lte, Fiber.max_result_align)); // TODO
-    assert(context_alignment.compare(.lte, Fiber.max_context_align)); // TODO
-    assert(result_len <= Fiber.max_result_size); // TODO
-    assert(context.len <= Fiber.max_context_size); // TODO
-
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const fiber = Fiber.create(ev) catch |err| switch (err) {
-        error.OutOfMemory => return error.ConcurrencyUnavailable,
-    };
-
-    const closure: *AsyncClosure = .fromFiber(fiber);
-    fiber.* = .{
-        .required_align = {},
-        .context = switch (builtin.cpu.arch) {
-            .aarch64 => .{
-                .sp = @intFromPtr(closure),
-                .fp = 0,
-                .pc = @intFromPtr(&AsyncClosure.entry),
-            },
-            .riscv64 => .{
-                .sp = @intFromPtr(closure),
-                .fp = 0,
-                .pc = @intFromPtr(&AsyncClosure.entry),
-            },
-            .x86_64 => .{
-                .rsp = @intFromPtr(closure) - 8,
-                .rbp = 0,
-                .rip = @intFromPtr(&AsyncClosure.entry),
-            },
-            else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
-        },
-        .link = .{ .awaiter = null },
-        .status = .{ .queue_next = null },
-        .cancel_status = .unrequested,
-        .cancel_protection = .unblocked,
-        .name = if (tracy.enable) name: {
-            const thread: *Thread = .current();
-            var name_arena = thread.name_arena.promote(std.heap.page_allocator);
-            defer thread.name_arena = name_arena.state;
-            break :name std.fmt.allocPrintSentinel(
-                name_arena.allocator(),
-                "task {d}",
-                .{@atomicRmw(u64, &Fiber.next_name, .Add, 1, .monotonic)},
-                0,
-            ) catch return error.ConcurrencyUnavailable;
-        },
-    };
-    closure.* = .{
-        .evented = ev,
-        .fiber = fiber,
-        .start = start,
-        .result_align = result_alignment,
-    };
-    @memcpy(closure.contextPointer(), context);
-
-    const thread: *Thread = .current();
-    if (ev.schedule(thread, .{ .head = fiber, .tail = fiber })) thread.submit();
-    return @ptrCast(fiber);
-}
-
-fn await(
-    userdata: ?*anyopaque,
-    future: *std.Io.AnyFuture,
-    result: []u8,
-    result_alignment: Alignment,
-) void {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const awaiting: *Fiber = @ptrCast(@alignCast(future));
-    if (@atomicLoad(?*Fiber, &awaiting.link.awaiter, .acquire) != Fiber.finished)
-        ev.yield(null, .{ .await = awaiting });
-    @memcpy(result, awaiting.resultBytes(result_alignment));
-    awaiting.destroy();
-}
-
-fn cancel(
-    userdata: ?*anyopaque,
-    future: *std.Io.AnyFuture,
-    result: []u8,
-    result_alignment: Alignment,
-) void {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const future_fiber: *Fiber = @ptrCast(@alignCast(future));
-    future_fiber.requestCancel(ev);
-    await(ev, future, result, result_alignment);
-}
-
-const Group = struct {
-    ptr: *Io.Group,
-
-    const List = packed struct(usize) {
-        cancel_requested: bool,
-        awaiter_delayed: bool,
-        fibers: Fiber.PackedPtr,
-    };
-    fn listPtr(group: Group) *List {
-        return @ptrCast(&group.ptr.token);
-    }
-
-    const Mutex = packed struct(u32) {
-        locked: bool,
-        contended: bool,
-        shared2: u30,
-    };
-    fn mutexPtr(group: Group) *Mutex {
-        return switch (comptime builtin.cpu.arch.endian()) {
-            .little => @ptrCast(&group.ptr.state),
-            .big => @ptrCast(@alignCast(
-                @as([*]u8, @ptrCast(&group.ptr.state)) + @sizeOf(usize) - @sizeOf(u32),
-            )),
+/// A thread that is not one of the workers blocks in the kernel. io_uring's futex operations and
+/// the futex system calls wake each other.
+fn futexWaitForeign(ev: *Evented, ptr: *const u32, expected: u32, timeout: Io.Timeout) void {
+    var timespec: linux.timespec = undefined;
+    const timespec_ptr: ?*const linux.timespec = if (timeout.toDurationFromNow(ev.io())) |duration| ts: {
+        const ns = @max(0, duration.raw.toNanoseconds());
+        timespec = .{
+            .sec = @intCast(@divFloor(ns, std.time.ns_per_s)),
+            .nsec = @intCast(@mod(ns, std.time.ns_per_s)),
         };
-    }
-
-    const Awaiter = packed struct(usize) {
-        locked: bool,
-        contended: bool,
-        awaiter: Fiber.PackedPtr,
-    };
-    fn awaiterPtr(group: Group) *Awaiter {
-        return @ptrCast(&group.ptr.state);
-    }
-
-    fn lock(group: Group, ev: *Evented) void {
-        const mutex = group.mutexPtr();
-        {
-            const old_state = @atomicRmw(
-                Mutex,
-                mutex,
-                .Or,
-                .{ .locked = true, .contended = false, .shared2 = 0 },
-                .acquire,
-            );
-            if (!old_state.locked) {
-                @branchHint(.likely);
-                return;
-            }
-            if (old_state.contended) {
-                futexWaitUncancelable(ev, @ptrCast(mutex), @bitCast(old_state));
-            }
-        }
-        while (true) {
-            var old_state = @atomicRmw(
-                Mutex,
-                mutex,
-                .Or,
-                .{ .locked = true, .contended = true, .shared2 = 0 },
-                .acquire,
-            );
-            if (!old_state.locked) {
-                @branchHint(.likely);
-                return;
-            }
-            old_state.contended = true;
-            futexWaitUncancelable(ev, @ptrCast(mutex), @bitCast(old_state));
-        }
-    }
-
-    fn unlock(group: Group, ev: *Evented) void {
-        const mutex = group.mutexPtr();
-        const old_state = @atomicRmw(
-            Mutex,
-            mutex,
-            .And,
-            .{ .locked = false, .contended = false, .shared2 = std.math.maxInt(u30) },
-            .release,
-        );
-        assert(old_state.locked);
-        if (old_state.contended) futexWake(ev, @ptrCast(mutex), 1);
-    }
-
-    fn addFiber(group: Group, ev: *Evented, fiber: *Fiber) void {
-        group.lock(ev);
-        defer group.unlock(ev);
-        const list_ptr = group.listPtr();
-        const list = @atomicLoad(List, list_ptr, .monotonic);
-        if (list.cancel_requested) fiber.cancel_status = .{ .requested = true, .awaiting = .nothing };
-        const old_head = list.fibers.unpack();
-        if (old_head) |head| head.link.group.prev = fiber;
-        fiber.link.group.next = old_head;
-        @atomicStore(List, list_ptr, .{
-            .cancel_requested = list.cancel_requested,
-            .awaiter_delayed = list.awaiter_delayed,
-            .fibers = .pack(fiber),
-        }, .monotonic);
-    }
-
-    fn removeFiber(group: Group, ev: *Evented, fiber: *Fiber) ?*Fiber {
-        group.lock(ev);
-        defer group.unlock(ev);
-        const list_ptr = group.listPtr();
-        const list = @atomicLoad(List, list_ptr, .monotonic);
-        if (fiber.link.group.next) |next| next.link.group.prev = fiber.link.group.prev;
-        if (fiber.link.group.prev) |prev| {
-            prev.link.group.next = fiber.link.group.next;
-        } else if (fiber.link.group.next) |new_head| {
-            @atomicStore(List, list_ptr, .{
-                .cancel_requested = list.cancel_requested,
-                .awaiter_delayed = list.awaiter_delayed,
-                .fibers = .pack(new_head),
-            }, .monotonic);
-        } else if (@atomicLoad(Awaiter, group.awaiterPtr(), .monotonic).awaiter.unpack()) |awaiter| {
-            if (!awaiter.cancel_status.changeAwaiting(.group, .nothing) or list.cancel_requested) {
-                @atomicStore(List, list_ptr, .{
-                    .cancel_requested = false,
-                    .awaiter_delayed = false,
-                    .fibers = .null,
-                }, .release);
-                assert(awaiter.status.awaiting_group.ptr == group.ptr);
-                awaiter.status = .{ .queue_next = null };
-                return awaiter;
-            }
-            // Race with `Fiber.requestCancel`
-            @atomicStore(List, list_ptr, .{
-                .cancel_requested = false,
-                .awaiter_delayed = true,
-                .fibers = .null,
-            }, .monotonic);
-        } else @atomicStore(List, list_ptr, .{
-            .cancel_requested = false,
-            .awaiter_delayed = false,
-            .fibers = .null,
-        }, .release);
-        return null;
-    }
-
-    fn await(group: Group, ev: *Evented, awaiter: *Fiber) bool {
-        group.lock(ev);
-        defer group.unlock(ev);
-        if (@atomicLoad(List, group.listPtr(), .monotonic).fibers.unpack()) |_| {
-            if (group.registerAwaiter(awaiter) and awaiter.cancel_protection.check() == .unblocked) {
-                // The awaiter already had an unacknowledged cancelation request before
-                // attempting to await a group, so propagate the cancelation to the group.
-                assert(!group.cancelLocked(ev, null));
-            }
-            return false;
-        }
-        return true;
-    }
-
-    fn cancel(group: Group, ev: *Evented, maybe_awaiter: ?*Fiber) bool {
-        group.lock(ev);
-        defer group.unlock(ev);
-        return group.cancelLocked(ev, maybe_awaiter);
-    }
-
-    /// Assumes the mutex is held.
-    fn cancelLocked(group: Group, ev: *Evented, maybe_awaiter: ?*Fiber) bool {
-        const list_ptr = group.listPtr();
-        const list = @atomicRmw(
-            List,
-            list_ptr,
-            .Add,
-            .{ .cancel_requested = true, .awaiter_delayed = false, .fibers = .null },
-            .monotonic,
-        );
-        assert(!list.cancel_requested);
-        if (list.fibers.unpack()) |head| {
-            var maybe_fiber: ?*Fiber = head;
-            while (maybe_fiber) |fiber| {
-                fiber.requestCancel(ev);
-                maybe_fiber = fiber.link.group.next;
-            }
-            if (maybe_awaiter) |awaiter| _ = group.registerAwaiter(awaiter);
-            return false;
-        }
-        @atomicStore(
-            List,
-            list_ptr,
-            .{ .cancel_requested = false, .awaiter_delayed = false, .fibers = .null },
-            .release,
-        );
-        return if (maybe_awaiter) |_| true else list.awaiter_delayed;
-    }
-
-    /// Assumes the mutex is held.
-    fn registerAwaiter(group: Group, awaiter: *Fiber) bool {
-        assert(awaiter.status.queue_next == null);
-        awaiter.status = .{ .awaiting_group = group };
-        assert(@atomicRmw(
-            Awaiter,
-            group.awaiterPtr(),
-            .Add,
-            .{ .locked = false, .contended = false, .awaiter = .pack(awaiter) },
-            .monotonic,
-        ).awaiter == .null);
-        return awaiter.cancel_status.changeAwaiting(.nothing, .group);
-    }
-
-    const AsyncClosure = struct {
-        evented: *Evented,
-        group: Group,
-        fiber: *Fiber,
-        start: *const fn (context: *const anyopaque) void,
-
-        fn fromFiber(fiber: *Fiber) *Group.AsyncClosure {
-            return @ptrFromInt(Fiber.max_context_align.max(.of(Group.AsyncClosure)).backward(
-                @intFromPtr(fiber.allocatedEnd()) - Fiber.max_context_size,
-            ) - @sizeOf(Group.AsyncClosure));
-        }
-
-        fn contextPointer(
-            closure: *Group.AsyncClosure,
-        ) [*]align(Fiber.max_context_align.toByteUnits()) u8 {
-            return @alignCast(@as([*]u8, @ptrCast(closure)) + @sizeOf(Group.AsyncClosure));
-        }
-
-        fn entry() callconv(.naked) void {
-            switch (builtin.cpu.arch) {
-                .aarch64 => asm volatile (
-                    \\ mov x0, sp
-                    \\ b %[call]
-                    :
-                    : [call] "X" (&call),
-                ),
-                .riscv64 => asm volatile (
-                    \\ mv a0, sp
-                    \\ tail %[call]@plt
-                    :
-                    : [call] "X" (&call),
-                ),
-                .x86_64 => asm volatile (
-                    \\ leaq 8(%%rsp), %%rdi
-                    \\ jmp %[call:P]
-                    :
-                    : [call] "X" (&call),
-                ),
-                else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
-            }
-        }
-
-        fn call(
-            closure: *Group.AsyncClosure,
-            contexts: *const Io.fiber.Switch,
-        ) callconv(.withStackAlign(.c, @alignOf(Group.AsyncClosure))) noreturn {
-            const message: *const SwitchMessage = @fieldParentPtr("contexts", contexts);
-            const ev = closure.evented;
-            const fiber = closure.fiber;
-            message.handle(ev);
-            assert(fiber.status.queue_next == null);
-            closure.start(closure.contextPointer());
-            ev.yield(closure.group.removeFiber(ev, fiber), .destroy);
-            unreachable; // switched to dead fiber
-        }
-    };
-};
-
-fn groupAsync(
-    userdata: ?*anyopaque,
-    type_erased: *Io.Group,
-    context: []const u8,
-    context_alignment: Alignment,
-    start: *const fn (context: *const anyopaque) void,
-) void {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    return groupConcurrent(ev, type_erased, context, context_alignment, start) catch {
-        start(context.ptr);
-    };
-}
-
-fn groupConcurrent(
-    userdata: ?*anyopaque,
-    type_erased: *Io.Group,
-    context: []const u8,
-    context_alignment: Alignment,
-    start: *const fn (context: *const anyopaque) void,
-) Io.ConcurrentError!void {
-    assert(context_alignment.compare(.lte, Fiber.max_context_align)); // TODO
-    assert(context.len <= Fiber.max_context_size); // TODO
-
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const group: Group = .{ .ptr = type_erased };
-    const fiber = Fiber.create(ev) catch |err| switch (err) {
-        error.OutOfMemory => return error.ConcurrencyUnavailable,
-    };
-
-    const closure: *Group.AsyncClosure = .fromFiber(fiber);
-    fiber.* = .{
-        .required_align = {},
-        .context = switch (builtin.cpu.arch) {
-            .aarch64 => .{
-                .sp = @intFromPtr(closure),
-                .fp = 0,
-                .pc = @intFromPtr(&Group.AsyncClosure.entry),
-            },
-            .riscv64 => .{
-                .sp = @intFromPtr(closure),
-                .fp = 0,
-                .pc = @intFromPtr(&Group.AsyncClosure.entry),
-            },
-            .x86_64 => .{
-                .rsp = @intFromPtr(closure) - 8,
-                .rbp = 0,
-                .rip = @intFromPtr(&Group.AsyncClosure.entry),
-            },
-            else => |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
-        },
-        .link = .{ .group = .{ .prev = null, .next = null } },
-        .status = .{ .queue_next = null },
-        .cancel_status = .unrequested,
-        .cancel_protection = .unblocked,
-        .name = if (tracy.enable) name: {
-            const thread: *Thread = .current();
-            var name_arena = thread.name_arena.promote(std.heap.page_allocator);
-            defer thread.name_arena = name_arena.state;
-            break :name std.fmt.allocPrintSentinel(
-                name_arena.allocator(),
-                "group task {d}",
-                .{@atomicRmw(u64, &Fiber.next_name, .Add, 1, .monotonic)},
-                0,
-            ) catch return error.ConcurrencyUnavailable;
-        },
-    };
-    closure.* = .{
-        .evented = ev,
-        .group = group,
-        .fiber = fiber,
-        .start = start,
-    };
-    @memcpy(closure.contextPointer(), context);
-    group.addFiber(ev, fiber);
-    const thread: *Thread = .current();
-    if (ev.schedule(thread, .{ .head = fiber, .tail = fiber })) thread.submit();
-}
-
-fn groupAwait(
-    userdata: ?*anyopaque,
-    type_erased: *Io.Group,
-    initial_token: *anyopaque,
-) Io.Cancelable!void {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = initial_token;
-    ev.yield(null, .{ .group_await = .{ .ptr = type_erased } });
-}
-
-fn groupCancel(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *anyopaque) void {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = initial_token;
-    ev.yield(null, .{ .group_cancel = .{ .ptr = type_erased } });
-}
-
-fn recancel(userdata: ?*anyopaque) void {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    Thread.current().currentFiber().cancel_protection.recancel();
-}
-
-fn swapCancelProtection(userdata: ?*anyopaque, new: Io.CancelProtection) Io.CancelProtection {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    const cancel_protection = &Thread.current().currentFiber().cancel_protection;
-    defer cancel_protection.user = new;
-    return cancel_protection.user;
-}
-
-fn checkCancel(userdata: ?*anyopaque) Io.Cancelable!void {
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    const fiber = Thread.current().currentFiber();
-    switch (fiber.cancel_protection.check()) {
-        .unblocked => {
-            const cancel_status = @atomicLoad(Fiber.CancelStatus, &fiber.cancel_status, .monotonic);
-            assert(cancel_status.awaiting == .nothing);
-            if (cancel_status.requested) {
-                @branchHint(.unlikely);
-                fiber.cancel_protection.acknowledge();
-                return error.Canceled;
-            }
-        },
-        .blocked => {},
-    }
+        break :ts &timespec;
+    } else null;
+    _ = linux.futex_4arg(ptr, .{ .cmd = .WAIT, .private = true }, expected, timespec_ptr);
 }
 
 fn futexWait(
@@ -1926,6 +852,7 @@ fn futexWait(
     timeout: Io.Timeout,
 ) Io.Cancelable!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
+    if (Scheduler.Worker.currentOrNull() == null) return futexWaitForeign(ev, ptr, expected, timeout);
     const timespec: ?linux.kernel_timespec, const clock: Io.Clock, const timeout_flags: u32 = timespec: switch (timeout) {
         .none => .{
             null,
@@ -1994,7 +921,7 @@ fn futexWait(
         .addr3 = 0,
         .resv = 0,
     };
-    ev.yield(null, .nothing);
+    ev.sched.park();
     switch (cancel_region.errno()) {
         .SUCCESS => {}, // notified by `wake()`
         .INTR, .CANCELED => {}, // caller's responsibility to retry
@@ -2008,6 +935,7 @@ fn futexWait(
 
 fn futexWaitUncancelable(userdata: ?*anyopaque, ptr: *const u32, expected: u32) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
+    if (Scheduler.Worker.currentOrNull() == null) return futexWaitForeign(ev, ptr, expected, .none);
     var cancel_region: CancelRegion = .initBlocked();
     defer cancel_region.deinit();
     const thread = cancel_region.awaitIoUring() catch |err| switch (err) {
@@ -2029,7 +957,7 @@ fn futexWaitUncancelable(userdata: ?*anyopaque, ptr: *const u32, expected: u32) 
         .addr3 = std.math.maxInt(u32),
         .resv = 0,
     };
-    ev.yield(null, .nothing);
+    ev.sched.park();
     switch (cancel_region.errno()) {
         .SUCCESS => {}, // notified by `wake()`
         .INTR, .CANCELED => {}, // caller's responsibility to retry
@@ -2043,13 +971,19 @@ fn futexWaitUncancelable(userdata: ?*anyopaque, ptr: *const u32, expected: u32) 
 fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = ev;
+    // The kernel takes the count as an `int`, and wakes one waiter for a negative one.
+    const n: u32 = @min(max_waiters, std.math.maxInt(i32));
+    if (Scheduler.Worker.currentOrNull() == null) {
+        _ = linux.futex_4arg(ptr, .{ .cmd = .WAKE, .private = true }, n, null);
+        return;
+    }
     const thread: *Thread = .current();
     thread.enqueue().* = .{
         .opcode = .FUTEX_WAKE,
         .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
         .ioprio = 0,
         .fd = @bitCast(linux.FUTEX2_FLAGS{ .size = .U32, .private = true }),
-        .off = max_waiters,
+        .off = n,
         .addr = @intFromPtr(ptr),
         .len = 0,
         .rw_flags = 0,
@@ -2107,17 +1041,36 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
         },
         .net_send => |o| .{
             .net_send = r: {
-                _ = o;
-                break :r .{ error.NetworkDown, 0 }; // TODO
+                const maybe_err, const count = ev.netSend(
+                    &maybe_sync.cancel_region,
+                    o.socket_handle,
+                    o.messages,
+                    o.flags,
+                ) catch |err| switch (err) {
+                    error.Canceled => |e| return e,
+                    else => unreachable, // `netSend` only returns `error.Canceled`
+                };
+                break :r .{ maybe_err, count };
             },
         },
         .net_read => |o| .{
-            .net_read = r: {
-                _ = o;
-                break :r error.NetworkDown; // TODO
+            .net_read = ev.netRead(&maybe_sync.cancel_region, o.socket_handle, o.data) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| e,
             },
         },
-        .net_write => @panic("TODO implement net_write operation"),
+        .net_write => |o| .{
+            .net_write = ev.netWrite(
+                &maybe_sync.cancel_region,
+                o.socket_handle,
+                o.header,
+                o.data,
+                o.splat,
+            ) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| e,
+            },
+        },
     };
 }
 
@@ -2215,7 +1168,7 @@ fn batchAwaitAsync(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!void {
             error.Timeout => unreachable, // no timeout
         };
         if (batch.completed.head != .none or batch.pending.head == .none) return;
-        ev.yield(null, .{ .batch_await = batch });
+        ev.sched.yield(null, .{ .custom = .{ .context = batch, .run = batchAwaitPending } });
     }
 }
 
@@ -2235,7 +1188,7 @@ fn batchAwaitConcurrent(
         };
         if (batch.completed.head != .none or batch.pending.head == .none) return;
         switch (timeout) {
-            .none => ev.yield(null, .{ .batch_await = batch }),
+            .none => ev.sched.yield(null, .{ .custom = .{ .context = batch, .run = batchAwaitPending } }),
             .duration => |duration| {
                 const ns = duration.raw.toNanoseconds();
                 break .{
@@ -2284,7 +1237,7 @@ fn batchAwaitConcurrent(
         };
     }
     while (batch.completed.head == .none and batch.pending.head != .none) {
-        ev.yield(null, .{ .batch_await = batch });
+        ev.sched.yield(null, .{ .custom = .{ .context = batch, .run = batchAwaitPending } });
         batchDrainReady(batch) catch |err| switch (err) {
             error.Timeout => |e| return if (batch.completed.head == .none and
                 batch.pending.head != .none) e,
@@ -2307,7 +1260,7 @@ fn batchAwaitConcurrent(
         .addr3 = 0,
         .resv = 0,
     };
-    ev.yield(null, .nothing);
+    ev.sched.park();
     switch (maybe_sync.cancel_region.errno()) {
         .SUCCESS => return,
         .BUSY, .NOENT => {},
@@ -2317,7 +1270,7 @@ fn batchAwaitConcurrent(
         batchDrainReady(batch) catch |err| switch (err) {
             error.Timeout => return,
         };
-        ev.yield(null, .{ .batch_await = batch });
+        ev.sched.yield(null, .{ .custom = .{ .context = batch, .run = batchAwaitPending } });
     }
 }
 
@@ -2402,20 +1355,40 @@ fn batchDrainSubmitted(
             else
                 .{ .device_io_control = try ev.deviceIoControl(try maybe_sync.enterSync(ev), o) },
             .net_receive => |o| {
-                _ = o;
-                @panic("TODO implement batchDrainSubmitted for net_receive");
+                batchNetSubmit(thread, batch, storage, .net_receive, o.socket_handle, poll_mask_readable, .{
+                    packHandleLen(o.socket_handle, o.data_buffer.len),
+                    @intFromPtr(o.message_buffer.ptr),
+                    packLenBits(o.message_buffer.len, @as(u8, @bitCast(o.flags))),
+                    @intFromPtr(o.data_buffer.ptr),
+                });
+                break :result null;
             },
             .net_send => |o| {
-                _ = o;
-                @panic("TODO implement batchDrainSubmitted for net_send");
+                batchNetSubmit(thread, batch, storage, .net_send, o.socket_handle, poll_mask_writable, .{
+                    @intCast(o.socket_handle),
+                    @intFromPtr(o.messages.ptr),
+                    packLenBits(o.messages.len, @as(u8, @bitCast(o.flags))),
+                    0,
+                });
+                break :result null;
             },
             .net_read => |o| {
-                _ = o;
-                @panic("TODO implement batchDrainSubmitted for net_read");
+                batchNetSubmit(thread, batch, storage, .net_read, o.socket_handle, poll_mask_readable, .{
+                    @intCast(o.socket_handle),
+                    @intFromPtr(o.data.ptr),
+                    o.data.len,
+                    0,
+                });
+                break :result null;
             },
             .net_write => |o| {
-                _ = o;
-                @panic("TODO implement batchDrainSubmitted for net_write");
+                batchNetSubmit(thread, batch, storage, .net_write, o.socket_handle, poll_mask_writable, .{
+                    packHandleLen(o.socket_handle, o.data.len),
+                    @intFromPtr(o.header.ptr),
+                    packLenBits(o.header.len, @intCast(@min(o.splat, net_write_splat_max))),
+                    @intFromPtr(o.data.ptr),
+                });
+                break :result null;
             },
         })) |result| {
             switch (batch.completed.tail) {
@@ -2517,10 +1490,67 @@ fn batchDrainReady(batch: *Io.Batch) Io.Timeout.Error!void {
                     },
                 },
                 .device_io_control => unreachable,
-                .net_receive => @panic("TODO"),
-                .net_send => @panic("TODO"),
-                .net_read => @panic("TODO"),
-                .net_write => @panic("TODO"),
+                .net_receive => net: {
+                    const state = storage.pending.userdata[batch_net_state_offset .. batch_net_state_offset + batch_net_state_len].*;
+                    const handle, const data_buffer_len = unpackHandleLen(state[0]);
+                    const message_buffer_len, const flags_bits = unpackLenBits(state[2]);
+                    const message_buffer = @as(
+                        [*]net.IncomingMessage,
+                        @ptrFromInt(state[1]),
+                    )[0..message_buffer_len];
+                    const data_buffer = @as([*]u8, @ptrFromInt(state[3]))[0..data_buffer_len];
+                    if (completion.result < 0) switch (completion.errno()) {
+                        .INTR, .CANCELED => break :net null,
+                        else => |err| break :net .{ .net_receive = .{ netReceiveErrno(err), 0 } },
+                    };
+                    break :net .{ .net_receive = netReceiveSync(
+                        handle,
+                        message_buffer,
+                        data_buffer,
+                        @bitCast(@as(u8, @truncate(flags_bits))),
+                    ) };
+                },
+                .net_send => net: {
+                    const state = storage.pending.userdata[batch_net_state_offset .. batch_net_state_offset + batch_net_state_len].*;
+                    const handle: net.Socket.Handle = @intCast(state[0]);
+                    const messages_len, const flags_bits = unpackLenBits(state[2]);
+                    const messages = @as(
+                        [*]net.OutgoingMessage,
+                        @ptrFromInt(state[1]),
+                    )[0..messages_len];
+                    if (completion.result < 0) switch (completion.errno()) {
+                        .INTR, .CANCELED => break :net null,
+                        else => |err| break :net .{ .net_send = .{ sendmsgErrno(err), 0 } },
+                    };
+                    break :net .{ .net_send = netSendSync(handle, messages, @bitCast(
+                        @as(u8, @truncate(flags_bits)),
+                    )) };
+                },
+                .net_read => net: {
+                    const state = storage.pending.userdata[batch_net_state_offset .. batch_net_state_offset + batch_net_state_len].*;
+                    const handle: net.Socket.Handle = @intCast(state[0]);
+                    const data = @as([*][]u8, @ptrFromInt(state[1]))[0..state[2]];
+                    if (completion.result < 0) switch (completion.errno()) {
+                        .INTR, .CANCELED => break :net null,
+                        else => |err| break :net .{ .net_read = readvErrno(err) },
+                    };
+                    break :net .{ .net_read = netReadSync(handle, data) };
+                },
+                .net_write => net: {
+                    const state = storage.pending.userdata[batch_net_state_offset .. batch_net_state_offset + batch_net_state_len].*;
+                    const handle, const data_len = unpackHandleLen(state[0]);
+                    const header_len, const splat = unpackLenBits(state[2]);
+                    const header = @as([*]const u8, @ptrFromInt(state[1]))[0..header_len];
+                    const data = @as(
+                        [*]const []const u8,
+                        @ptrFromInt(state[3]),
+                    )[0..data_len];
+                    if (completion.result < 0) switch (completion.errno()) {
+                        .INTR, .CANCELED => break :net null,
+                        else => |err| break :net .{ .net_write = netWriteErrno(err) },
+                    };
+                    break :net .{ .net_write = netWriteSync(handle, header, data, splat) };
+                },
             })) |result| {
                 switch (batch.completed.tail) {
                     .none => batch.completed.head = index,
@@ -2543,7 +1573,6 @@ fn batchDrainReady(batch: *Io.Batch) Io.Timeout.Error!void {
 
 fn batchCancel(userdata: ?*anyopaque, batch: *Io.Batch) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
     batchDrainReady(batch) catch |err| switch (err) {
         error.Timeout => unreachable, // no timeout
     };
@@ -2574,9 +1603,14 @@ fn batchCancel(userdata: ?*anyopaque, batch: *Io.Batch) void {
         };
         index = pending.node.next;
     }
-    while (batch.pending.head != .none) batchDrainReady(batch) catch |err| switch (err) {
-        error.Timeout => unreachable, // no timeout
-    };
+    while (true) {
+        batchDrainReady(batch) catch |err| switch (err) {
+            error.Timeout => unreachable, // no timeout
+        };
+        if (batch.pending.head == .none) return;
+        // Parked until the next of the operations finishes, as they are canceled.
+        ev.sched.yield(null, .{ .custom = .{ .context = batch, .run = batchAwaitPending } });
+    }
 }
 
 fn dirCreateDir(
@@ -2610,7 +1644,7 @@ fn dirCreateDir(
             .addr3 = 0,
             .resv = 0,
         };
-        ev.yield(null, .nothing);
+        ev.sched.park();
         switch (cancel_region.errno()) {
             .SUCCESS => return,
             .INTR, .CANCELED => {},
@@ -2690,7 +1724,7 @@ fn filePathKind(ev: *Evented, dir: Dir, sub_path: []const u8) !File.Kind {
             .addr3 = 0,
             .resv = 0,
         };
-        ev.yield(null, .nothing);
+        ev.sched.park();
         switch (cancel_region.errno()) {
             .SUCCESS => {
                 if (!statx_buf.mask.TYPE) return error.Unexpected;
@@ -3216,7 +2250,7 @@ fn dirDeleteFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8) Dir.Dele
             .addr3 = 0,
             .resv = 0,
         };
-        ev.yield(null, .nothing);
+        ev.sched.park();
         switch (cancel_region.errno()) {
             .SUCCESS => return,
             .INTR, .CANCELED => {},
@@ -3268,7 +2302,7 @@ fn dirDeleteDir(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8) Dir.Delet
             .addr3 = 0,
             .resv = 0,
         };
-        ev.yield(null, .nothing);
+        ev.sched.park();
         switch (cancel_region.errno()) {
             .SUCCESS => return,
             .INTR, .CANCELED => {},
@@ -3384,7 +2418,7 @@ fn dirSymLink(
             .addr3 = 0,
             .resv = 0,
         };
-        ev.yield(null, .nothing);
+        ev.sched.park();
         switch (cancel_region.errno()) {
             .SUCCESS => return,
             .INTR, .CANCELED => {},
@@ -3610,7 +2644,7 @@ fn fileLength(userdata: ?*anyopaque, file: File) File.LengthError!u64 {
             .addr3 = 0,
             .resv = 0,
         };
-        ev.yield(null, .nothing);
+        ev.sched.park();
         switch (cancel_region.errno()) {
             .SUCCESS => {
                 if (!statx_buf.mask.SIZE) return error.Unexpected;
@@ -3796,7 +2830,7 @@ fn fileSync(userdata: ?*anyopaque, file: File) File.SyncError!void {
             .addr3 = 0,
             .resv = 0,
         };
-        ev.yield(null, .nothing);
+        ev.sched.park();
         switch (cancel_region.errno()) {
             .SUCCESS => return,
             .INTR, .CANCELED => {},
@@ -3854,7 +2888,7 @@ fn fileSetLength(userdata: ?*anyopaque, file: File, length: u64) File.SetLengthE
             .addr3 = 0,
             .resv = 0,
         };
-        ev.yield(null, .nothing);
+        ev.sched.park();
         switch (cancel_region.errno()) {
             .SUCCESS => return,
             .INTR, .CANCELED => {},
@@ -4162,8 +3196,8 @@ fn tryLockStderr(
 fn initLockedStderr(ev: *Evented, terminal_mode: ?Io.Terminal.Mode) Io.Cancelable!Io.LockedStderr {
     if (!ev.stderr_writer_initialized) {
         const ev_io = ev.io();
-        const cancel_protection = swapCancelProtection(ev, .blocked);
-        defer assert(swapCancelProtection(ev, cancel_protection) == .blocked);
+        const cancel_protection = Scheduler.swapCancelProtection(ev, .blocked);
+        defer assert(Scheduler.swapCancelProtection(ev, cancel_protection) == .blocked);
         ev.scanEnviron() catch |err| switch (err) {
             error.Canceled => unreachable, // blocked
         };
@@ -4269,15 +3303,70 @@ fn processReplacePath(
     options: process.ReplaceOptions,
 ) process.ReplaceError {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = dir;
-    _ = options;
-    @panic("TODO processReplacePath");
+
+    try ev.scanEnviron(); // for the child environment
+
+    var arena_allocator = std.heap.ArenaAllocator.init(ev.allocator());
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    const argv_buf = try arena.allocSentinel(?[*:0]const u8, options.argv.len, null);
+    for (options.argv, 0..) |arg, i| argv_buf[i] = (try arena.dupeSentinel(u8, arg, 0)).ptr;
+
+    const env_block = env_block: {
+        const prog_fd: i32 = -1;
+        if (options.environ_map) |environ_map| break :env_block try environ_map.createPosixBlock(arena, .{
+            .zig_progress_fd = prog_fd,
+        });
+        break :env_block try ev.environ.process_environ.createPosixBlock(arena, .{
+            .zig_progress_fd = prog_fd,
+        });
+    };
+
+    var sync: CancelRegion.Sync = try .init(ev);
+    defer sync.deinit(ev);
+    return execvAt(&sync, dir, argv_buf.ptr[0].?, argv_buf.ptr, env_block);
+}
+
+/// Like `execvPath`, except that `file` is resolved relative to `dir`, and
+/// `PATH` is never consulted, as documented for the `*Path` variants of
+/// `spawn` and `replace`.
+fn execvAt(
+    sync: *CancelRegion.Sync,
+    dir: Dir,
+    file: [*:0]const u8,
+    child_argv: [*:null]const ?[*:0]const u8,
+    env_block: process.Environ.PosixBlock,
+) process.ReplaceError {
+    try sync.cancel_region.await(.nothing);
+    switch (linux.errno(linux.execveat(dir.handle, file, child_argv, env_block.slice.ptr, .{
+        .SYMLINK_NOFOLLOW = false,
+        .EMPTY_PATH = false,
+    }))) {
+        .FAULT => |err| return errnoBug(err), // Bad pointer parameter.
+        .@"2BIG" => return error.SystemResources,
+        .MFILE => return error.ProcessFdQuotaExceeded,
+        .NAMETOOLONG => return error.NameTooLong,
+        .NFILE => return error.SystemFdQuotaExceeded,
+        .NOMEM => return error.SystemResources,
+        .ACCES => return error.AccessDenied,
+        .PERM => return error.PermissionDenied,
+        .INVAL => return error.InvalidExe,
+        .NOEXEC => return error.InvalidExe,
+        .IO => return error.FileSystem,
+        .LOOP => return error.FileSystem,
+        .ISDIR => return error.IsDir,
+        .NOENT => return error.FileNotFound,
+        .NOTDIR => return error.NotDir,
+        .TXTBSY => return error.FileBusy,
+        .LIBBAD => return error.InvalidExe,
+        else => |err| return unexpectedErrno(err),
+    }
 }
 
 fn processSpawn(userdata: ?*anyopaque, options: process.SpawnOptions) process.SpawnError!process.Child {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const spawned = try ev.spawn(options);
+    const spawned = try ev.spawn(null, options);
     var cancel_region: CancelRegion = .initBlocked();
     defer cancel_region.deinit();
     defer ev.closeAsync(spawned.err_fd);
@@ -4315,10 +3404,36 @@ fn processSpawnPath(
     options: process.SpawnOptions,
 ) process.SpawnError!process.Child {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = dir;
-    _ = options;
-    @panic("TODO processSpawnPath");
+    const spawned = try ev.spawn(dir, options);
+    var cancel_region: CancelRegion = .initBlocked();
+    defer cancel_region.deinit();
+    defer ev.closeAsync(spawned.err_fd);
+
+    // Wait for the child to report any errors in or before `execveat`.
+    var child_err: ForkBailError = undefined;
+    ev.readAll(&cancel_region, spawned.err_fd, @ptrCast(&child_err)) catch |read_err| {
+        switch (read_err) {
+            error.Canceled => unreachable, // blocked
+            error.EndOfStream => {
+                // Write end closed by CLOEXEC at the time of the `execveat` call,
+                // indicating success.
+            },
+            else => {
+                // Problem reading the error from the error reporting pipe. We
+                // don't know if the child is alive or dead. Better to assume it is
+                // alive so the resource does not risk being leaked.
+            },
+        }
+        return .{
+            .id = spawned.pid,
+            .thread_handle = {},
+            .stdin = spawned.stdin,
+            .stdout = spawned.stdout,
+            .stderr = spawned.stderr,
+            .request_resource_usage_statistics = options.request_resource_usage_statistics,
+        };
+    };
+    return child_err;
 }
 
 const prog_fileno = @max(linux.STDIN_FILENO, linux.STDOUT_FILENO, linux.STDERR_FILENO);
@@ -4330,7 +3445,10 @@ const Spawned = struct {
     stdout: ?File,
     stderr: ?File,
 };
-fn spawn(ev: *Evented, options: process.SpawnOptions) process.SpawnError!Spawned {
+/// When `exec_dir` is provided, the executable path in `options.argv[0]` is
+/// resolved relative to it (and `PATH` is not consulted), without affecting
+/// the child's working directory.
+fn spawn(ev: *Evented, exec_dir: ?Dir, options: process.SpawnOptions) process.SpawnError!Spawned {
     var cancel_region: CancelRegion = .init();
     defer cancel_region.deinit();
 
@@ -4433,6 +3551,7 @@ fn spawn(ev: *Evented, options: process.SpawnOptions) process.SpawnError!Spawned
             .argv_buf = argv_buf,
             .env_block = env_block,
             .PATH = PATH,
+            .exec_dir = exec_dir,
             .spawn = options,
         });
         writeAllSync(&sync, err_pipe[1], @ptrCast(&err)) catch {};
@@ -4502,6 +3621,7 @@ fn setUpChild(sync: *CancelRegion.Sync, options: struct {
     argv_buf: [:null]?[*:0]const u8,
     env_block: process.Environ.Block,
     PATH: []const u8,
+    exec_dir: ?Dir,
     spawn: process.SpawnOptions,
 }) ForkBailError {
     try setUpChildIo(
@@ -4578,6 +3698,13 @@ fn setUpChild(sync: *CancelRegion.Sync, options: struct {
         }
     }
 
+    if (options.exec_dir) |exec_dir| return execvAt(
+        sync,
+        exec_dir,
+        options.argv_buf.ptr[0].?,
+        options.argv_buf.ptr,
+        options.env_block,
+    );
     return execv(
         sync,
         options.spawn.expand_arg0,
@@ -4729,7 +3856,7 @@ fn childWait(userdata: ?*anyopaque, child: *process.Child) process.Child.WaitErr
             .addr3 = 0,
             .resv = 0,
         };
-        ev.yield(null, .nothing);
+        ev.sched.park();
         switch (maybe_sync.cancel_region.errno()) {
             .SUCCESS => {
                 if (child.request_resource_usage_statistics) {
@@ -4809,7 +3936,7 @@ fn childKill(userdata: ?*anyopaque, child: *process.Child) void {
             .addr3 = 0,
             .resv = 0,
         };
-        ev.yield(null, .nothing);
+        ev.sched.park();
         switch (maybe_sync.cancel_region.errno()) {
             .SUCCESS => return,
             .INTR, .CANCELED => {},
@@ -4837,8 +3964,8 @@ fn childCleanup(ev: *Evented, child: *process.Child) void {
 
 fn progressParentFile(userdata: ?*anyopaque) std.Progress.ParentFileError!File {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    const cancel_protection = swapCancelProtection(ev, .blocked);
-    defer assert(swapCancelProtection(ev, cancel_protection) == .blocked);
+    const cancel_protection = Scheduler.swapCancelProtection(ev, .blocked);
+    defer assert(Scheduler.swapCancelProtection(ev, cancel_protection) == .blocked);
     ev.scanEnviron() catch |err| switch (err) {
         error.Canceled => unreachable, // blocked
     };
@@ -4934,7 +4061,7 @@ fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
         .addr3 = 0,
         .resv = 0,
     };
-    ev.yield(null, .nothing);
+    ev.sched.park();
     // Handles SUCCESS as well as clock not available and unexpected
     // errors. The user had a chance to check clock resolution before
     // getting here, which would have reported 0, making this a legal
@@ -4983,28 +4110,106 @@ fn randomSecure(userdata: ?*anyopaque, buffer: []u8) Io.RandomSecureError!void {
     };
 }
 
-fn netListenIpUnavailable(
+fn netListenIp(
     userdata: ?*anyopaque,
     address: *const net.IpAddress,
     options: net.IpAddress.ListenOptions,
 ) net.IpAddress.ListenError!net.Socket {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = address;
-    _ = options;
-    return error.NetworkDown;
+    var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
+    defer maybe_sync.deinit(ev);
+    const family = posixAddressFamily(address);
+    const socket_fd = try ev.socket(&maybe_sync.cancel_region, family, .{
+        .mode = options.mode,
+        .protocol = options.protocol,
+    });
+    errdefer ev.closeAsync(socket_fd);
+
+    if (options.reuse_address) {
+        try ev.setsockopt(&maybe_sync.cancel_region, socket_fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, 1);
+        if (@hasDecl(linux.SO, "REUSEPORT"))
+            try ev.setsockopt(&maybe_sync.cancel_region, socket_fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, 1);
+    }
+
+    var storage: PosixAddress = undefined;
+    var addr_len = addressToPosix(address, &storage);
+    try ev.bind(&maybe_sync.cancel_region, socket_fd, &storage.any, addr_len);
+    try listen(try maybe_sync.enterSync(ev), socket_fd, options.kernel_backlog);
+    maybe_sync.leaveSync(ev);
+    try ev.getsockname(try maybe_sync.enterSync(ev), socket_fd, &storage.any, &addr_len);
+    return .{ .handle = socket_fd, .address = addressFromPosix(&storage) };
 }
 
-fn netAcceptUnavailable(
+/// This syscall does not block, but going through `CancelRegion.Sync` is how
+/// the caller retains the ability to interrupt the task while it is inside a
+/// syscall.
+fn listen(sync: *CancelRegion.Sync, socket_fd: fd_t, backlog: u31) !void {
+    while (true) {
+        try sync.cancel_region.await(.nothing);
+        switch (linux.errno(linux.listen(socket_fd, backlog))) {
+            .SUCCESS => return,
+            .INTR => {},
+            .ADDRINUSE => return error.AddressInUse,
+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .NOTSOCK => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn netAccept(
     userdata: ?*anyopaque,
     listen_handle: net.Socket.Handle,
     options: net.Server.AcceptOptions,
 ) net.Server.AcceptError!net.Socket {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = listen_handle;
-    _ = options;
-    return error.NetworkDown;
+    _ = options; // AcceptOptions is void on POSIX
+    var cancel_region: CancelRegion = .init();
+    defer cancel_region.deinit();
+    var storage: PosixAddress = undefined;
+    var addr_len: linux.socklen_t = @sizeOf(PosixAddress);
+    while (true) {
+        const thread = try cancel_region.awaitIoUring();
+        thread.enqueue().* = .{
+            .opcode = .ACCEPT,
+            .flags = 0,
+            .ioprio = 0,
+            .fd = listen_handle,
+            .off = @intFromPtr(&addr_len),
+            .addr = @intFromPtr(&storage.any),
+            .len = 0,
+            .rw_flags = linux.SOCK.CLOEXEC,
+            .user_data = @intFromPtr(cancel_region.fiber),
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
+        ev.sched.park();
+        const completion = cancel_region.completion();
+        switch (completion.errno()) {
+            .SUCCESS => return .{
+                .handle = @intCast(completion.result),
+                .address = addressFromPosix(&storage),
+            },
+            .INTR, .CANCELED => {},
+            .AGAIN => |err| return errnoBug(err),
+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .CONNABORTED => return error.ConnectionAborted,
+            .FAULT => |err| return errnoBug(err),
+            .INVAL => return error.SocketNotListening,
+            .NOTSOCK => |err| return errnoBug(err),
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOBUFS => return error.SystemResources,
+            .NOMEM => return error.SystemResources,
+            .OPNOTSUPP => |err| return errnoBug(err),
+            .PROTO => return error.ProtocolFailure,
+            .PERM => return error.BlockedByFirewall,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
 }
 
 fn netBindIp(
@@ -5026,47 +4231,895 @@ fn netBindIp(
     return .{ .handle = socket_fd, .address = addressFromPosix(&storage) };
 }
 
-fn netConnectIpUnavailable(
+fn netConnectIp(
     userdata: ?*anyopaque,
     address: *const net.IpAddress,
     options: net.IpAddress.ConnectOptions,
 ) net.IpAddress.ConnectError!net.Socket {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = address;
-    _ = options;
-    return error.NetworkDown;
+    var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
+    defer maybe_sync.deinit(ev);
+    const family = posixAddressFamily(address);
+    const socket_fd = try ev.socket(&maybe_sync.cancel_region, family, .{
+        .mode = options.mode,
+        .protocol = options.protocol,
+    });
+    errdefer ev.closeAsync(socket_fd);
+    var storage: PosixAddress = undefined;
+    var addr_len = addressToPosix(address, &storage);
+    try connectIp(&maybe_sync.cancel_region, ev, socket_fd, &storage.any, addr_len, options.timeout);
+    try ev.getsockname(try maybe_sync.enterSync(ev), socket_fd, &storage.any, &addr_len);
+    return .{ .handle = socket_fd, .address = addressFromPosix(&storage) };
 }
 
-fn netListenUnixUnavailable(
+fn connectIp(
+    cancel_region: *CancelRegion,
+    ev: *Evented,
+    socket_fd: fd_t,
+    addr: *const linux.sockaddr,
+    addr_len: linux.socklen_t,
+    timeout: Io.Timeout,
+) net.IpAddress.ConnectError!void {
+    const timespec: ?linux.kernel_timespec, const timeout_flags: u32 = switch (timeout) {
+        .none => .{ null, 0 },
+        .duration => |duration| .{ .{
+            .sec = @intCast(@divFloor(duration.raw.toNanoseconds(), std.time.ns_per_s)),
+            .nsec = @intCast(@mod(duration.raw.toNanoseconds(), std.time.ns_per_s)),
+        }, 0 },
+        .deadline => |deadline| .{ .{
+            .sec = @intCast(@divFloor(deadline.raw.toNanoseconds(), std.time.ns_per_s)),
+            .nsec = @intCast(@mod(deadline.raw.toNanoseconds(), std.time.ns_per_s)),
+        }, linux.IORING_TIMEOUT_ABS | @as(u32, switch (deadline.clock) {
+            .real => linux.IORING_TIMEOUT_REALTIME,
+            else => 0,
+            .boot => linux.IORING_TIMEOUT_BOOTTIME,
+        }) },
+    };
+    var timeout_storage = timespec;
+    while (true) {
+        const thread = try cancel_region.awaitIoUring();
+        thread.enqueue().* = .{
+            .opcode = .CONNECT,
+            .flags = if (timespec != null) linux.IOSQE_IO_LINK else 0,
+            .ioprio = 0,
+            .fd = socket_fd,
+            .off = addr_len,
+            .addr = @intFromPtr(addr),
+            .len = 0,
+            .rw_flags = 0,
+            .user_data = @intFromPtr(cancel_region.fiber),
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
+        if (timeout_storage) |*timespec_ptr| thread.enqueue().* = .{
+            .opcode = .LINK_TIMEOUT,
+            .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
+            .ioprio = 0,
+            .fd = 0,
+            .off = 0,
+            .addr = @intFromPtr(timespec_ptr),
+            .len = 1,
+            .rw_flags = timeout_flags,
+            .user_data = @backingInt(Completion.Userdata.wakeup),
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
+        ev.sched.park();
+        switch (cancel_region.errno()) {
+            .SUCCESS => return,
+            .INTR, .CANCELED => {},
+            // A linked timeout that expires cancels the `CONNECT` with `ETIME`.
+            .TIME => return error.Timeout,
+            .ADDRNOTAVAIL => return error.AddressUnavailable,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .AGAIN, .INPROGRESS => return error.WouldBlock,
+            // The kernel reports this when a linked timeout expiring races
+            // with an in-flight connect.
+            .ALREADY => return if (timespec != null) error.Timeout else error.ConnectionPending,
+            .CONNREFUSED => return error.ConnectionRefused,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .HOSTUNREACH => return error.HostUnreachable,
+            .NETUNREACH => return error.NetworkUnreachable,
+            .TIMEDOUT => return error.Timeout,
+            .ACCES => return error.AccessDenied,
+            .NETDOWN => return error.NetworkDown,
+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .CONNABORTED => |err| return errnoBug(err),
+            .FAULT => |err| return errnoBug(err),
+            .ISCONN => |err| return errnoBug(err),
+            .NOENT => |err| return errnoBug(err),
+            .NOTSOCK => |err| return errnoBug(err),
+            .PERM => |err| return errnoBug(err),
+            .PROTOTYPE => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn netListenUnix(
     userdata: ?*anyopaque,
     address: *const net.UnixAddress,
     options: net.UnixAddress.ListenOptions,
 ) net.UnixAddress.ListenError!net.Socket.Handle {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = address;
-    _ = options;
-    return error.AddressFamilyUnsupported;
+    var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
+    defer maybe_sync.deinit(ev);
+    const socket_fd = ev.socket(&maybe_sync.cancel_region, linux.AF.UNIX, .{ .mode = .stream }) catch |err| switch (err) {
+        error.ProtocolUnsupportedBySystem => return error.AddressFamilyUnsupported,
+        error.ProtocolUnsupportedByAddressFamily => return error.AddressFamilyUnsupported,
+        error.SocketModeUnsupported => return error.AddressFamilyUnsupported,
+        error.OptionUnsupported => return error.Unexpected,
+        else => |e| return e,
+    };
+    errdefer ev.closeAsync(socket_fd);
+
+    var storage: UnixAddress = undefined;
+    const addr_len = addressUnixToPosix(address, &storage);
+    try bindUnix(&maybe_sync.cancel_region, ev, socket_fd, &storage.any, addr_len);
+    try listen(try maybe_sync.enterSync(ev), socket_fd, options.kernel_backlog);
+    return socket_fd;
 }
 
-fn netConnectUnixUnavailable(
+fn bindUnix(
+    cancel_region: *CancelRegion,
+    ev: *Evented,
+    socket_fd: fd_t,
+    addr: *const linux.sockaddr,
+    addr_len: linux.socklen_t,
+) net.UnixAddress.ListenError!void {
+    while (true) {
+        const thread = try cancel_region.awaitIoUring();
+        thread.enqueue().* = .{
+            .opcode = .BIND,
+            .flags = 0,
+            .ioprio = 0,
+            .fd = socket_fd,
+            .off = addr_len,
+            .addr = @intFromPtr(addr),
+            .len = 0,
+            .rw_flags = 0,
+            .user_data = @intFromPtr(cancel_region.fiber),
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
+        ev.sched.park();
+        switch (cancel_region.errno()) {
+            .SUCCESS => return,
+            .INTR, .CANCELED => {},
+            .ACCES => return error.AccessDenied,
+            .ADDRINUSE => return error.AddressInUse,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .ADDRNOTAVAIL => return error.AddressUnavailable,
+            .NOMEM => return error.SystemResources,
+
+            .LOOP => return error.SymLinkLoop,
+            .NOENT => return error.FileNotFound,
+            .NOTDIR => return error.NotDir,
+            .ROFS => return error.ReadOnlyFileSystem,
+            .PERM => return error.PermissionDenied,
+
+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .INVAL => |err| return errnoBug(err), // invalid parameters
+            .NOTSOCK => |err| return errnoBug(err), // invalid `sockfd`
+            .FAULT => |err| return errnoBug(err), // invalid `addr` pointer
+            .NAMETOOLONG => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn netConnectUnix(
     userdata: ?*anyopaque,
     address: *const net.UnixAddress,
 ) net.UnixAddress.ConnectError!net.Socket.Handle {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = address;
-    return error.AddressFamilyUnsupported;
+    var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
+    defer maybe_sync.deinit(ev);
+    const socket_fd = ev.socket(&maybe_sync.cancel_region, linux.AF.UNIX, .{ .mode = .stream }) catch |err| switch (err) {
+        error.ProtocolUnsupportedByAddressFamily => return error.AddressFamilyUnsupported,
+        error.OptionUnsupported => return error.Unexpected,
+        else => |e| return e,
+    };
+    errdefer ev.closeAsync(socket_fd);
+    var storage: UnixAddress = undefined;
+    const addr_len = addressUnixToPosix(address, &storage);
+    try connectUnix(&maybe_sync.cancel_region, ev, socket_fd, &storage.any, addr_len);
+    return socket_fd;
 }
 
-fn netSocketCreatePairUnavailable(
+fn connectUnix(
+    cancel_region: *CancelRegion,
+    ev: *Evented,
+    socket_fd: fd_t,
+    addr: *const linux.sockaddr,
+    addr_len: linux.socklen_t,
+) net.UnixAddress.ConnectError!void {
+    while (true) {
+        const thread = try cancel_region.awaitIoUring();
+        thread.enqueue().* = .{
+            .opcode = .CONNECT,
+            .flags = 0,
+            .ioprio = 0,
+            .fd = socket_fd,
+            .off = addr_len,
+            .addr = @intFromPtr(addr),
+            .len = 0,
+            .rw_flags = 0,
+            .user_data = @intFromPtr(cancel_region.fiber),
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
+        ev.sched.park();
+        switch (cancel_region.errno()) {
+            .SUCCESS => return,
+            .INTR, .CANCELED => {},
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .AGAIN, .INPROGRESS => return error.WouldBlock,
+            .ACCES => return error.AccessDenied,
+
+            .LOOP => return error.SymLinkLoop,
+            .NOENT => return error.FileNotFound,
+            .NOTDIR => return error.NotDir,
+            .ROFS => return error.ReadOnlyFileSystem,
+            .PERM => return error.PermissionDenied,
+
+            .CONNREFUSED => return error.ConnectionRefused,
+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .FAULT => |err| return errnoBug(err),
+            .INVAL => |err| return errnoBug(err),
+            .ISCONN => |err| return errnoBug(err),
+            .NOTSOCK => |err| return errnoBug(err),
+            .PROTOTYPE => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn netSocketCreatePair(
     userdata: ?*anyopaque,
     options: net.Socket.CreatePairOptions,
 ) net.Socket.CreatePairError![2]net.Socket {
-    _ = userdata;
-    _ = options;
-    return error.OperationUnsupported;
+    const ev: *Evented = @ptrCast(@alignCast(userdata));
+    const family: linux.sa_family_t = switch (options.family) {
+        .ip4 => linux.AF.INET,
+        .ip6 => linux.AF.INET6,
+    };
+    const mode, const protocol = try posixSocketModeProtocol(family, options.mode, options.protocol);
+    var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
+    defer maybe_sync.deinit(ev);
+    var sockets: [2]fd_t = undefined;
+    while (true) {
+        try maybe_sync.cancel_region.await(.nothing);
+        switch (linux.errno(linux.socketpair(family, mode | linux.SOCK.CLOEXEC, protocol, &sockets))) {
+            .SUCCESS => break,
+            .INTR => {},
+            .ACCES => return error.AccessDenied,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .INVAL => return error.ProtocolUnsupportedBySystem,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOBUFS => return error.SystemResources,
+            .NOMEM => return error.SystemResources,
+            .PROTONOSUPPORT => return error.ProtocolUnsupportedByAddressFamily,
+            .PROTOTYPE => return error.SocketModeUnsupported,
+            // e.g. socket pairs are only supported for `AF.UNIX` by Linux.
+            .OPNOTSUPP => return error.OperationUnsupported,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+    errdefer {
+        ev.closeAsync(sockets[0]);
+        ev.closeAsync(sockets[1]);
+    }
+    var storages: [2]PosixAddress = undefined;
+    var addr_lens: [2]linux.socklen_t = .{ @sizeOf(PosixAddress), @sizeOf(PosixAddress) };
+    const sync = try maybe_sync.enterSync(ev);
+    try ev.getsockname(sync, sockets[0], &storages[0].any, &addr_lens[0]);
+    try ev.getsockname(sync, sockets[1], &storages[1].any, &addr_lens[1]);
+    return .{
+        .{ .handle = sockets[0], .address = addressFromPosix(&storages[0]) },
+        .{ .handle = sockets[1], .address = addressFromPosix(&storages[1]) },
+    };
+}
+
+/// Maps an `errno` from `sendmsg`; `INTR` and `CANCELED` are handled by the
+/// callers.
+fn sendmsgErrno(err: linux.E) Io.Operation.NetSend.Error {
+    return switch (err) {
+        .ACCES => error.AccessDenied,
+        .ALREADY => error.FastOpenAlreadyInProgress,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .MSGSIZE => error.MessageOversize,
+        .NOBUFS => error.SystemResources,
+        .NOMEM => error.SystemResources,
+        .PIPE => error.SocketUnconnected,
+        .AFNOSUPPORT => error.AddressFamilyUnsupported,
+        .HOSTUNREACH => error.HostUnreachable,
+        .NETUNREACH => error.NetworkUnreachable,
+        .NOTCONN => error.SocketUnconnected,
+        .TIMEDOUT => error.ConnectionTimedOut,
+        .NETDOWN => error.NetworkDown,
+
+        .BADF => |e| errnoBug(e), // File descriptor used after closed.
+        .DESTADDRREQ => |e| errnoBug(e), // not connection-mode and no peer address is set
+        .FAULT => |e| errnoBug(e), // invalid user space address
+        .INVAL => |e| errnoBug(e), // invalid argument passed
+        .ISCONN => |e| errnoBug(e), // connected already but a recipient was specified
+        .NOTSOCK => |e| errnoBug(e), // does not refer to a socket
+        .OPNOTSUPP => |e| errnoBug(e), // flags inappropriate for the socket type
+        else => |e| unexpectedErrno(e),
+    };
+}
+
+/// Maps an `errno` from `readv`; `INTR` and `CANCELED` are handled by the
+/// callers. `.AGAIN` is an operating system bug because the file descriptors
+/// managed by this implementation are blocking.
+fn readvErrno(err: linux.E) Io.Operation.NetRead.Error {
+    return switch (err) {
+        .NOBUFS => error.SystemResources,
+        .NOMEM => error.SystemResources,
+        .NOTCONN => error.SocketUnconnected,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .TIMEDOUT => error.ConnectionTimedOut,
+        .NETDOWN => error.NetworkDown,
+
+        .AGAIN => |e| errnoBug(e), // File descriptor is blocking.
+        .BADF => |e| errnoBug(e), // File descriptor used after closed.
+        .FAULT => |e| errnoBug(e),
+        .INVAL => |e| errnoBug(e),
+        else => |e| unexpectedErrno(e),
+    };
+}
+
+/// Maps an `errno` from `sendmsg` on a stream; `INTR` and `CANCELED` are
+/// handled by the callers.
+fn netWriteErrno(err: linux.E) Io.Operation.NetWrite.Error {
+    return switch (err) {
+        .ALREADY => error.FastOpenAlreadyInProgress,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .NOBUFS => error.SystemResources,
+        .NOMEM => error.SystemResources,
+        .PIPE => error.SocketUnconnected,
+        .AFNOSUPPORT => error.AddressFamilyUnsupported,
+        .HOSTUNREACH => error.HostUnreachable,
+        .NETUNREACH => error.NetworkUnreachable,
+        .NOTCONN => error.SocketUnconnected,
+        .TIMEDOUT => error.ConnectionTimedOut,
+        .NETDOWN => error.NetworkDown,
+
+        .ACCES => |e| errnoBug(e),
+        .AGAIN => |e| errnoBug(e), // File descriptor is blocking.
+        .BADF => |e| errnoBug(e), // File descriptor used after closed.
+        .DESTADDRREQ => |e| errnoBug(e), // connection-mode socket was never connected
+        .FAULT => |e| errnoBug(e), // invalid user space address
+        .INVAL => |e| errnoBug(e), // invalid argument passed
+        .ISCONN => |e| errnoBug(e), // connected already but a recipient was specified
+        .MSGSIZE => |e| errnoBug(e),
+        .NOTSOCK => |e| errnoBug(e), // does not refer to a socket
+        .OPNOTSUPP => |e| errnoBug(e), // flags inappropriate for the socket type
+        else => |e| unexpectedErrno(e),
+    };
+}
+
+/// Maps an `errno` from `recvmsg`; `INTR` and `CANCELED` are handled by the
+/// callers.
+fn netReceiveErrno(err: linux.E) net.Socket.ReceiveError {
+    return switch (err) {
+        .NFILE => error.SystemFdQuotaExceeded,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NOBUFS => error.SystemResources,
+        .NOMEM => error.SystemResources,
+        .NOTCONN => error.SocketUnconnected,
+        .PIPE => error.SocketUnconnected,
+        .MSGSIZE => error.MessageOversize,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .TIMEDOUT => error.ConnectionTimedOut,
+        .NETDOWN => error.NetworkDown,
+        // An ICMP port unreachable received for a previously sent datagram.
+        .CONNREFUSED => error.PortUnreachable,
+
+        .AGAIN => |e| errnoBug(e), // File descriptor is blocking.
+        .BADF => |e| errnoBug(e), // File descriptor used after closed.
+        .FAULT => |e| errnoBug(e),
+        .INVAL => |e| errnoBug(e),
+        .NOTSOCK => |e| errnoBug(e),
+        .OPNOTSUPP => |e| errnoBug(e),
+        else => |e| unexpectedErrno(e),
+    };
+}
+
+fn netSend(
+    ev: *Evented,
+    cancel_region: *CancelRegion,
+    handle: net.Socket.Handle,
+    messages: []net.OutgoingMessage,
+    flags: net.SendFlags,
+) Io.Cancelable!struct { ?net.Socket.SendError, usize } {
+    const posix_flags: u32 =
+        @as(u32, if (@hasDecl(linux.MSG, "CONFIRM") and flags.confirm) linux.MSG.CONFIRM else 0) |
+        @as(u32, if (@hasDecl(linux.MSG, "DONTROUTE") and flags.dont_route) linux.MSG.DONTROUTE else 0) |
+        @as(u32, if (@hasDecl(linux.MSG, "EOR") and flags.eor) linux.MSG.EOR else 0) |
+        @as(u32, if (@hasDecl(linux.MSG, "OOB") and flags.oob) linux.MSG.OOB else 0) |
+        @as(u32, if (@hasDecl(linux.MSG, "FASTOPEN") and flags.fastopen) linux.MSG.FASTOPEN else 0) |
+        linux.MSG.NOSIGNAL;
+
+    var i: usize = 0;
+    while (messages.len - i != 0) : (i += 1) {
+        netSendOne(ev, cancel_region, handle, &messages[i], posix_flags) catch |err| switch (err) {
+            error.Canceled => |e| if (i == 0) {
+                return e;
+            } else {
+                // The messages sent so far are reported to the caller; the
+                // cancelation request stays pending, so it is observed by the
+                // next operation that awaits.
+                return .{ null, i };
+            },
+            else => |e| return .{ e, i },
+        };
+    }
+    return .{ null, i };
+}
+
+fn netSendOne(
+    ev: *Evented,
+    cancel_region: *CancelRegion,
+    handle: net.Socket.Handle,
+    message: *net.OutgoingMessage,
+    posix_flags: u32,
+) (Io.Cancelable || Io.Operation.NetSend.Error)!void {
+    var addr: PosixAddress = undefined;
+    var one_iovec: iovec_const = .{ .base = @constCast(message.data_ptr), .len = message.data_len };
+    const msg: linux.msghdr_const = .{
+        .name = &addr.any,
+        .namelen = addressToPosix(message.address, &addr),
+        .iov = (&one_iovec)[0..1],
+        .iovlen = 1,
+        // OS returns EINVAL if this pointer is invalid even if controllen is zero.
+        .control = if (message.control.len == 0) null else @constCast(message.control.ptr),
+        .controllen = @intCast(message.control.len),
+        .flags = 0,
+    };
+    while (true) {
+        const thread = try cancel_region.awaitIoUring();
+        thread.enqueue().* = .{
+            .opcode = .SENDMSG,
+            .flags = 0,
+            .ioprio = 0,
+            .fd = handle,
+            .off = 0,
+            .addr = @intFromPtr(&msg),
+            .len = 1,
+            .rw_flags = posix_flags,
+            .user_data = @intFromPtr(cancel_region.fiber),
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
+        ev.sched.park();
+        const completion = cancel_region.completion();
+        switch (completion.errno()) {
+            .SUCCESS => {
+                message.data_len = @intCast(completion.result);
+                return;
+            },
+            .INTR, .CANCELED => {},
+            else => |err| return sendmsgErrno(err),
+        }
+    }
+}
+
+/// Direct syscall variant of `netSend`, for use once the kernel has reported
+/// the socket to be writable, in contexts where awaiting the ring is not
+/// possible.
+fn netSendSync(
+    handle: net.Socket.Handle,
+    messages: []net.OutgoingMessage,
+    flags: net.SendFlags,
+) struct { ?Io.Operation.NetSend.Error, usize } {
+    const posix_flags: u32 =
+        @as(u32, if (@hasDecl(linux.MSG, "CONFIRM") and flags.confirm) linux.MSG.CONFIRM else 0) |
+        @as(u32, if (@hasDecl(linux.MSG, "DONTROUTE") and flags.dont_route) linux.MSG.DONTROUTE else 0) |
+        @as(u32, if (@hasDecl(linux.MSG, "EOR") and flags.eor) linux.MSG.EOR else 0) |
+        @as(u32, if (@hasDecl(linux.MSG, "OOB") and flags.oob) linux.MSG.OOB else 0) |
+        @as(u32, if (@hasDecl(linux.MSG, "FASTOPEN") and flags.fastopen) linux.MSG.FASTOPEN else 0) |
+        linux.MSG.NOSIGNAL;
+
+    var i: usize = 0;
+    while (messages.len - i != 0) : (i += 1) {
+        netSendOneSync(handle, &messages[i], posix_flags) catch |err| return .{ err, i };
+    }
+    return .{ null, i };
+}
+
+fn netSendOneSync(
+    handle: net.Socket.Handle,
+    message: *net.OutgoingMessage,
+    posix_flags: u32,
+) Io.Operation.NetSend.Error!void {
+    var addr: PosixAddress = undefined;
+    var one_iovec: iovec_const = .{ .base = @constCast(message.data_ptr), .len = message.data_len };
+    const msg: linux.msghdr_const = .{
+        .name = &addr.any,
+        .namelen = addressToPosix(message.address, &addr),
+        .iov = (&one_iovec)[0..1],
+        .iovlen = 1,
+        // OS returns EINVAL if this pointer is invalid even if controllen is zero.
+        .control = if (message.control.len == 0) null else @constCast(message.control.ptr),
+        .controllen = @intCast(message.control.len),
+        .flags = 0,
+    };
+    const rc: usize = while (true) {
+        const rc = linux.sendmsg(handle, &msg, posix_flags);
+        switch (linux.errno(rc)) {
+            .INTR => {},
+            else => break rc,
+        }
+    };
+    switch (linux.errno(rc)) {
+        .SUCCESS => message.data_len = @intCast(rc),
+        else => |err| return sendmsgErrno(err),
+    }
+}
+
+fn netRead(
+    ev: *Evented,
+    cancel_region: *CancelRegion,
+    handle: net.Socket.Handle,
+    data: [][]u8,
+) net.Stream.Reader.Error!usize {
+    var iovecs_buffer: [max_iovecs_len]iovec = undefined;
+    var i: usize = 0;
+    for (data) |buf| {
+        if (iovecs_buffer.len - i == 0) break;
+        if (buf.len != 0) {
+            iovecs_buffer[i] = .{ .base = buf.ptr, .len = buf.len };
+            i += 1;
+        }
+    }
+    const dest = iovecs_buffer[0..i];
+    assert(dest[0].len > 0);
+    return ioUringReadv(ev, cancel_region, handle, dest);
+}
+
+fn netReadSync(handle: net.Socket.Handle, data: [][]u8) Io.Operation.NetRead.Result {
+    var iovecs_buffer: [max_iovecs_len]iovec = undefined;
+    var i: usize = 0;
+    for (data) |buf| {
+        if (iovecs_buffer.len - i == 0) break;
+        if (buf.len != 0) {
+            iovecs_buffer[i] = .{ .base = buf.ptr, .len = buf.len };
+            i += 1;
+        }
+    }
+    const dest = iovecs_buffer[0..i];
+    assert(dest[0].len > 0);
+    while (true) {
+        const rc = linux.readv(handle, dest.ptr, dest.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => |err| return readvErrno(err),
+        }
+    }
+}
+
+fn ioUringReadv(
+    ev: *Evented,
+    cancel_region: *CancelRegion,
+    handle: net.Socket.Handle,
+    dest: []const iovec,
+) net.Stream.Reader.Error!usize {
+    while (true) {
+        const thread = try cancel_region.awaitIoUring();
+        thread.enqueue().* = .{
+            .opcode = .READV,
+            .flags = 0,
+            .ioprio = 0,
+            .fd = handle,
+            .off = std.math.maxInt(u64),
+            .addr = @intFromPtr(dest.ptr),
+            .len = @intCast(dest.len),
+            .rw_flags = 0,
+            .user_data = @intFromPtr(cancel_region.fiber),
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
+        ev.sched.park();
+        const completion = cancel_region.completion();
+        switch (completion.errno()) {
+            .SUCCESS => return @intCast(@as(u32, @bitCast(completion.result))),
+            .INTR, .CANCELED => {},
+            else => |err| return readvErrno(err),
+        }
+    }
+}
+
+/// Builds the iovec array describing `header`, the literal `data` bytes, and
+/// the `data` pattern repeated `splat` times. The returned slice refers to
+/// `iovecs` and possibly `splat_buffer`.
+fn netWriteIovecs(
+    iovecs: *[max_iovecs_len]iovec_const,
+    header: []const u8,
+    data: []const []const u8,
+    splat: usize,
+    splat_buffer: *[splat_buffer_size]u8,
+) []const iovec_const {
+    var iovlen: iovlen_t = 0;
+    addBuf(iovecs, &iovlen, header);
+    for (data[0 .. data.len - 1]) |bytes| addBuf(iovecs, &iovlen, bytes);
+    const pattern = data[data.len - 1];
+    if (iovecs.len - iovlen != 0) switch (splat) {
+        0 => {},
+        1 => addBuf(iovecs, &iovlen, pattern),
+        else => switch (pattern.len) {
+            0 => {},
+            1 => {
+                const memset_len = @min(splat_buffer.len, splat);
+                const buf = splat_buffer[0..memset_len];
+                @memset(buf, pattern[0]);
+                addBuf(iovecs, &iovlen, buf);
+                var remaining_splat = splat - buf.len;
+                while (remaining_splat > splat_buffer.len and iovecs.len - iovlen != 0) {
+                    assert(buf.len == splat_buffer.len);
+                    addBuf(iovecs, &iovlen, splat_buffer);
+                    remaining_splat -= splat_buffer.len;
+                }
+                addBuf(iovecs, &iovlen, splat_buffer[0..@min(remaining_splat, splat_buffer.len)]);
+            },
+            else => for (0..@min(splat, iovecs.len - iovlen)) |_| {
+                addBuf(iovecs, &iovlen, pattern);
+            },
+        },
+    };
+    return iovecs[0..iovlen];
+}
+
+fn netWrite(
+    ev: *Evented,
+    cancel_region: *CancelRegion,
+    handle: net.Socket.Handle,
+    header: []const u8,
+    data: []const []const u8,
+    splat: usize,
+) net.Stream.Writer.Error!usize {
+    var iovecs: [max_iovecs_len]iovec_const = undefined;
+    var splat_backup_buffer: [splat_buffer_size]u8 = undefined;
+    const used = netWriteIovecs(&iovecs, header, data, splat, &splat_backup_buffer);
+    const msg: linux.msghdr_const = .{
+        .name = null,
+        .namelen = 0,
+        .iov = used.ptr,
+        .iovlen = used.len,
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    const posix_flags = linux.MSG.NOSIGNAL;
+    while (true) {
+        const thread = try cancel_region.awaitIoUring();
+        thread.enqueue().* = .{
+            .opcode = .SENDMSG,
+            .flags = 0,
+            .ioprio = 0,
+            .fd = handle,
+            .off = 0,
+            .addr = @intFromPtr(&msg),
+            .len = 1,
+            .rw_flags = posix_flags,
+            .user_data = @intFromPtr(cancel_region.fiber),
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
+        ev.sched.park();
+        const completion = cancel_region.completion();
+        switch (completion.errno()) {
+            .SUCCESS => return @intCast(completion.result),
+            .INTR, .CANCELED => {},
+            else => |err| return netWriteErrno(err),
+        }
+    }
+}
+
+/// Direct syscall variant of `netWrite`, for use once the kernel has reported
+/// the socket to be writable, in contexts where awaiting the ring is not
+/// possible.
+fn netWriteSync(
+    handle: net.Socket.Handle,
+    header: []const u8,
+    data: []const []const u8,
+    splat: usize,
+) Io.Operation.NetWrite.Result {
+    var iovecs: [max_iovecs_len]iovec_const = undefined;
+    var splat_backup_buffer: [splat_buffer_size]u8 = undefined;
+    const used = netWriteIovecs(&iovecs, header, data, splat, &splat_backup_buffer);
+    const msg: linux.msghdr_const = .{
+        .name = null,
+        .namelen = 0,
+        .iov = used.ptr,
+        .iovlen = used.len,
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    while (true) {
+        const rc = linux.sendmsg(handle, &msg, linux.MSG.NOSIGNAL);
+        switch (linux.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => |err| return netWriteErrno(err),
+        }
+    }
+}
+
+/// Direct syscall variant of `netReceive`, for use once the kernel has
+/// reported the socket to be readable, in contexts where awaiting the ring is
+/// not possible.
+///
+/// Receives as many messages as are immediately available. The first message
+/// is received without `MSG_DONTWAIT` since the socket was reported to be
+/// ready.
+fn netReceiveSync(
+    handle: net.Socket.Handle,
+    message_buffer: []net.IncomingMessage,
+    data_buffer: []u8,
+    flags: net.ReceiveFlags,
+) struct { ?net.Socket.ReceiveError, usize } {
+    var data_i: usize = 0;
+    for (message_buffer, 0..) |*message, message_i| {
+        const remaining_data_buffer = data_buffer[data_i..];
+        var storage: PosixAddress = undefined;
+        var one_iovec: iovec = .{
+            .base = remaining_data_buffer.ptr,
+            .len = remaining_data_buffer.len,
+        };
+        var msg: linux.msghdr = .{
+            .name = &storage.any,
+            .namelen = @sizeOf(PosixAddress),
+            .iov = (&one_iovec)[0..1],
+            .iovlen = 1,
+            .control = message.control.ptr,
+            .controllen = @intCast(message.control.len),
+            .flags = undefined,
+        };
+        const posix_flags: u32 =
+            @as(u32, if (flags.oob) linux.MSG.OOB else 0) |
+            @as(u32, if (flags.peek) linux.MSG.PEEK else 0) |
+            @as(u32, if (flags.trunc) linux.MSG.TRUNC else 0) |
+            linux.MSG.NOSIGNAL |
+            @as(u32, if (message_i != 0) linux.MSG.DONTWAIT else 0);
+        const rc: usize = while (true) {
+            const rc = linux.recvmsg(handle, &msg, posix_flags);
+            switch (linux.errno(rc)) {
+                .INTR => {},
+                else => break rc,
+            }
+        };
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                const data = remaining_data_buffer[0..@intCast(rc)];
+                data_i += data.len;
+                message.* = .{
+                    .from = addressFromPosix(&storage),
+                    .data = data,
+                    .control = if (msg.control) |ptr| @as([*]u8, @ptrCast(ptr))[0..msg.controllen] else message.control,
+                    .flags = .{
+                        .eor = msg.flags & linux.MSG.EOR != 0,
+                        .trunc = msg.flags & linux.MSG.TRUNC != 0,
+                        .ctrunc = msg.flags & linux.MSG.CTRUNC != 0,
+                        .oob = msg.flags & linux.MSG.OOB != 0,
+                        .errqueue = msg.flags & linux.MSG.ERRQUEUE != 0,
+                    },
+                };
+            },
+            // All messages available have been received.
+            .AGAIN => if (message_i != 0) return .{ null, message_i } else return .{
+                // The socket was reported to be ready, and yet the first
+                // message would have blocked.
+                errnoBug(.AGAIN),
+                0,
+            },
+            else => |err| return .{ netReceiveErrno(err), message_i },
+        }
+    }
+    return .{ null, message_buffer.len };
+}
+
+/// Packs a length and a small value into one word, for storing in
+/// `Io.Operation.Storage.Pending.Userdata`. The length of any real buffer is
+/// far below the 16-bit-shift bound that is implied here.
+fn packLenBits(len: usize, bits: u16) usize {
+    assert(len <= std.math.maxInt(usize) >> 16);
+    return len | (@as(usize, bits) << (@bitSizeOf(usize) - 16));
+}
+
+fn unpackLenBits(word: usize) struct { usize, u16 } {
+    return .{
+        word & (std.math.maxInt(usize) >> 16),
+        @truncate(word >> (@bitSizeOf(usize) - 16)),
+    };
+}
+
+/// Packs a socket handle and a length into one word, for storing in
+/// `Io.Operation.Storage.Pending.Userdata`.
+fn packHandleLen(handle: net.Socket.Handle, len: usize) usize {
+    assert(handle >= 0);
+    assert(len <= std.math.maxInt(u32));
+    return @as(usize, @intCast(handle)) << 32 | @as(u32, @intCast(len));
+}
+
+fn unpackHandleLen(word: usize) struct { net.Socket.Handle, usize } {
+    return .{ @intCast(word >> 32), @as(u32, @truncate(word)) };
+}
+
+/// The batch implementation of the network operations waits for the socket to
+/// be reported ready by the kernel with a poll operation, and then performs
+/// the operation itself with a syscall. This is the maximum useful value of
+/// `Io.Operation.NetWrite.splat` for that purpose: `netWriteIovecs` can only
+/// describe `max_iovecs_len` repetitions of a `splat_buffer_size`-byte pattern,
+/// so any larger value has an identical effect.
+const net_write_splat_max = max_iovecs_len * splat_buffer_size;
+
+/// The first three words of the userdata are reserved for the scheduler.
+const batch_net_state_offset = 3;
+const batch_net_state_len = 4;
+
+const poll_mask_readable = linux.POLL.IN | linux.POLL.ERR | linux.POLL.HUP;
+const poll_mask_writable = linux.POLL.OUT | linux.POLL.ERR | linux.POLL.HUP;
+
+/// Arms `storage` so that the operation is resumed when `handle` is reported
+/// ready by the kernel, storing `state` in the storage for the completion
+/// handler to consume.
+fn batchNetSubmit(
+    thread: *Thread,
+    batch: *Io.Batch,
+    storage: *Io.Operation.Storage,
+    tag: Io.Operation.Tag,
+    handle: net.Socket.Handle,
+    poll_mask: u32,
+    state: [batch_net_state_len]usize,
+) void {
+    storage.* = .{ .pending = .{
+        .node = .{ .prev = batch.pending.tail, .next = .none },
+        .tag = tag,
+        .userdata = undefined,
+    } };
+    storage.pending.userdata[batch_net_state_offset .. batch_net_state_offset + batch_net_state_len].* = state;
+    thread.enqueue().* = .{
+        .opcode = .POLL_ADD,
+        .flags = 0,
+        .ioprio = 0,
+        .fd = handle,
+        .off = 0,
+        .addr = 0,
+        .len = 0,
+        .rw_flags = poll_mask,
+        .user_data = @intFromPtr(&storage.pending.userdata) | 0b10,
+        .buf_index = 0,
+        .personality = 0,
+        .splice_fd_in = 0,
+        .addr3 = 0,
+        .resv = 0,
+    };
 }
 
 fn netReceive(
@@ -5116,7 +5169,7 @@ fn netReceive(
             .addr3 = 0,
             .resv = 0,
         };
-        ev.yield(null, .nothing);
+        ev.sched.park();
         const completion = cancel_region.completion();
         switch (completion.errno()) {
             .SUCCESS => {
@@ -5139,27 +5192,12 @@ fn netReceive(
             },
             .AGAIN => unreachable,
             .INTR, .CANCELED => {},
-            .BADF => |err| return .{ errnoBug(err), message_i },
-            .NFILE => return .{ error.SystemFdQuotaExceeded, message_i },
-            .MFILE => return .{ error.ProcessFdQuotaExceeded, message_i },
-            .FAULT => |err| return .{ errnoBug(err), message_i },
-            .INVAL => |err| return .{ errnoBug(err), message_i },
-            .NOBUFS => return .{ error.SystemResources, message_i },
-            .NOMEM => return .{ error.SystemResources, message_i },
-            .NOTCONN => return .{ error.SocketUnconnected, message_i },
-            .NOTSOCK => |err| return .{ errnoBug(err), message_i },
-            .MSGSIZE => return .{ error.MessageOversize, message_i },
-            .PIPE => return .{ error.SocketUnconnected, message_i },
-            .OPNOTSUPP => |err| return .{ errnoBug(err), message_i },
-            .CONNRESET => return .{ error.ConnectionResetByPeer, message_i },
-            .TIMEDOUT => return .{ error.ConnectionTimedOut, message_i },
-            .NETDOWN => return .{ error.NetworkDown, message_i },
-            else => |err| return .{ unexpectedErrno(err), message_i },
+            else => |err| return .{ netReceiveErrno(err), message_i },
         }
     }
 }
 
-fn netWriteFileUnavailable(
+fn netWriteFile(
     userdata: ?*anyopaque,
     socket_handle: net.Socket.Handle,
     header: []const u8,
@@ -5167,12 +5205,170 @@ fn netWriteFileUnavailable(
     limit: Io.Limit,
 ) net.Stream.Writer.WriteFileError!usize {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = socket_handle;
-    _ = header;
-    _ = file_reader;
-    _ = limit;
-    return error.Unimplemented;
+    var cancel_region: CancelRegion = .init();
+    defer cancel_region.deinit();
+
+    // Data the caller has already read from the file comes first, and it takes
+    // up part of the limit.
+    const buffered = limit.slice(file_reader.interface.buffered());
+    var total: usize = 0;
+    if (header.len != 0 or buffered.len != 0) {
+        const n = try ev.netWrite(&cancel_region, socket_handle, header, &.{buffered}, 1);
+        file_reader.interface.toss(n -| header.len);
+        total = n;
+        if (n != header.len + buffered.len) return n; // partial write; caller retries
+    }
+    const file_limit = @backingInt(limit) -| buffered.len;
+    if (file_limit == 0) return total;
+    const file_bytes = try spliceFileToSocket(
+        ev,
+        &cancel_region,
+        file_reader,
+        socket_handle,
+        file_limit,
+    );
+    file_reader.pos += file_bytes;
+    total += file_bytes;
+    if (file_bytes == 0 and total == 0) {
+        file_reader.size = file_reader.pos;
+        return error.EndOfStream;
+    }
+    return total;
+}
+
+/// Copies up to `limit_bytes` (which are not already buffered by the reader)
+/// from the file to the socket using `splice`.
+///
+/// `splice` requires one of its file descriptors to be a pipe, so the data
+/// travels from the file into a pipe, and from the pipe into the socket.
+///
+/// The number of bytes that reached the socket is returned. Bytes that were
+/// read into the pipe but not yet written to the socket are not counted, and
+/// are re-read by the next call; this relies on `file_reader.pos` only being
+/// advanced for bytes that reached the socket, which is possible by passing
+/// the file offset by value rather than as a live file position.
+fn spliceFileToSocket(
+    ev: *Evented,
+    cancel_region: *CancelRegion,
+    file_reader: *File.Reader,
+    socket_fd: net.Socket.Handle,
+    limit_bytes: usize,
+) net.Stream.Writer.WriteFileError!usize {
+    if (file_reader.mode == .failure) return error.ReadFailed;
+    const file_fd = file_reader.file.handle;
+    const pipe_fds = pipe2(.{ .CLOEXEC = true }) catch |err| switch (err) {
+        error.SystemFdQuotaExceeded, error.ProcessFdQuotaExceeded => return error.SystemResources,
+        error.Unexpected => |e| return e,
+    };
+    defer destroyPipe(ev, pipe_fds);
+    const pipe_read = pipe_fds[0];
+    const pipe_write = pipe_fds[1];
+    const pipe_capacity = pipeCapacity(pipe_read);
+
+    var remaining = limit_bytes;
+    var file_offset: ?u64 = switch (file_reader.mode) {
+        .positional => @intCast(file_reader.pos),
+        .streaming => null, // use the file position
+        .streaming_simple, .positional_simple => return error.Unimplemented,
+        .failure => unreachable, // checked above
+    };
+    var total: usize = 0;
+    while (remaining != 0) {
+        // Never ask for more than the pipe can hold, since the pipe is only
+        // drained by this task, and filling a full pipe blocks the syscall.
+        const chunk = @min(remaining, pipe_capacity);
+        const fed = splice(ev, cancel_region, file_fd, file_offset, pipe_write, null, chunk) catch |err| switch (err) {
+            // Nothing has been written yet, so the caller can fall back to a
+            // read-based copy without any bytes being duplicated.
+            error.Unimplemented => return if (total == 0) error.Unimplemented else total,
+            else => |e| return if (total == 0) e else total,
+        };
+        if (fed == 0) break; // end of file
+        if (file_offset) |*off| off.* += fed;
+        // Only bytes that reach the socket are reported.
+        var left = fed;
+        while (left != 0) {
+            const written = splice(ev, cancel_region, pipe_read, null, socket_fd, null, left) catch |err|
+                return if (total == 0) err else total;
+            if (written == 0) return total;
+            left -= written;
+            remaining -= written;
+            total += written;
+        }
+    }
+    return total;
+}
+
+fn pipeCapacity(pipe_read: fd_t) usize {
+    // The minimum pipe capacity, used if the kernel does not report one.
+    const default = 4096;
+    const rc = linux.fcntl(pipe_read, linux.F.GETPIPE_SZ, 0);
+    switch (linux.errno(rc)) {
+        .SUCCESS => return if (rc == 0) default else @intCast(rc),
+        else => return default,
+    }
+}
+
+/// `off_in` and `off_out` are file offsets, or `null` to use the current file
+/// position; pipes require `null`.
+fn splice(
+    ev: *Evented,
+    cancel_region: *CancelRegion,
+    fd_in: fd_t,
+    off_in: ?u64,
+    fd_out: fd_t,
+    off_out: ?u64,
+    len: usize,
+) net.Stream.Writer.WriteFileError!usize {
+    while (true) {
+        const thread = try cancel_region.awaitIoUring();
+        thread.enqueue().* = .{
+            .opcode = .SPLICE,
+            .flags = 0,
+            .ioprio = 0,
+            .fd = fd_out,
+            .off = off_out orelse std.math.maxInt(u64),
+            .addr = off_in orelse std.math.maxInt(u64),
+            .len = @intCast(len),
+            .rw_flags = 0,
+            .user_data = @intFromPtr(cancel_region.fiber),
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = fd_in,
+            .addr3 = 0,
+            .resv = 0,
+        };
+        ev.sched.park();
+        const completion = cancel_region.completion();
+        switch (completion.errno()) {
+            .SUCCESS => return @intCast(@as(u32, @bitCast(completion.result))),
+            .INTR, .CANCELED => {},
+            else => |err| return spliceErrno(err),
+        }
+    }
+}
+
+fn spliceErrno(err: linux.E) net.Stream.Writer.WriteFileError {
+    return switch (err) {
+        // `splice` is not usable for this pair of file descriptors.
+        .INVAL, .NOSYS, .OPNOTSUPP => error.Unimplemented,
+        .NFILE, .MFILE => error.SystemResources,
+        .NOBUFS, .NOMEM => error.SystemResources,
+        .PIPE => error.SocketUnconnected,
+        .NOTCONN => error.SocketUnconnected,
+        .CONNREFUSED => error.SocketUnconnected,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .TIMEDOUT => error.ConnectionTimedOut,
+        .NETDOWN => error.NetworkDown,
+        .NETUNREACH => error.NetworkUnreachable,
+        .HOSTUNREACH => error.HostUnreachable,
+        .AFNOSUPPORT => error.AddressFamilyUnsupported,
+
+        .AGAIN => |e| errnoBug(e), // File descriptors are blocking.
+        .BADF => |e| errnoBug(e), // File descriptor used after closed.
+        .FAULT => |e| errnoBug(e),
+        else => |e| unexpectedErrno(e),
+    };
 }
 
 fn netClose(userdata: ?*anyopaque, sockets: []const net.Socket) void {
@@ -5210,7 +5406,7 @@ fn netShutdown(
             .addr3 = 0,
             .resv = 0,
         };
-        ev.yield(null, .nothing);
+        ev.sched.park();
         switch (cancel_region.errno()) {
             .SUCCESS => return,
             .INTR, .CANCELED => {},
@@ -5222,37 +5418,230 @@ fn netShutdown(
     }
 }
 
-fn netInterfaceNameResolveUnavailable(
+fn netInterfaceNameResolve(
     userdata: ?*anyopaque,
     name: *const net.Interface.Name,
 ) net.Interface.Name.ResolveError!net.Interface {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = name;
-    return error.InterfaceNotFound;
+    var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
+    defer maybe_sync.deinit(ev);
+    const sock_fd = ev.socket(&maybe_sync.cancel_region, linux.AF.UNIX, .{ .mode = .dgram }) catch |err| switch (err) {
+        error.ProcessFdQuotaExceeded => return error.SystemResources,
+        error.SystemFdQuotaExceeded => return error.SystemResources,
+        error.AddressFamilyUnsupported => return error.Unexpected,
+        error.ProtocolUnsupportedBySystem => return error.Unexpected,
+        error.ProtocolUnsupportedByAddressFamily => return error.Unexpected,
+        error.SocketModeUnsupported => return error.Unexpected,
+        error.OptionUnsupported => return error.Unexpected,
+        else => |e| return e,
+    };
+    defer ev.closeAsync(sock_fd);
+
+    var ifr: linux.ifreq = .{
+        .ifrn = .{ .name = @bitCast(name.bytes) },
+        .ifru = undefined,
+    };
+    ioctl(try maybe_sync.enterSync(ev), sock_fd, linux.SIOCGIFINDEX, &ifr) catch |err| switch (err) {
+        error.NoDevice => return error.InterfaceNotFound,
+        error.Canceled => |e| return e,
+        error.Unexpected => |e| return e,
+    };
+    return .{ .index = @bitCast(ifr.ifru.ivalue) };
 }
 
-fn netInterfaceNameUnavailable(
+fn netInterfaceName(
     userdata: ?*anyopaque,
     interface: net.Interface,
 ) net.Interface.NameError!net.Interface.Name {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = interface;
-    return error.Unexpected;
+    var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
+    defer maybe_sync.deinit(ev);
+    // `net.Interface.NameError` has no error for resource exhaustion.
+    const sock_fd = ev.socket(&maybe_sync.cancel_region, linux.AF.UNIX, .{ .mode = .dgram }) catch |err| switch (err) {
+        error.ProcessFdQuotaExceeded => return error.Unexpected,
+        error.SystemFdQuotaExceeded => return error.Unexpected,
+        error.SystemResources => return error.Unexpected,
+        error.AddressFamilyUnsupported => return error.Unexpected,
+        error.ProtocolUnsupportedBySystem => return error.Unexpected,
+        error.ProtocolUnsupportedByAddressFamily => return error.Unexpected,
+        error.SocketModeUnsupported => return error.Unexpected,
+        error.OptionUnsupported => return error.Unexpected,
+        else => |e| return e,
+    };
+    defer ev.closeAsync(sock_fd);
+
+    var ifr: linux.ifreq = undefined;
+    @memset(std.mem.asBytes(&ifr), 0);
+    ifr.ifru.ivalue = @bitCast(interface.index);
+    ioctl(try maybe_sync.enterSync(ev), sock_fd, linux.SIOCGIFNAME, &ifr) catch |err| switch (err) {
+        error.NoDevice => return error.InterfaceNotFound,
+        error.Canceled => |e| return e,
+        error.Unexpected => |e| return e,
+    };
+    return .fromSliceUnchecked(std.mem.sliceTo(&ifr.ifrn.name, 0));
 }
 
-fn netLookupUnavailable(
+/// `arg` is the request-specific argument, e.g. an `ifreq`.
+fn ioctl(
+    sync: *CancelRegion.Sync,
+    fd: fd_t,
+    request: u32,
+    arg: *anyopaque,
+) (Io.Cancelable || Io.UnexpectedError || error{NoDevice})!void {
+    while (true) {
+        try sync.cancel_region.await(.nothing);
+        switch (linux.errno(linux.ioctl(fd, request, @intFromPtr(arg)))) {
+            .SUCCESS => return,
+            .INTR => {},
+            // No such device; `SIOCGIFINDEX` uses it for "no such interface".
+            .NODEV => return error.NoDevice,
+            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
+            .FAULT => |err| return errnoBug(err),
+            .INVAL => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn netLookup(
     userdata: ?*anyopaque,
     host_name: net.HostName,
     resolved: *Io.Queue(net.HostName.LookupResult),
     options: net.HostName.LookupOptions,
 ) net.HostName.LookupError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = host_name;
-    _ = options;
-    resolved.close(ev.io());
-    return error.NetworkDown;
+    defer resolved.close(ev.io());
+    netLookupFallible(ev, host_name, resolved, options) catch |err| switch (err) {
+        error.Closed => unreachable, // `resolved` must not be closed until `netLookup` returns
+        else => |e| return e,
+    };
+}
+
+/// Networking is available because this file is only compiled for Linux.
+///
+/// None of the I/O below happens on the calling thread: it all goes through
+/// the `Io` interface, whose socket and file operations are serviced by io_uring.
+fn netLookupFallible(
+    ev: *Evented,
+    host_name: net.HostName,
+    resolved: *Io.Queue(net.HostName.LookupResult),
+    options: net.HostName.LookupOptions,
+) (net.HostName.LookupError || Io.QueueClosedError)!void {
+    const ev_io = ev.io();
+    const name = host_name.bytes;
+    assert(name.len <= net.HostName.max_len);
+
+    if (net.IpAddress.parseIp6(name, options.port)) |addr| {
+        if (options.family == .ip4) return error.UnknownHostName;
+        if (Io.Threaded.copyCanon(options.canonical_name_buffer, name)) |canon| {
+            try resolved.putAll(ev_io, &.{
+                .{ .address = addr },
+                .{ .canonical_name = canon },
+            });
+        } else {
+            try resolved.putOne(ev_io, .{ .address = addr });
+        }
+        return;
+    } else |_| {}
+
+    if (net.IpAddress.parseIp4(name, options.port)) |addr| {
+        if (options.family == .ip6) return error.UnknownHostName;
+        if (Io.Threaded.copyCanon(options.canonical_name_buffer, name)) |canon| {
+            try resolved.putAll(ev_io, &.{
+                .{ .address = addr },
+                .{ .canonical_name = canon },
+            });
+        } else {
+            try resolved.putOne(ev_io, .{ .address = addr });
+        }
+        return;
+    } else |_| {}
+
+    if (lookupHosts(ev, host_name, resolved, options)) return else |err| switch (err) {
+        error.UnknownHostName => {},
+        else => |e| return e,
+    }
+
+    // RFC 6761 Section 6.3.3
+    // Name resolution APIs and libraries SHOULD recognize
+    // localhost names as special and SHOULD always return the IP
+    // loopback address for address queries and negative responses
+    // for all other query types.
+
+    // Check for equal to "localhost(.)" or ends in ".localhost(.)"
+    const localhost = if (name[name.len - 1] == '.') "localhost." else "localhost";
+    if (std.mem.endsWith(u8, name, localhost) and
+        (name.len == localhost.len or name[name.len - localhost.len - 1] == '.'))
+    {
+        var results_buffer: [3]net.HostName.LookupResult = undefined;
+        var results_index: usize = 0;
+        if (options.family != .ip4) {
+            results_buffer[results_index] = .{ .address = .{ .ip6 = .loopback(options.port) } };
+            results_index += 1;
+        }
+        if (options.family != .ip6) {
+            results_buffer[results_index] = .{ .address = .{ .ip4 = .loopback(options.port) } };
+            results_index += 1;
+        }
+        if (options.canonical_name_buffer) |buf| {
+            const canon_name = "localhost";
+            const canon_name_dest = buf[0..canon_name.len];
+            canon_name_dest.* = canon_name.*;
+            results_buffer[results_index] = .{ .canonical_name = .{ .bytes = canon_name_dest } };
+            results_index += 1;
+        }
+        try resolved.putAll(ev_io, results_buffer[0..results_index]);
+        return;
+    }
+
+    return Io.Threaded.lookupDnsSearch(ev_io, host_name, resolved, options);
+}
+
+/// Same as `Io.Threaded.lookupHosts`, except that all I/O is routed through
+/// this implementation's `Io` interface.
+fn lookupHosts(
+    ev: *Evented,
+    host_name: net.HostName,
+    resolved: *Io.Queue(net.HostName.LookupResult),
+    options: net.HostName.LookupOptions,
+) !void {
+    const ev_io = ev.io();
+    const file = Io.Dir.cwd().openFile(ev_io, "/etc/hosts", .{}) catch |err| switch (err) {
+        error.FileNotFound,
+        error.NotDir,
+        error.AccessDenied,
+        => return error.UnknownHostName,
+
+        error.Canceled => |e| return e,
+
+        else => {
+            // Here we could add more detailed diagnostics to the results queue.
+            return error.DetectingNetworkConfigurationFailed;
+        },
+    };
+    defer file.close(ev_io);
+
+    var line_buf: [512]u8 = undefined;
+    var file_reader = file.reader(ev_io, &line_buf);
+    return Io.Threaded.lookupHostsReader(
+        ev_io,
+        host_name,
+        resolved,
+        options,
+        &file_reader.interface,
+    ) catch |err| switch (err) {
+        error.ReadFailed => switch (file_reader.err.?) {
+            error.Canceled => |e| return e,
+            else => {
+                // Here we could add more detailed diagnostics to the results queue.
+                return error.DetectingNetworkConfigurationFailed;
+            },
+        },
+        error.Canceled,
+        error.Closed,
+        error.UnknownHostName,
+        => |e| return e,
+    };
 }
 
 fn bind(
@@ -5280,7 +5669,7 @@ fn bind(
             .addr3 = 0,
             .resv = 0,
         };
-        ev.yield(null, .nothing);
+        ev.sched.park();
         switch (cancel_region.errno()) {
             .SUCCESS => return,
             .INTR, .CANCELED => {},
@@ -5340,7 +5729,7 @@ fn close(ev: *Evented, fd: fd_t) void {
         .addr3 = 0,
         .resv = 0,
     };
-    ev.yield(null, .nothing);
+    ev.sched.park();
     switch (cancel_region.errno()) {
         .BADF => recoverableOsBugDetected(), // Always a race condition.
         .INTR => {}, // This is still a success. See https://github.com/ziglang/zig/issues/2425
@@ -5484,7 +5873,7 @@ fn flock(
                     .addr3 = 0,
                     .resv = 0,
                 };
-                ev.yield(null, .nothing);
+                ev.sched.park();
                 switch (sync.cancel_region.errno()) {
                     .SUCCESS, .INTR, .CANCELED => {},
                     else => unreachable,
@@ -5552,7 +5941,7 @@ fn linkat(
             .addr3 = 0,
             .resv = 0,
         };
-        ev.yield(null, .nothing);
+        ev.sched.park();
         switch (cancel_region.errno()) {
             .SUCCESS => return,
             .INTR, .CANCELED => {},
@@ -5634,7 +6023,7 @@ fn openat(
             .addr3 = 0,
             .resv = 0,
         };
-        ev.yield(null, .nothing);
+        ev.sched.park();
         const completion = cancel_region.completion();
         switch (completion.errno()) {
             .SUCCESS => return completion.result,
@@ -5699,7 +6088,7 @@ fn preadv(
             .addr3 = 0,
             .resv = 0,
         };
-        ev.yield(null, .nothing);
+        ev.sched.park();
         const completion = cancel_region.completion();
         switch (completion.errno()) {
             .SUCCESS => return @as(u32, @bitCast(completion.result)),
@@ -5746,7 +6135,7 @@ fn pwritev(
             .addr3 = 0,
             .resv = 0,
         };
-        ev.yield(null, .nothing);
+        ev.sched.park();
         const completion = cancel_region.completion();
         switch (completion.errno()) {
             .SUCCESS => return @as(u32, @bitCast(completion.result)),
@@ -5842,7 +6231,7 @@ fn renameat(
             .addr3 = 0,
             .resv = 0,
         };
-        ev.yield(null, .nothing);
+        ev.sched.park();
         switch (cancel_region.errno()) {
             .SUCCESS => return,
             .INTR, .CANCELED => {},
@@ -5909,7 +6298,7 @@ fn setsockopt(
             .addr3 = @intFromPtr(o.ptr),
             .resv = 0,
         };
-        ev.yield(null, .nothing);
+        ev.sched.park();
         switch (cancel_region.errno()) {
             .SUCCESS => return,
             .INTR, .CANCELED => {},
@@ -5958,7 +6347,7 @@ fn socket(
             .addr3 = 0,
             .resv = 0,
         };
-        ev.yield(null, .nothing);
+        ev.sched.park();
         const completion = cancel_region.completion();
         switch (completion.errno()) {
             .SUCCESS => break completion.result,
@@ -6021,7 +6410,7 @@ fn statx(
             .addr3 = 0,
             .resv = 0,
         };
-        ev.yield(null, .nothing);
+        ev.sched.park();
         switch (cancel_region.errno()) {
             .SUCCESS => return statFromLinux(&statx_buf),
             .INTR, .CANCELED => {},

@@ -9723,6 +9723,10 @@ pub const MADV = struct {
     pub const PAGEOUT = 21;
     pub const HWPOISON = 100;
     pub const SOFT_OFFLINE = 101;
+    /// Linux 6.13: accesses to the range raise `SIGSEGV`, without splitting the mapping.
+    pub const GUARD_INSTALL = 102;
+    /// Linux 6.13: removes guards installed with `GUARD_INSTALL`.
+    pub const GUARD_REMOVE = 103;
 };
 
 pub const POSIX_FADV = switch (native_arch) {

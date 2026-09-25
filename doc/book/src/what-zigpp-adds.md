@@ -160,6 +160,44 @@ the standard library as long as they avoid operating system services:
 build and run the kernels. Still to come: MLIR lowering for tensor cores and
 kernel fusion.
 
+## `std.Io.Threadz`
+
+`std.Io.Threadz` is an `Io` implementation whose unit of work is a task: a
+function on its own stack that parks at every Io call that has to wait, while
+its worker thread runs the next task. Code written against `std.Io` runs on it
+unchanged, so moving a program between `Io.Threaded` and `Io.Threadz` changes
+one declaration:
+
+```zig
+var threadz: std.Io.Threadz = undefined;
+try threadz.init(gpa, .{});
+defer threadz.deinit();
+const io = threadz.io();
+```
+
+- The thread that calls `init` becomes the first worker and runs as the main
+  task. More workers start as work arrives, one per CPU by default;
+  `setWorkerLimit` lowers the count, and `-j` sets it in a compiler built with
+  `-Dio-mode=evented`.
+- Every task gets its own mapping with a guard page below the stack, and the OS
+  commits the stack as the task touches it. Tasks reserve 256 KiB unless
+  `InitOptions.stack_size` says otherwise.
+- A task's affinity decides where it runs whenever it becomes runnable.
+  `.sticky`, the default, resumes it on the worker that last ran it, and another
+  worker takes it only from a worker with more than one task waiting.
+  `.pinned` keeps it on one worker, for tasks that own that worker's
+  resources. `.free` lets whichever worker is idle take it. `concurrentWith`
+  and `groupConcurrentWith` take the affinity and the stack size of one task.
+- Threads outside the pool can use the synchronization primitives, whose
+  futexes they wait on in the kernel.
+
+On Linux, Threadz runs on io_uring: files, sockets, DNS, processes, timers, and
+futexes are ring operations, with a ring per worker. `zig build test-threadz`
+runs the `Io` tests on it, and the test runner's `--io=threadz` runs any test on
+it. The design, and the steps still to come (a cooperative budget, a pool for
+blocking calls, a watchdog, and the kqueue and IOCP cores), are in
+[the Threadz proposal](https://github.com/mattneel/zigpp/blob/master/doc/proposals/threadz.md).
+
 ## AI in the toolchain
 
 Upstream Zig bans LLMs from issues, patches, and bug tracker comments. Zig++

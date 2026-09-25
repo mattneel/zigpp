@@ -43,7 +43,6 @@ pub inline fn contextSwitch(s: *const Switch) *const Switch {
             : [message_to_send] "{x1}" (s),
             : .{
               .x0 = true,
-              .x1 = true,
               .x2 = true,
               .x3 = true,
               .x4 = true,
@@ -147,7 +146,6 @@ pub inline fn contextSwitch(s: *const Switch) *const Switch {
               .x7 = true,
               .x9 = true,
               .x10 = true,
-              .x11 = true,
               .x12 = true,
               .x13 = true,
               .x14 = true,
@@ -259,7 +257,6 @@ pub inline fn contextSwitch(s: *const Switch) *const Switch {
               .rcx = true,
               .rdx = true,
               .rbx = true,
-              .rsi = true,
               .rdi = true,
               .r8 = true,
               .r9 = true,

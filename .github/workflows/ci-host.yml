@@ -98,6 +98,8 @@ jobs:
             zig test test/behavior.zig -j"$share"
             zig test lib/std/std.zig -lc -fllvm -j"$share"
             zig test test/behavior.zig -fllvm -j"$share"
+            # The Io tests again on Io.Threadz, where the host has it (Linux).
+            zig build test-threadz -j"$share"
           }
 
           # Zig++ against C that the Clang in Zig++ compiled.

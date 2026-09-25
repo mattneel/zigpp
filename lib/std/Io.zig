@@ -28,12 +28,16 @@ vtable: *const VTable,
 pub const Threaded = @import("Io/Threaded.zig");
 
 pub const fiber = @import("Io/fiber.zig");
-pub const Evented = if (fiber.supported) switch (builtin.os.tag) {
+/// Tasks on their own stacks, parked at every Io call and scheduled across a pool of OS
+/// workers: io_uring on Linux, kqueue on the BSDs, libdispatch on Darwin.
+pub const Threadz = if (fiber.supported) switch (builtin.os.tag) {
     .linux => Uring,
     .dragonfly, .freebsd, .netbsd, .openbsd => Kqueue,
     .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => Dispatch,
     else => void,
 } else void; // context-switching code not implemented yet
+/// The upstream name for `Threadz`.
+pub const Evented = Threadz;
 pub const Dispatch = @import("Io/Dispatch.zig");
 pub const Kqueue = @import("Io/Kqueue.zig");
 pub const Uring = @import("Io/Uring.zig");
@@ -561,6 +565,8 @@ pub fn operateTimeout(io: Io, operation: Operation, timeout: Timeout) OperateTim
     if (timeout == .none) return io.vtable.operate(io.userdata, operation);
     var storage: [1]Operation.Storage = undefined;
     var batch: Batch = .init(&storage);
+    // An implementation may still hold the operation, which points into this frame.
+    errdefer batch.cancel(io);
     batch.addAt(0, operation);
     try batch.awaitConcurrent(io, timeout);
     const completion = batch.next().?;
@@ -2686,7 +2692,8 @@ test {
     _ = Dir;
     _ = Reader;
     _ = Writer;
-    _ = Evented;
+    _ = Threadz;
+    _ = @import("Io/Threadz/scheduler.zig");
     _ = Threaded;
     _ = RwLock;
     _ = Semaphore;

@@ -14096,7 +14096,7 @@ fn netLookupFallible(
             return;
         }
 
-        if (native_os == .linux) return t.lookupDnsSearch(host_name, resolved, options);
+        if (native_os == .linux) return lookupDnsSearch(t_io, host_name, resolved, options);
 
         comptime assert(is_windows);
         var DnsQueryEx = t.dl.DnsQueryEx.load(.acquire);
@@ -14516,7 +14516,7 @@ pub const PosixAddress = extern union {
     in6: posix.sockaddr.in6,
 };
 
-const UnixAddress = extern union {
+pub const UnixAddress = extern union {
     any: posix.sockaddr,
     un: posix.sockaddr.un,
 };
@@ -14549,7 +14549,7 @@ pub fn addressToPosix(a: *const IpAddress, storage: *PosixAddress) posix.socklen
     };
 }
 
-fn addressUnixToPosix(a: *const net.UnixAddress, storage: *UnixAddress) posix.socklen_t {
+pub fn addressUnixToPosix(a: *const net.UnixAddress, storage: *UnixAddress) posix.socklen_t {
     storage.un.family = posix.AF.UNIX;
     var path_len = switch (native_os) {
         .windows => @min(a.path.len, storage.un.path.len),
@@ -14822,13 +14822,13 @@ pub fn pathToPosix(file_path: []const u8, buffer: *[posix.PATH_MAX]u8) Dir.PathN
     return buffer[0..file_path.len :0];
 }
 
-fn lookupDnsSearch(
-    t: *Threaded,
+/// Reused by other `Io` implementations.
+pub fn lookupDnsSearch(
+    t_io: Io,
     host_name: HostName,
     resolved: *Io.Queue(HostName.LookupResult),
     options: HostName.LookupOptions,
 ) (HostName.LookupError || Io.QueueClosedError)!void {
-    const t_io = io(t);
     const rc = HostName.ResolvConf.init(t_io) catch return error.ResolvConfParseFailed;
 
     // Count dots, suppress search when >=ndots or name ends in
@@ -14855,7 +14855,7 @@ fn lookupDnsSearch(
     while (it.next()) |token| {
         @memcpy(canon_buf[canon_name.len + 1 ..][0..token.len], token);
         const lookup_canon_name = canon_buf[0 .. canon_name.len + 1 + token.len];
-        if (t.lookupDns(lookup_canon_name, &rc, resolved, options)) |result| {
+        if (lookupDns(t_io, lookup_canon_name, &rc, resolved, options)) |result| {
             return result;
         } else |err| switch (err) {
             error.UnknownHostName, error.NoAddressReturned => continue,
@@ -14864,17 +14864,17 @@ fn lookupDnsSearch(
     }
 
     const lookup_canon_name = canon_buf[0..canon_name.len];
-    return t.lookupDns(lookup_canon_name, &rc, resolved, options);
+    return lookupDns(t_io, lookup_canon_name, &rc, resolved, options);
 }
 
-fn lookupDns(
-    t: *Threaded,
+/// Reused by other `Io` implementations.
+pub fn lookupDns(
+    t_io: Io,
     lookup_canon_name: []const u8,
     rc: *const HostName.ResolvConf,
     resolved: *Io.Queue(HostName.LookupResult),
     options: HostName.LookupOptions,
 ) (HostName.LookupError || Io.QueueClosedError)!void {
-    const t_io = io(t);
     const family_records: [2]struct { af: IpAddress.Family, rr: HostName.DnsRecord } = .{
         .{ .af = .ip6, .rr = .A },
         .{ .af = .ip4, .rr = .AAAA },
@@ -14889,7 +14889,7 @@ fn lookupDns(
     for (family_records) |fr| {
         if (options.family != fr.af) {
             var entropy: [2]u8 = undefined;
-            random(t, &entropy);
+            t_io.random(&entropy);
             const len = writeResolutionQuery(&query_buffers[nq], 0, lookup_canon_name, 1, fr.rr, entropy);
             queries_buffer[nq] = query_buffers[nq][0..len];
             nq += 1;
@@ -15117,7 +15117,7 @@ fn lookupHosts(
 
     var line_buf: [512]u8 = undefined;
     var file_reader = file.reader(t.io(), &line_buf);
-    return t.lookupHostsReader(host_name, resolved, options, &file_reader.interface) catch |err| switch (err) {
+    return lookupHostsReader(t.io(), host_name, resolved, options, &file_reader.interface) catch |err| switch (err) {
         error.ReadFailed => switch (file_reader.err.?) {
             error.Canceled => |e| return e,
             else => {
@@ -15132,14 +15132,14 @@ fn lookupHosts(
     };
 }
 
-fn lookupHostsReader(
-    t: *Threaded,
+/// Reused by other `Io` implementations.
+pub fn lookupHostsReader(
+    t_io: Io,
     host_name: HostName,
     resolved: *Io.Queue(HostName.LookupResult),
     options: HostName.LookupOptions,
     reader: *Io.Reader,
 ) error{ ReadFailed, Canceled, UnknownHostName, Closed }!void {
-    const t_io = io(t);
     var addresses_len: usize = 0;
     var canonical_name: ?HostName = null;
     while (true) {
@@ -15203,7 +15203,7 @@ fn lookupHostsReader(
 }
 
 /// Writes DNS resolution query packet data to `w`; at most 280 bytes.
-fn writeResolutionQuery(q: *[280]u8, op: u4, dname: []const u8, class: u8, ty: HostName.DnsRecord, entropy: [2]u8) usize {
+pub fn writeResolutionQuery(q: *[280]u8, op: u4, dname: []const u8, class: u8, ty: HostName.DnsRecord, entropy: [2]u8) usize {
     // This implementation is ported from musl libc.
     // A more idiomatic "ziggy" implementation would be welcome.
     var name = dname;
@@ -15289,7 +15289,7 @@ const LookupDnsWindows = struct {
     }
 };
 
-fn copyCanon(canonical_name_buffer: ?*[HostName.max_len]u8, name: []const u8) ?HostName {
+pub fn copyCanon(canonical_name_buffer: ?*[HostName.max_len]u8, name: []const u8) ?HostName {
     const buf = canonical_name_buffer orelse return null;
     const dest = buf[0..name.len];
     @memcpy(dest, name);

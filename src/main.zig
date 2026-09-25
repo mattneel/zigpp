@@ -195,6 +195,8 @@ pub fn main(init: std.process.Init.Minimal) anyerror!void {
             .environ = init.environ,
         }),
         .evented => try io_impl.init(root_gpa, .{
+            .stack_size = thread_stack_size,
+
             .argv0 = .init(init.args),
             .environ = init.environ,
 
@@ -3963,11 +3965,10 @@ fn buildOutputType(
         },
     };
 
-    const thread_limit = @min(
+    const thread_limit = try setThreadLimit(arena, @min(
         @max(n_jobs orelse std.Thread.getCpuCount() catch 1, 1),
         std.math.maxInt(Zcu.PerThread.IdBacking),
-    );
-    try setThreadLimit(arena, thread_limit);
+    ));
 
     for (create_module.c_source_files.items) |*src| {
         dev.check(.c_compiler);
@@ -5390,11 +5391,10 @@ fn jitCmd(
     });
     defer root_prog_node.end();
 
-    const thread_limit = @min(
+    const thread_limit = try setThreadLimit(arena, @min(
         @max(std.Thread.getCpuCount() catch 1, 1),
         std.math.maxInt(Zcu.PerThread.IdBacking),
-    );
-    try setThreadLimit(arena, thread_limit);
+    ));
 
     return jitCmdInner(gpa, arena, io, args, environ_map, root_prog_node, thread_limit, options);
 }
@@ -6628,12 +6628,13 @@ fn addLibDirectoryWarn2(
 
 const IoImpl = switch (build_options.io_mode) {
     .threaded => Io.Threaded,
-    .evented => Io.Evented,
+    .evented => Io.Threadz,
 };
 var io_impl_ptr: *IoImpl = undefined;
-fn setThreadLimit(arena: std.mem.Allocator, n: usize) Allocator.Error!void {
-    switch (build_options.io_mode) {
-        .threaded => {
+/// Limits the compiler to `n` threads, and returns how many threads the InternPool must serve.
+fn setThreadLimit(arena: std.mem.Allocator, n: usize) Allocator.Error!usize {
+    const ids = switch (build_options.io_mode) {
+        .threaded => ids: {
             // We want a maximum of n total threads to keep the InternPool happy, but
             // the main thread doesn't count towards the limits, so use n-1. Also, the
             // linker can run concurrently, so we need to set both the async *and* the
@@ -6641,10 +6642,20 @@ fn setThreadLimit(arena: std.mem.Allocator, n: usize) Allocator.Error!void {
             const limit: Io.Limit = .limited(n - 1);
             io_impl_ptr.setAsyncLimit(limit);
             io_impl_ptr.concurrent_limit = limit;
+            break :ids n;
         },
-        .evented => {},
-    }
-    try Zcu.PerThread.Id.allocate(arena, @max(n, 2));
+        .evented => ids: {
+            // Tasks run on at most n workers, the main thread among them. Unlike a thread, a task
+            // keeps its id while it waits, and some tasks wait for others that need ids: every
+            // compilation in flight, the main one and sub-compilations such as compiler_rt, holds
+            // one for its update and one for its linker task. So there are ids for those beyond
+            // the n that the tasks they wait for share.
+            io_impl_ptr.setWorkerLimit(n);
+            break :ids @min(n + 16, std.math.maxInt(Zcu.PerThread.IdBacking));
+        },
+    };
+    try Zcu.PerThread.Id.allocate(arena, @max(ids, 2));
+    return ids;
 }
 
 fn randInt(io: Io, comptime T: type) T {
