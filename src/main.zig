@@ -333,7 +333,7 @@ fn mainArgs(
     // exact compiler version, run that version instead of this one, installing
     // it into the global cache on first use. `zig any` is the explicit way to
     // do the same thing.
-    if (!mem.eql(u8, cmd, "any")) {
+    if (!mem.eql(u8, cmd, "any") and !isToolReentry(cmd)) {
         switch (native_os) {
             .wasi => {},
             else => try dispatchToPinnedVersion(gpa, arena, io, args, environ_map),
@@ -554,6 +554,18 @@ fn isValidVersionString(version: []const u8) bool {
     };
     _ = std.SemanticVersion.parse(version) catch return false;
     return true;
+}
+
+/// The commands this compiler, and the Clang inside it, run as children of
+/// the same executable to reach Clang, LLD and resinator. They belong to the
+/// command that runs them, which chose its version already: dispatching again
+/// would run another version's tool, or, while that command installs the
+/// pinned version, wait forever for the lock it holds on the global cache.
+fn isToolReentry(cmd: []const u8) bool {
+    for ([_][]const u8{ "clang", "-cc1", "-cc1as", "ld.lld", "lld-link", "wasm-ld", "rc" }) |tool| {
+        if (mem.eql(u8, cmd, tool)) return true;
+    }
+    return false;
 }
 
 fn isHelpArg(arg: []const u8) bool {
