@@ -7,12 +7,22 @@ welcomes them. The first Zig++ language feature, private fields, was
 implemented, tested, and documented by Claude, and the commit is signed that
 way.
 
-Zig++ is also building AI code generation into the build system. Today that is
-[Zigger](https://github.com/mattneel/zigger), a package that adds a
+Zig++ has AI on both sides of compilation: as a runtime facility in the
+programs it builds, and as a build-system facility in the build itself.
+Neither is in `std` yet: both are packages today, and both are headed into the
+standard library under the names `std.ai` and `std.Build.ai`.
+
+`std.ai` will be [ai.zig](https://github.com/mattneel/ai.zig), the AI toolkit
+for Zig: an implementation of the Vercel AI SDK v7 core built on `std.Io`,
+with text generation and streaming, multi-step tool loops, structured output,
+embeddings, reranking, reusable agents, and an MCP client.
+
+`std.Build.ai` will be [Zigger](https://github.com/mattneel/zigger), AI code
+generation as a Zig build step. Today it is a package that adds a
 `zig build gen` step: it reads `SPEC.md`, runs the Claude CLI to implement it,
-runs `zig build test`, feeds any failures back, and repeats until the tests pass
-(up to 10 times by default). With `-Dtdd=true` it writes failing tests first.
-The plan is to make this pipeline part of `std.Build`.
+runs `zig build test`, feeds any failures back, and repeats until the tests
+pass (up to 10 times by default). With `-Dtdd=true` it writes failing tests
+first. The plan is to move this pipeline into `std.Build.ai`.
 
 The goal: by September 2027, all new Zig++ code is written through the Zigger
 pipeline.

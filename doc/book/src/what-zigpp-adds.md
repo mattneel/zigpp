@@ -163,5 +163,6 @@ kernel fusion.
 ## AI in the toolchain
 
 Upstream Zig bans LLMs from issues, patches, and bug tracker comments. Zig++
-welcomes them, and it is building AI code generation into the build system; see
+welcomes them, and it is putting AI on both sides of compilation: in the
+programs it builds and in the build itself; see
 [AI Policy and Governance](ai-policy.md).
