@@ -1,6 +1,6 @@
-# Introduction
+![Zig++: Zig with the features upstream said no to.](zigpp-header.webp)
 
-<img src="/logo.png" alt="Zig++" width="200">
+# Introduction
 
 Zig++ is to Zig what TypeScript is to JavaScript: a superset that adds the
 features people kept asking for. Every valid Zig program is a valid Zig++

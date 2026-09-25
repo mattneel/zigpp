@@ -1,4 +1,4 @@
-![Zig++](doc/assets/zigpp-logo.png)
+![Zig++: Zig with the features upstream said no to.](doc/book/src/zigpp-header.webp)
 
 # Zig++
 

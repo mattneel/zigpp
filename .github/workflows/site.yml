@@ -190,7 +190,7 @@ jobs:
         run: |
           mkdir -p _site
           cp -R doc/book/_book/. _site/
-          cp doc/book/theme/*.png doc/book/theme/*.ico doc/book/theme/site.webmanifest _site/
+          cp doc/book/theme/*.png doc/book/theme/*.jpg doc/book/theme/*.ico doc/book/theme/site.webmanifest _site/
           # The one-line installers, served from the root of the site:
           #   curl -fsSL https://zigpp.lol/ppup | sh
           #   irm https://zigpp.lol/ppup.ps1 | iex

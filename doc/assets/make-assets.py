@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
-"""Derives Zig++'s brand assets from the logo.
+"""Derives Zig++'s brand assets from the logo and the header.
 
-    doc/assets/make-assets.py <logo.png> [--out-root .]
+    doc/assets/make-assets.py [<logo.png>] [--header <header.png>] [--out-root .]
 
-The logo is the only hand-made file: an RGBA drawing on a transparent
-background. Everything else is generated from it, so a new logo means
-re-running this script.
+Two files are hand-made, and everything else is generated from them, so a new
+logo or a new header means re-running this script with it.
 
-Writes:
+The logo is an RGBA drawing on a transparent background. It is the icon:
     doc/book/theme/favicon.ico          16x16, 32x32, 48x48
     doc/book/theme/favicon-32x32.png
     doc/book/theme/apple-touch-icon.png 180x180, opaque (iOS shows alpha as black)
     doc/book/theme/icon-192.png         transparent, padded
     doc/book/theme/icon-512.png         transparent, padded
-    doc/book/theme/logo.png             transparent, for pages in the book
-    doc/book/theme/og.png               1200x630 Open Graph card
+    doc/book/theme/logo.png             transparent, for the book's menu bar
     doc/book/theme/site.webmanifest
-    doc/assets/zigpp-logo.png           header image for README.md
 
-It also prints the palette that doc/book/theme/zigpp.css uses: the logo's
-dominant colours, and the contrast ratios with which the link colours are
+The header is a 2:1 banner, written at 1280x640, the size of GitHub's social
+preview. It tops README.md and the book, and it is the card a shared link shows:
+    doc/book/src/zigpp-header.webp      the top of README.md and of the book
+    doc/book/theme/og.jpg               Open Graph card
+
+For the logo it also prints the palette that doc/book/theme/zigpp.css uses: the
+logo's dominant colours, and the contrast ratios with which the link colours are
 readable as text on the light and the dark book themes.
 """
 
@@ -30,16 +32,12 @@ import json
 import os
 from collections import Counter
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
-OG_SIZE = (1200, 630)
-OG_BG = "#070b22"
+BRAND_BG = "#070b22"
+HEADER_SIZE = (1280, 640)
 LIGHT_BG = "#ffffff"
 DARK_BG = "#0c122c"
-FONTS = (
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-)
 
 
 def luminance(rgb):
@@ -121,17 +119,6 @@ def save(image, path, palette_colors=None):
     return os.path.getsize(path)
 
 
-def og_card(art, wordmark, accent):
-    card = Image.new("RGB", OG_SIZE, OG_BG)
-    draw = ImageDraw.Draw(card)
-    draw.rectangle([0, 0, OG_SIZE[0], 10], fill=accent)
-    logo = square(art, 380, 0.04)
-    card.paste(logo, (760, (OG_SIZE[1] - 380) // 2), logo)
-    font = ImageFont.truetype(next(path for path in FONTS if os.path.exists(path)), 150)
-    draw.text((90, 245), "Zig++", font=font, fill=wordmark)
-    return card
-
-
 def favicon_svg(art, size=48):
     """mdbook writes its own <link rel="icon"> tags for theme/favicon.svg and
     theme/favicon.png, so both hold the logo as well, next to the tags that
@@ -147,15 +134,8 @@ def favicon_svg(art, size=48):
     ).format(size, data)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("logo")
-    parser.add_argument("--out-root", default=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    args = parser.parse_args()
-
-    theme = os.path.join(args.out_root, "doc", "book", "theme")
-    assets = os.path.join(args.out_root, "doc", "assets")
-    source = Image.open(args.logo).convert("RGBA")
+def logo_assets(path, theme, sizes):
+    source = Image.open(path).convert("RGBA")
     art = trim(source)
 
     found = palette(art)
@@ -163,7 +143,6 @@ def main():
     light_links = next((rgb for rgb, _ in found if contrast(rgb, rgb_of(LIGHT_BG)) >= 4.5), readable(found[0][0], rgb_of(LIGHT_BG)))
     dark_links = next((rgb for rgb, _ in found if contrast(rgb, rgb_of(DARK_BG)) >= 7), readable(found[0][0], rgb_of(DARK_BG), 7))
 
-    sizes = {}
     favicon = square(art, 48, 0.04)
     favicon.save(os.path.join(theme, "favicon.ico"), sizes=[(16, 16), (32, 32), (48, 48)])
     sizes["favicon.png"] = save(favicon, os.path.join(theme, "favicon.png"))
@@ -173,13 +152,12 @@ def main():
     sizes["favicon-32x32.png"] = save(square(art, 32, 0.04), os.path.join(theme, "favicon-32x32.png"))
 
     touch = square(art, 180, 0.08)
-    opaque = Image.new("RGBA", touch.size, OG_BG)
+    opaque = Image.new("RGBA", touch.size, BRAND_BG)
     opaque.paste(touch, (0, 0), touch)
     sizes["apple-touch-icon.png"] = save(opaque, os.path.join(theme, "apple-touch-icon.png"))
     sizes["icon-192.png"] = save(square(art, 192, 0.08), os.path.join(theme, "icon-192.png"))
     sizes["icon-512.png"] = save(square(art, 512, 0.08), os.path.join(theme, "icon-512.png"), palette_colors=256)
     sizes["logo.png"] = save(square(art, 360, 0.02), os.path.join(theme, "logo.png"), palette_colors=256)
-    sizes["og.png"] = save(og_card(art, (255, 255, 255), accent), os.path.join(theme, "og.png"), palette_colors=256)
 
     with open(os.path.join(theme, "site.webmanifest"), "w") as file:
         json.dump(
@@ -190,7 +168,7 @@ def main():
                 "start_url": "/",
                 "display": "standalone",
                 "theme_color": hex_of(accent),
-                "background_color": OG_BG,
+                "background_color": BRAND_BG,
                 "icons": [
                     {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
                     {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"},
@@ -201,10 +179,7 @@ def main():
         )
         file.write("\n")
 
-    header = art.resize((200, max(1, round(art.height * 200 / art.width))), Image.LANCZOS)
-    sizes["doc/assets/zigpp-logo.png"] = save(header, os.path.join(assets, "zigpp-logo.png"), palette_colors=256)
-
-    print("logo %s: %dx%d, art %dx%d" % (args.logo, source.width, source.height, art.width, art.height))
+    print("logo %s: %dx%d, art %dx%d" % (path, source.width, source.height, art.width, art.height))
     print("dominant colours:")
     for rgb, share in found[:6]:
         print(
@@ -214,9 +189,45 @@ def main():
     print("accent, borders and gradients: %s" % hex_of(accent))
     print("links on light themes:         %s  %5.2f:1 on white" % (hex_of(light_links), contrast(light_links, rgb_of(LIGHT_BG))))
     print("links on dark themes:          %s  %5.2f:1 on %s" % (hex_of(dark_links), contrast(dark_links, rgb_of(DARK_BG)), DARK_BG))
+
+
+def header_assets(path, out_root, theme, sizes):
+    """The pages get WebP, which is a fraction of the PNG's size. The card is a
+    JPEG, because every site that unfurls a link reads JPEG."""
+    source = Image.open(path).convert("RGB")
+    if source.width * HEADER_SIZE[1] != source.height * HEADER_SIZE[0]:
+        raise SystemExit("header %s is %dx%d; it has to be 2:1" % (path, source.width, source.height))
+    header = source.resize(HEADER_SIZE, Image.LANCZOS)
+
+    page = os.path.join(out_root, "doc", "book", "src", "zigpp-header.webp")
+    header.save(page, quality=90, method=6)
+    sizes["doc/book/src/zigpp-header.webp"] = os.path.getsize(page)
+    card = os.path.join(theme, "og.jpg")
+    header.save(card, quality=90, optimize=True, progressive=True)
+    sizes["og.jpg"] = os.path.getsize(card)
+
+    print("header %s: %dx%d" % (path, source.width, source.height))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("logo", nargs="?")
+    parser.add_argument("--header")
+    parser.add_argument("--out-root", default=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    args = parser.parse_args()
+    if args.logo is None and args.header is None:
+        parser.error("give the logo, --header, or both")
+
+    theme = os.path.join(args.out_root, "doc", "book", "theme")
+    sizes = {}
+    if args.logo is not None:
+        logo_assets(args.logo, theme, sizes)
+    if args.header is not None:
+        header_assets(args.header, args.out_root, theme, sizes)
+
     print("written:")
     for name, size in sizes.items():
-        print("  %-28s %7.1f KiB" % (name, size / 1024))
+        print("  %-30s %7.1f KiB" % (name, size / 1024))
 
 
 if __name__ == "__main__":
