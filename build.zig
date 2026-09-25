@@ -1426,9 +1426,11 @@ const zig_cpp_sources = [_][]const u8{
     "src/zig_clang_cc1as_main.cpp",
 };
 
-// The Metal AIR stage: the C API entry point (ZigLLVMAirLower) and the AIR rewrites.
+// The Metal AIR stage: the C API entry point (ZigLLVMAirLower), the AIR rewrites, and the
+// lowerings after the optimization pipeline.
 const zig_air_sources = [_][]const u8{
     "src/zig_air.cpp",
+    "src/zig_air_lower.cpp",
     "src/zig_air_rewrite.cpp",
 };
 

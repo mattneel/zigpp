@@ -82,17 +82,20 @@
 //! downgraded AIR bitcode inside it; `-femit-asm` and `-femit-llvm-ir` are errors, because there
 //! is no AIR assembly that this compiler could write.
 //!
-//! Two things a kernel cannot do yet, both of them in Apple's compiler rather than in this
-//! standard library: a 64-bit multiplication whose overflow flag is used
-//! (`llvm.umul.with.overflow.i64`, so `@mulWithOverflow(u64)` and every checked multiplication
-//! of `u64` in a safe build), and a 128-bit multiplication whose high half is used, which is how
-//! `std.fmt.parseFloat` computes for every float type (its Eisel-Lemire fast path). Apple's AIR
-//! to AGX backend crashes on both, so a kernel that parses a number out of text does not compile
-//! yet, whatever type it parses into; lowering the multiply in this backend is not enough,
-//! because the optimizer re-forms the 128-bit idiom before the module reaches Apple. The rest of
-//! the target - the address spaces, the builtins, the intrinsics above and the container - is
-//! exercised by `test/standalone/gpu`, which compiles its Apple kernels for `air64-macos` on
-//! every host and runs them on a Mac.
+//! Apple's compiler cannot produce the high 64 bits of a 64-bit multiplication, which the
+//! overflow check of every safety-checked multiplication of `u64` and `usize` needs, and so does
+//! 128-bit arithmetic such as the Eisel-Lemire path of `std.fmt.parseFloat`: the backend rebuilds
+//! those multiplications out of 32-bit ones after the optimizer has run, since the optimizer
+//! would form the 128-bit idiom again. Program-scope constants (string literals, lookup tables)
+//! live in the constant address space, where Metal keeps them; the backend carries that address
+//! space through every pointer derived from a constant, inlining the calls such a pointer
+//! crosses. Metal has no generic address space, so a pointer into constant data that meets a
+//! pointer to thread memory in a kernel, in a phi or a store, is a compile error that names the
+//! kernel. So is a constant that holds pointers, such as a table of strings or slices, because
+//! Apple's toolchain does not relocate the addresses inside constant data; `std.fmt.parseFloat`
+//! has one, so it does not compile for an Apple GPU yet (issue #22). The target (the address spaces, the
+//! builtins, the intrinsics above and the container) is exercised by `test/standalone/gpu`,
+//! which compiles its Apple kernels for `air64-macos` on every host and runs them on a Mac.
 //!
 //! The device-side functions in this namespace are implemented for NVPTX, AMDGPU and air64. The
 //! indexing functions and `syncThreads` use builtins that also exist for SPIR-V.

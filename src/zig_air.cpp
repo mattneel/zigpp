@@ -149,6 +149,12 @@ extern "C" int ZigLLVMAirLower(LLVMModuleRef module, const ZigLLVMAirOptions *op
         // The LLVM middle end (step 6).
         if (!runPipeline(M, options->opt_level, Err)) return fail(out_error, Err);
 
+        // What the pipeline must not see, because it would form it again: constants outside
+        // the constant address space, and multiplies that need a high half Apple's compiler
+        // cannot produce. Moving the constants runs SROA, at opt_level 0 too, and inlines the
+        // calls that pointers into constant data cross.
+        if (!zigAirLowerLate(M, Err)) return fail(out_error, Err);
+
         // The pipeline's own inferrences are removed again (the AIR reader wants Apple's
         // kernel parameter shapes), and SROA has left GEPs on the buffer parameters that
         // want the buffer's element type (step 5b of the spike).

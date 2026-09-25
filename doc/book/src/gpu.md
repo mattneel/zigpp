@@ -522,16 +522,19 @@ The Metal variant is built wherever the suite is. `build.zig` compiles
 and a fast variant, installs the two containers next to the host program
 `gpu_metal_host`, and runs the host on each of them, so the suite exercises the
 `air64` target on any host. The host runs a vector add, a reduction whose
-partial sums go through threadgroup memory and a device atomic counter, and a
-kernel with scalar parameters, checking the results against the CPU and
-reporting the SIMD width of the kernels; `-Dmetallib=a.metallib,b.metallib`
-adds the containers that Apple's own `metal` compiler or the spike built, to
-compare Apple's code with this one's. A machine without the Metal framework
-skips every library it was given, a library without one of the three kernels
-skips those tests, and a run with no library at all skips everything: all three
-exit 0. The suite therefore builds its containers and its host on any host, and
-only a Mac runs the kernels. On macOS, a framework that will not open and a
-library that will not load are failures.
+partial sums go through threadgroup memory and a device atomic counter, a
+kernel with scalar parameters, an index computed with a `usize` multiply (which
+a debug build checks for overflow), the 128-bit products and overflow flags of
+64-bit multiplies, and tables of integers and of structs in the constant address
+space, checking the results against the CPU bit for bit and reporting the SIMD
+width of the kernels;
+`-Dmetallib=a.metallib,b.metallib` adds the containers that Apple's own `metal`
+compiler or the spike built, to compare Apple's code with this one's. A machine
+without the Metal framework skips every library it was given, a library without
+one of the kernels skips its test, and a run with no library at all skips
+everything: all three exit 0. The suite therefore builds its containers and its
+host on any host, and only a Mac runs the kernels. On macOS, a framework that
+will not open and a library that will not load are failures.
 
 A machine without the driver or without a device is not a failure: the test
 reports it and passes, for `error.DriverNotFound`, `error.NoDevice`, a driver
@@ -554,12 +557,16 @@ GPU driver, where the suite then skips itself.
   on architectures other than NVPTX, both of which are compile errors.
 - On Apple GPUs, `f64` is a compile error, the atomics are the relaxed ones
   only, `print` and `assertFail` are compile errors, and threadgroup memory must
-  be a static variable sized by the pipeline's 32 KiB.
-- A 64-bit multiplication whose overflow flag is used, and a 128-bit
-  multiplication whose high half is used, make Apple's AIR-to-AGX backend crash,
-  so a checked multiplication of `u64` in a safe build and `std.fmt.parseFloat`,
-  which computes every float type through a 64x64->128 multiply, do not compile
-  on Metal.
+  be a static variable sized by the pipeline's 32 KiB. Metal has no generic
+  address space, so a pointer into constant data (a string literal, a table)
+  that meets a pointer to thread memory is a compile error naming the function,
+  and a checked multiplication of `i128` values is supported only where both
+  operands fit in 64 bits.
+- On Apple GPUs, a program-scope constant that holds pointers, such as a table
+  of strings or slices, is a compile error, because Apple's toolchain does not
+  relocate the addresses inside constant data. `std.fmt.parseFloat` has such a
+  table, so it does not compile for Apple GPUs yet
+  ([#22](https://github.com/mattneel/zigpp/issues/22)).
 - The AIR version, the Metal language version, and the container version of a
   Metal library are the ones of the macOS release row that the deployment target
   selects, not a choice of the program.

@@ -214,6 +214,7 @@ set(ZIG_CPP_SOURCES
 # headers it augments), so their per-source options are set below.
 set(ZIG_AIR_SOURCES
     src/zig_air.cpp
+    src/zig_air_lower.cpp
     src/zig_air_rewrite.cpp
 )
 set(ZIG_AIR_VENDOR_SOURCES
