@@ -2448,6 +2448,7 @@ fn addPathForDynLibs(
     var module_graph: Step.Compile.ModuleGraph = .empty;
     const compile_deps = try Step.Compile.getCompileDependencies(arena, &module_graph, conf, artifact, true);
 
+    var added = false;
     for (compile_deps) |dep_index| {
         const conf_comp_step = dep_index.ptr(conf);
         const conf_comp = conf_comp_step.extended.get(conf.extra).compile;
@@ -2462,7 +2463,25 @@ fn addPathForDynLibs(
             } else {
                 try environ_map.put(path_key, search_path);
             }
+            added = true;
         }
+    }
+
+    // Off Windows and without Wine, a Windows executable only starts at all through WSL's
+    // interop, which hands a variable to the Windows process only when WSLENV names it; `/l` has
+    // it translate a list of Linux paths into Windows ones. Without it, the program cannot find
+    // its DLLs, and Windows stops to show a dialog about the missing one.
+    if (added and !use_wine and builtin.os.tag != .windows) {
+        const wslenv = environ_map.get("WSLENV") orelse "";
+        var entries = std.mem.tokenizeScalar(u8, wslenv, ':');
+        const listed = while (entries.next()) |entry| {
+            const name = entry[0 .. std.mem.indexOfScalar(u8, entry, '/') orelse entry.len];
+            if (std.mem.eql(u8, name, path_key)) break true;
+        } else false;
+        if (!listed) try environ_map.put("WSLENV", if (wslenv.len == 0)
+            "PATH/l"
+        else
+            try arena.print("{s}:PATH/l", .{wslenv}));
     }
 }
 
