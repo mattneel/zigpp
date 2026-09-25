@@ -364,3 +364,49 @@ extern fn LLVMGetHostCPUName() ?[*:0]u8;
 
 pub const GetHostCPUFeatures = LLVMGetHostCPUFeatures;
 extern fn LLVMGetHostCPUFeatures() ?[*:0]u8;
+
+/// Apple's AIR (Apple Intermediate Representation) pipeline for the `air64` target. LLVM has no
+/// AIR backend: the Zig emitter writes LLVM IR with AIR's address spaces and kernel ABI, and
+/// this runs the AIR rewrites, the optimization pipeline and llvm-downgrade in process, turning
+/// modern LLVM bitcode into the LLVM 14 format Apple's Metal runtime reads. The result is a
+/// `.metallib` module (see `doc/proposals/metal.md` sections 4, 5 and 6.2).
+pub const air = struct {
+    /// The AIR, Metal language and SDK versions whose conventions the module is put in, plus the
+    /// bitcode format to downgrade to. `source_name` and `ident` are optional metadata strings.
+    pub const Options = extern struct {
+        source_name: ?[*:0]const u8,
+        ident: ?[*:0]const u8,
+        air_major: c_uint,
+        air_minor: c_uint,
+        air_patch: c_uint,
+        metal_major: c_uint,
+        metal_minor: c_uint,
+        metal_patch: c_uint,
+        sdk_major: c_uint,
+        sdk_minor: c_uint,
+        sdk_patch: c_uint,
+        /// 0 runs only `GlobalDCE` and `StripDeadPrototypes`; anything else is the standard
+        /// optimization pipeline at that level.
+        opt_level: c_uint,
+        downgrade_major: c_uint,
+        downgrade_minor: c_uint,
+    };
+
+    /// Lowers `module` to the LLVM-14-format bitcode Apple's reader accepts. Returns zero and
+    /// sets `out_bitcode`/`out_len` on success, and nonzero with `out_error` set otherwise; the
+    /// caller frees both with `disposeBytes`/`disposeMessage`.
+    pub const lower = ZigLLVMAirLower;
+    extern fn ZigLLVMAirLower(
+        module: *Module,
+        options: *const Options,
+        out_bitcode: *[*]u8,
+        out_len: *usize,
+        out_error: *?[*:0]u8,
+    ) c_int;
+
+    pub const disposeBytes = ZigLLVMAirDisposeBytes;
+    extern fn ZigLLVMAirDisposeBytes(bytes: [*]u8) void;
+
+    pub const disposeMessage = ZigLLVMAirDisposeMessage;
+    extern fn ZigLLVMAirDisposeMessage(message: [*:0]u8) void;
+};

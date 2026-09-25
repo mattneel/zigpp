@@ -4,8 +4,15 @@ const builtin = @import("builtin");
 const compiler_rt = @import("../compiler_rt.zig");
 const symbol = compiler_rt.symbol;
 
-const have_availability_version_check = builtin.os.tag.isDarwin() and
-    builtin.os.version_range.semver.min.order(.{ .major = 10, .minor = 15, .patch = 0 }).compare(.gte);
+const have_availability_version_check = have: {
+    // A bundled compiler-rt is inside a GPU module. `air64`'s OS is macOS, so without this check
+    // the Darwin arm below would be selected, but a kernel never runs the Objective-C `@available`
+    // check this function implements, and the routine behind it is libSystem's, which the device
+    // does not have.
+    if (compiler_rt.bundled) break :have false;
+    break :have builtin.os.tag.isDarwin() and
+        builtin.os.version_range.semver.min.order(.{ .major = 10, .minor = 15, .patch = 0 }).compare(.gte);
+};
 
 comptime {
     if (have_availability_version_check) {

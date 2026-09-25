@@ -23,6 +23,10 @@ pub fn build(b: *std.Build) void {
     const os = host_target.result.os.tag;
     if (os == .linux) addCudaTest(b, test_step, host_target);
     if (os == .linux or os == .windows) addHipTest(b, test_step, host_target, amdgpu_archs);
+    // `std.gpu.metal` finds the Metal framework and the Objective-C runtime at run time, and only
+    // on macOS. The host program, and the kernels that the compiler under test builds for it, are
+    // built and run everywhere: without a Mac every test of it is skipped.
+    addMetalHost(b, test_step, host_target);
 }
 
 const images = [_]struct { name: []const u8, optimize: std.builtin.OptimizeMode }{
@@ -107,6 +111,82 @@ fn addHipTest(
     }
     exe.root_module.addImport("code_objects", code_objects);
     addRuns(b, test_step, exe);
+}
+
+/// The Metal arm of this suite: `metal_host.zig` runs the vector add, the reduction, and the
+/// kernel with scalar parameters through `std.gpu.metal`, with the same kernels and the same
+/// arguments as the CUDA and HIP hosts, and checks the results against the CPU.
+///
+/// Its kernels are `.metallib` files, not objects of this directory, because the container is what
+/// a Metal GPU is given. The ones that this step always builds are the kernels of
+/// `metal_kernels.zig`, compiled for the `air64` target by the compiler that runs the build: the
+/// object file of that target *is* the library, so the compiler under test produces a loadable
+/// container on any host, with no Metal toolchain, no linker and no SDK in the pipeline. The
+/// containers of the two optimization modes of the rest of the suite are installed next to the
+/// host, and each is run by it, so the step exercises the `air64` target wherever it runs.
+///
+/// A library of the Metal Shading Language, `metal_kernels.metal` compiled by Apple's own
+/// compiler, or one that the spike builds, is what `-Dmetallib=a.metallib,b.metallib` feeds in, for
+/// a comparison against Apple's code. Every run skips the tests of a machine without the Metal
+/// framework, and the tests of a library that does not have a kernel, so the step passes with no
+/// Mac and no library at all.
+fn addMetalHost(b: *std.Build, test_step: *std.Build.Step, host_target: std.Build.ResolvedTarget) void {
+    const exe = b.addExecutable(.{
+        .name = "gpu_metal_host",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("metal_host.zig"),
+            .target = host_target,
+            .optimize = .debug,
+            // The Metal framework and the Objective-C runtime are loaded with `dlopen`.
+            .link_libc = true,
+        }),
+    });
+    b.installArtifact(exe);
+
+    const metallibs = b.option(
+        []const u8,
+        "metallib",
+        "Comma-separated .metallib files whose kernels the Metal host test runs on the GPU of a Mac",
+    );
+    if (metallibs) |list| {
+        const run_libraries = b.addRunArtifact(exe);
+        var paths = std.mem.tokenizeScalar(u8, list, ',');
+        while (paths.next()) |path| run_libraries.addArg(path);
+        test_step.dependOn(&run_libraries.step);
+    }
+
+    // The kernels that the compiler under test builds: one container per optimization mode, to run
+    // the kernels as both the debug and the release build of the standard library compile them.
+    const kernel_target = b.resolveTargetQuery(.{
+        .cpu_arch = .air64,
+        .os_tag = .macos,
+        // The AIR version, the Metal language version and the container version are one row per
+        // macOS release, and the deployment target selects the row: macOS 26 is the release whose
+        // toolchain emits the AIR 2.8, Metal 4.0 and container 1.2.9 that these kernels run as.
+        .os_version_min = .{ .semver = .{ .major = 26, .minor = 0, .patch = 0 } },
+    });
+    for (images) |image| {
+        const kernels = b.addObject(.{
+            .name = b.fmt("metal_kernels_{s}", .{image.name}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("metal_kernels.zig"),
+                .target = kernel_target,
+                .optimize = image.optimize,
+            }),
+        });
+        // An object has no installation procedure of its own, and the emitted file of this one is
+        // the `.metallib` itself, so that a build for a Mac installs the containers next to the
+        // host that runs them.
+        const install_container = b.addInstallBinFile(
+            kernels.getEmittedBin(),
+            b.fmt("metal_kernels_{s}.metallib", .{image.name}),
+        );
+        b.getInstallStep().dependOn(&install_container.step);
+
+        const run_kernels = b.addRunArtifact(exe);
+        run_kernels.addFileArg(kernels.getEmittedBin());
+        test_step.dependOn(&run_kernels.step);
+    }
 }
 
 fn addHost(b: *std.Build, host_target: std.Build.ResolvedTarget, backend: Backend) *std.Build.Step.Compile {

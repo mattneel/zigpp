@@ -42,8 +42,15 @@ else
 
 /// Whether this compiler-rt is compiled into a GPU module, which must match
 /// `bundlesCompilerRt` in the compiler.
-const bundled = switch (builtin.cpu.arch) {
-    .nvptx, .nvptx64, .amdgcn => true,
+///
+/// A GPU module links against no external library, and a kernel has no operating system under
+/// it, so nothing in this library may call into one. That matters for `air64` (Apple GPUs): its
+/// OS is macOS, so the Darwin code paths of this library are selected, while a Metal kernel
+/// cannot call libSystem - `sys_icache_invalidate` and the availability-version API do not exist
+/// on the device. `compiler_rt/clear_cache.zig` and `compiler_rt/os_version_check.zig` test this
+/// flag to leave those two calls out.
+pub const bundled = switch (builtin.cpu.arch) {
+    .nvptx, .nvptx64, .amdgcn, .air64 => true,
     else => false,
 };
 

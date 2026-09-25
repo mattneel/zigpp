@@ -258,6 +258,10 @@ pub fn binNameAlloc(allocator: Allocator, options: BinNameOptions) error{OutOfMe
         },
         .c => return std.fmt.allocPrint(allocator, "{s}.c", .{root_name}),
         .spirv => return std.fmt.allocPrint(allocator, "{s}.spv", .{root_name}),
+        // A metallib is the only thing an AIR module is ever put in, in every output mode.
+        .metallib => return std.fmt.allocPrint(allocator, "{s}{s}", .{
+            root_name, options.ofmt.fileExt(options.cpu_arch),
+        }),
         .hex => return std.fmt.allocPrint(allocator, "{s}.ihex", .{root_name}),
         .raw => return std.fmt.allocPrint(allocator, "{s}.bin", .{root_name}),
         .plan9 => switch (options.output_mode) {

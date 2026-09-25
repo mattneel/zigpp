@@ -42,7 +42,9 @@ pub const winsize = std.posix.winsize;
 pub extern var _mh_execute_header: mach_hdr;
 var dummy_execute_header: mach_hdr = undefined;
 comptime {
-    if (native_os.isDarwin()) {
+    // A `.metallib` has no Mach-O header, and an AIR module has no program-scope variable
+    // that is not in the constant or threadgroup address space.
+    if (native_os.isDarwin() and builtin.object_format != .metallib) {
         @export(&dummy_execute_header, .{ .name = "_mh_execute_header", .linkage = .weak });
     }
 }

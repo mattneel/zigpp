@@ -12,6 +12,7 @@ const codegen = @import("../codegen.zig");
 const Compilation = @import("../Compilation.zig");
 const InternPool = @import("../InternPool.zig");
 const link = @import("../link.zig");
+const metallib = @import("../metallib.zig");
 const Module = @import("../Module.zig");
 const target_util = @import("../target.zig");
 const Type = @import("../Type.zig");
@@ -154,6 +155,47 @@ pub const Object = struct {
     /// Values for `@llvm.used`.
     used: std.ArrayList(Builder.Constant),
 
+    /// The kernel functions of the `air64` target, in the order they were lowered. `emit` turns
+    /// this into the module-level `!air.kernel` metadata Apple's Metal runtime reads; see
+    /// `doc/proposals/metal.md` sections 2.4 and 2.5.
+    air_kernels: std.ArrayListUnmanaged(AirKernel),
+    /// External declarations of the `air.*` intrinsics and of the `zig.air.builtin.*`
+    /// placeholders the `air64` kernel ABI is built from, keyed by name so that one module
+    /// declares each of them once.
+    air_decls: std.StringArrayHashMapUnmanaged(Builder.Global.Index),
+
+    /// One `air64` kernel: its LLVM function and the host-visible parameters, in Zig parameter
+    /// order. The thread-position builtins are appended to `args` by the AIR pass, which also
+    /// binds `air.location_index` to the parameter index, exactly as a Metal host binds
+    /// `setBuffer:offset:atIndex:` / `setBytes:length:atIndex:`.
+    pub const AirKernel = struct {
+        /// The global of the kernel function; its name is what the host resolves.
+        global: Builder.Global.Index,
+        args: std.ArrayListUnmanaged(AirArg),
+
+        /// One kernel parameter the host binds, described in the shape of Apple's metadata
+        /// (doc section 2.5): a buffer is a pointer in device or constant memory, and a scalar
+        /// parameter is bound as bytes that the AIR pass loads through a `constant` pointer.
+        pub const AirArg = struct {
+            /// The AIR address space of the pointer the kernel sees: 1 for device memory, 2 for
+            /// a scalar or `constant` parameter, 3 for threadgroup memory.
+            address_space: u3,
+            /// `air.location_index`, the index the host binds this parameter at. A Zig kernel's
+            /// parameters are bound in order, so this is the parameter index.
+            location_index: u32,
+            access: Access,
+            /// The MSL type name of the pointee, e.g. `"float"`.
+            type_name: []const u8,
+            type_size: u64,
+            type_align: u64,
+            /// `air.arg_name`. Reflection only; parameter names are not preserved by the
+            /// backend, so this is generated from the index.
+            name: []const u8,
+
+            pub const Access = enum { read, write, read_write };
+        };
+    };
+
     pub const Ptr = if (@import("../dev.zig").env.supports(.llvm_backend)) *Object else noreturn;
 
     const TypeMap = std.AutoHashMapUnmanaged(InternPool.Index, Builder.Type);
@@ -253,8 +295,156 @@ pub const Object = struct {
             .error_name_table = .none,
             .errors_len_variable = .none,
             .used = .empty,
+            .air_kernels = .empty,
+            .air_decls = .empty,
         };
         return obj;
+    }
+
+    fn freeAirKernel(gpa: Allocator, kernel: AirKernel) void {
+        for (kernel.args.items) |arg| {
+            gpa.free(arg.type_name);
+            gpa.free(arg.name);
+        }
+        var args = kernel.args;
+        args.deinit(gpa);
+    }
+
+    /// Records an `air64` kernel and the parameters the host binds for it, in Zig parameter
+    /// order. `args` and the strings they point to are owned by the `Object` afterwards. The
+    /// thread-position builtins a kernel uses are appended to the same list by the AIR pass,
+    /// which is also what turns this into `!air.kernel`.
+    pub fn addAirKernel(
+        o: *Object,
+        global: Builder.Global.Index,
+        args: []const AirKernel.AirArg,
+    ) Allocator.Error!void {
+        const gpa = o.gpa;
+        for (o.air_kernels.items, 0..) |*kernel, i| {
+            if (kernel.global.eql(global, &o.builder)) {
+                // Re-lowering a function replaces its entry rather than adding a second one.
+                freeAirKernel(gpa, kernel.*);
+                o.air_kernels.items[i] = .{ .global = global, .args = .empty };
+                try o.air_kernels.items[i].args.appendSlice(gpa, args);
+                return;
+            }
+        }
+        var list: std.ArrayListUnmanaged(AirKernel.AirArg) = .empty;
+        errdefer list.deinit(gpa);
+        try list.appendSlice(gpa, args);
+        try o.air_kernels.append(gpa, .{ .global = global, .args = list });
+    }
+
+    /// Returns the external declaration of the function `name` with type `fn_ty`, creating it on
+    /// first use. The `air64` target reaches Apple's AIR through such declarations — there is no
+    /// LLVM target for `air64`, so this is where the ABI lives — for the `air.*` intrinsic
+    /// names and for the `zig.air.builtin.*` placeholders the AIR pass rewrites into kernel
+    /// parameters.
+    pub fn airDecl(o: *Object, name: []const u8, fn_ty: Builder.Type) Allocator.Error!Builder.Global.Index {
+        const gpa = o.gpa;
+        const owned_name = try gpa.dupe(u8, name);
+        const gop = o.air_decls.getOrPut(gpa, owned_name) catch |err| {
+            gpa.free(owned_name);
+            return err;
+        };
+        if (gop.found_existing) {
+            gpa.free(owned_name);
+            return gop.value_ptr.*;
+        }
+        errdefer _ = o.air_decls.swapRemove(owned_name);
+        const strtab_name = try o.builder.strtabString(owned_name);
+        // Source code can declare the same function itself (a kernel that writes the AIR
+        // intrinsics it uses, and the `zig.air.builtin.*` placeholders `std.gpu` declares).
+        // Those are the same function, so reuse the global the emitter already has.
+        const global = o.builder.getGlobal(strtab_name) orelse
+            try o.builder.addGlobal(strtab_name, .{
+                .type = fn_ty,
+                .kind = .{ .alias = .none },
+            });
+        gop.value_ptr.* = global;
+        // Nothing ever lowers a body into one of these globals: the AIR pass turns the builtins
+        // into kernel parameters, and the driver provides the `air.*` intrinsics. The bitcode
+        // writer only knows globals that belong to a variable, a function or an alias, so the
+        // global has to be a declaration right away — a value that references a global outside
+        // that set crashes the writer. An existing global found above is a declaration already
+        // (a previous call of this function, or the NAV `updateNav` lowered), except for the
+        // placeholder `lowerNavRef` leaves behind while a NAV is still being lowered, which this
+        // is the same declaration as.
+        switch (global.ptrConst(&o.builder).kind) {
+            .function => {},
+            .replaced, .alias, .variable => _ = try global.toNewFunction(&o.builder),
+        }
+        return global;
+    }
+
+    /// The declaration of the `air64` builtin placeholder
+    /// `zig.air.builtin.<air_name>.<dimension>`, which the AIR pass replaces with the kernel
+    /// argument that carries the builtin. The declaration is a marker, not an implementation:
+    /// nothing links against it, and the pass erases it.
+    pub fn airBuiltinDecl(
+        o: *Object,
+        air_name: []const u8,
+        dimension: u32,
+    ) Allocator.Error!Builder.Global.Index {
+        const gpa = o.gpa;
+        const name = try std.fmt.allocPrint(gpa, "zig.air.builtin.{s}.{s}", .{
+            air_name,
+            switch (dimension) {
+                0 => "x",
+                1 => "y",
+                else => "z",
+            },
+        });
+        defer gpa.free(name);
+        const fn_ty = try o.builder.fnType(.i32, &.{}, .normal);
+        return o.airDecl(name, fn_ty);
+    }
+
+    /// Writes `!air.kernel`, one kernel node per kernel, directly in the named node's operand
+    /// list (`!air.kernel = !{!K1, !K2}` with `!Ki = !{ptr @k, !{}, !{<arguments>}}`): Apple's
+    /// reader rejects any extra level of nesting, and the runtime then fails to copy the
+    /// bitcode for the function. Section 2.5 of `doc/proposals/metal.md` pins the shape of each
+    /// argument node. The AIR pass appends the builtin arguments after these.
+    fn emitAirKernelMetadata(o: *Object) Allocator.Error!void {
+        const b = &o.builder;
+        const gpa = o.gpa;
+        if (o.air_kernels.items.len == 0) return;
+        const nodes = try gpa.alloc(Builder.Metadata, o.air_kernels.items.len);
+        defer gpa.free(nodes);
+        for (nodes, o.air_kernels.items) |*node, kernel| {
+            const arg_nodes = try gpa.alloc(Builder.Metadata, kernel.args.items.len);
+            defer gpa.free(arg_nodes);
+            for (arg_nodes, kernel.args.items, 0..) |*arg_node, arg, param_index| {
+                arg_node.* = try b.metadataTuple(&.{
+                    try b.metadataConstant(try b.intConst(.i32, param_index)),
+                    (try b.metadataString("air.buffer")).toMetadata(),
+                    (try b.metadataString("air.location_index")).toMetadata(),
+                    try b.metadataConstant(try b.intConst(.i32, arg.location_index)),
+                    try b.metadataConstant(try b.intConst(.i32, 1)),
+                    (try b.metadataString(switch (arg.access) {
+                        .read => "air.read",
+                        .write => "air.write",
+                        .read_write => "air.read_write",
+                    })).toMetadata(),
+                    (try b.metadataString("air.address_space")).toMetadata(),
+                    try b.metadataConstant(try b.intConst(.i32, arg.address_space)),
+                    (try b.metadataString("air.arg_type_size")).toMetadata(),
+                    try b.metadataConstant(try b.intConst(.i32, arg.type_size)),
+                    (try b.metadataString("air.arg_type_align_size")).toMetadata(),
+                    try b.metadataConstant(try b.intConst(.i32, arg.type_align)),
+                    (try b.metadataString("air.arg_type_name")).toMetadata(),
+                    (try b.metadataString(arg.type_name)).toMetadata(),
+                    (try b.metadataString("air.arg_name")).toMetadata(),
+                    (try b.metadataString(arg.name)).toMetadata(),
+                });
+            }
+            node.* = try b.metadataTuple(&.{
+                try b.metadataConstant(kernel.global.toConst()),
+                Builder.Metadata.empty_tuple,
+                try b.metadataTuple(arg_nodes),
+            });
+        }
+        try b.addNamedMetadata(try b.string("air.kernel"), nodes);
     }
 
     pub fn deinit(o: *Object) void {
@@ -271,6 +461,10 @@ pub const Object = struct {
         o.enum_tag_name_map.deinit(gpa);
         o.named_enum_map.deinit(gpa);
         o.type_map.deinit(gpa);
+        for (o.air_kernels.items) |kernel| freeAirKernel(gpa, kernel);
+        o.air_kernels.deinit(gpa);
+        for (o.air_decls.keys()) |name| gpa.free(name);
+        o.air_decls.deinit(gpa);
         o.builder.deinit();
         o.* = undefined;
     }
@@ -507,6 +701,12 @@ pub const Object = struct {
             }
 
             try o.builder.addNamedMetadata(try o.builder.string("llvm.module.flags"), module_flags.items);
+
+            if (target.cpu.arch == .air64) {
+                // Apple's reader finds kernels through this metadata, and the AIR pass rewrites
+                // the modules that have it (`doc/proposals/metal.md` section 2.5).
+                try o.emitAirKernelMetadata();
+            }
         }
 
         const target_triple_sentinel =
@@ -546,6 +746,10 @@ pub const Object = struct {
                 const ptr: [*]const u8 = @ptrCast(bitcode.ptr);
                 file.writeStreamingAll(io, ptr[0..(bitcode.len * 4)]) catch |err|
                     return diags.fail("failed to write to '{s}': {t}", .{ path, err });
+            }
+
+            if (comp.root_mod.resolved_target.result.cpu.arch == .air64) {
+                return o.emitAir(io, options, bitcode);
             }
 
             if (options.asm_path == null and options.bin_path == null and
@@ -746,6 +950,140 @@ pub const Object = struct {
         }
     }
 
+    /// The `air64` target's object file is a Metal library. LLVM has no AIR backend, so no
+    /// `TargetMachine` is created and no assembly or IR text is produced: the module the emitter
+    /// built is run through Apple's AIR rewrites and the optimization pipeline, downgraded to the
+    /// LLVM 14 bitcode format Apple's reader accepts, and wrapped in a `.metallib`
+    /// (`doc/proposals/metal.md` sections 4, 5 and 6.2). The versions — AIR, Metal language and
+    /// container — come from the macOS deployment target, as Apple's own toolchain does.
+    fn emitAir(o: *Object, io: Io, options: EmitOptions, bitcode: []const u32) link.Error!void {
+        const zcu = o.zcu;
+        const comp = zcu.comp;
+        const diags = &comp.link_diags;
+        const target = &comp.root_mod.resolved_target.result;
+
+        if (options.asm_path != null) {
+            return diags.fail("the air64 target emits a Metal library, not assembly", .{});
+        }
+        if (options.post_ir_path != null) {
+            return diags.fail("the air64 target does not emit textual LLVM IR", .{});
+        }
+        if (options.bin_path == null and options.post_bc_path == null) return;
+        if (!build_options.have_llvm or !comp.config.use_lib_llvm) {
+            return diags.fail("emitting without libllvm not implemented", .{});
+        }
+        if (target.os.tag != .macos) {
+            return diags.fail("the air64 target is only available for macOS", .{});
+        }
+
+        const macos = target.os.version_range.semver.min;
+        const versions = std.Target.air64.versionsForMacos(@intCast(macos.major));
+
+        const context: *bindings.Context = .create();
+        defer context.dispose();
+
+        const bitcode_memory_buffer = bindings.MemoryBuffer.createMemoryBufferWithMemoryRange(
+            @ptrCast(bitcode.ptr),
+            bitcode.len * 4,
+            "AirBitcodeBuffer",
+            bindings.Bool.False,
+        );
+        defer bitcode_memory_buffer.dispose();
+
+        context.enableBrokenDebugInfoCheck();
+
+        var module: *bindings.Module = undefined;
+        if (context.parseBitcodeInContext2(bitcode_memory_buffer, &module).toBool() or
+            context.getBrokenDebugInfo())
+        {
+            return diags.fail("Failed to parse bitcode", .{});
+        }
+
+        const air_options: bindings.air.Options = .{
+            .source_name = null,
+            .ident = null,
+            .air_major = versions.air[0],
+            .air_minor = versions.air[1],
+            .air_patch = versions.air[2],
+            .metal_major = versions.metal[0],
+            .metal_minor = versions.metal[1],
+            .metal_patch = versions.metal[2],
+            // The SDK version is the deployment target here: the compiler does not know which SDK
+            // the device was built against, and the flag is informational to Apple's reader.
+            .sdk_major = @intCast(macos.major),
+            .sdk_minor = @intCast(macos.minor),
+            .sdk_patch = @intCast(macos.patch),
+            .opt_level = switch (comp.root_mod.optimize_mode) {
+                .debug => 0,
+                .safe => 1,
+                .fast, .small => 3,
+            },
+            .downgrade_major = 14,
+            .downgrade_minor = 0,
+        };
+
+        var air_bitcode: [*]u8 = undefined;
+        var air_bitcode_len: usize = undefined;
+        var air_error: ?[*:0]u8 = null;
+        if (bindings.air.lower(module, &air_options, &air_bitcode, &air_bitcode_len, &air_error) != 0) {
+            defer if (air_error) |message| bindings.air.disposeMessage(message);
+            return diags.fail("the AIR pass failed: {s}", .{
+                if (air_error) |message| std.mem.span(message) else "(no message)",
+            });
+        }
+        defer bindings.air.disposeBytes(air_bitcode);
+        assert(air_bitcode_len != 0);
+
+        if (options.post_bc_path) |path| {
+            var file = Io.Dir.cwd().createFile(io, path, .{}) catch |err|
+                return diags.fail("failed to create '{s}': {t}", .{ path, err });
+            defer file.close(io);
+            file.writeStreamingAll(io, air_bitcode[0..air_bitcode_len]) catch |err|
+                return diags.fail("failed to write to '{s}': {t}", .{ path, err });
+        }
+
+        const bin_path = options.bin_path orelse return;
+
+        // Metal's own compiler stores the 20-byte module section header of an `.air` file inside
+        // the library, and the runtime fails to copy the bitcode of a function whose module
+        // arrives without it (doc/proposals/metal.md section 5). LLVM's bitcode writer already
+        // emits that header for the apple/macosx triple the AIR module carries, so it is only
+        // added when it is missing: two headers in one library would be a corrupt module.
+        const module_section_magic = [_]u8{ 0xde, 0xc0, 0x17, 0x0b }; // `0x0b17c0de`, LE
+        const air_bitcode_bytes = air_bitcode[0..air_bitcode_len];
+        const wrapped: ?[]u8 = if (std.mem.startsWith(u8, air_bitcode_bytes, &module_section_magic))
+            null
+        else
+            try metallib.wrapModule(o.gpa, air_bitcode_bytes);
+        defer if (wrapped) |bytes| o.gpa.free(bytes);
+        const module_bytes = wrapped orelse air_bitcode_bytes;
+
+        // One function in the library per kernel of this module, in the order the kernels were
+        // lowered: a Metal host resolves them by the exported name.
+        const functions = try o.gpa.alloc(metallib.Function, o.air_kernels.items.len);
+        defer o.gpa.free(functions);
+        for (functions, o.air_kernels.items) |*function, kernel| function.* = .{
+            .name = kernel.global.name(&o.builder).slice(&o.builder).?,
+        };
+
+        const image = try metallib.write(o.gpa, module_bytes, .{
+            .functions = functions,
+            .versions = .{
+                .air = versions.air,
+                .metal = versions.metal,
+                .format = versions.metallib,
+                .platform = .{ @intCast(macos.major), @intCast(macos.minor), @intCast(macos.patch) },
+            },
+        });
+        defer o.gpa.free(image);
+
+        var file = Io.Dir.cwd().createFile(io, bin_path, .{}) catch |err|
+            return diags.fail("failed to create '{s}': {t}", .{ bin_path, err });
+        defer file.close(io);
+        file.writeStreamingAll(io, image) catch |err|
+            return diags.fail("failed to write to '{s}': {t}", .{ bin_path, err });
+    }
+
     pub fn updateFunc(
         o: *Object,
         pt: Zcu.PerThread,
@@ -884,7 +1222,7 @@ pub const Object = struct {
             } }, &o.builder);
         }
 
-        const file, const subprogram = if (!owner_mod.strip) debug_info: {
+        const file, const subprogram = if (!owner_mod.strip and !o.builder.strip) debug_info: {
             const file = try o.getDebugFile(file_scope);
 
             const line_number = zcu.navSrcLine(func.owner_nav) + 1;
@@ -1149,7 +1487,7 @@ pub const Object = struct {
                 break :tl .default;
             }, &o.builder);
 
-            if (!mod.strip) {
+            if (!mod.strip and !o.builder.strip) {
                 const debug_file = try o.getDebugFile(file_scope);
                 const debug_global_var_expr = try o.builder.debugGlobalVarExpression(
                     try o.builder.debugGlobalVar(
@@ -1245,7 +1583,8 @@ pub const Object = struct {
         }
 
         const arch = comp.root_mod.resolved_target.result.cpu.arch;
-        const workaround_alias_bugs = arch == .amdgcn or arch == .nvptx or arch == .nvptx64;
+        const workaround_alias_bugs = arch == .amdgcn or arch == .nvptx or arch == .nvptx64 or
+            arch == .air64;
 
         const llvm_global_ty = llvm_global.typeOf(&o.builder);
 
@@ -1267,6 +1606,10 @@ pub const Object = struct {
             // WORKAROUND (see https://github.com/llvm/llvm-project/issues/213504, https://github.com/llvm/llvm-project/issues/214835)
             // For NVPTX, LLVM throws "NVPTX aliasee must be a non-kernel function definition" if we try to alias a kernel
             // On AMDGCN, LLVM does not generate an alias for the kernel descriptor symbol on associated functions
+            // AIR has no aliases either, and it names a kernel by the name of its own function:
+            // Apple's kernel is `define void @vadd(...)` and `!air.kernel` points at that
+            // function, which is the name a Metal host asks for as well (doc/proposals/metal.md
+            // section 2.4). So this global carries the exported name itself.
             // To solve these, we rename the global
             if (workaround_alias_bugs) {
                 // The name may already belong to an extern declaration of the same symbol, such as
@@ -4375,6 +4718,10 @@ pub fn toLlvmCallConvTag(cc_tag: std.lang.CallingConvention.Tag, target: *const 
         .amdgcn_cs => .amdgpu_cs,
         .nvptx_device => .ptx_device,
         .nvptx_kernel => .ptx_kernel,
+        // AIR kernels are `ccc` functions: Apple's frontend emits `define void @k(...)` with the
+        // default convention and marks the kernels with `!air.kernel` instead. The ordinary
+        // functions of the target are `ccc` for the same reason.
+        .metal_kernel, .metal_device => .ccc,
         .loongarch32_preserve_none => .preserve_nonecc,
         .loongarch64_preserve_none => .preserve_nonecc,
 
@@ -4466,6 +4813,17 @@ pub fn toLlvmCallConvTag(cc_tag: std.lang.CallingConvention.Tag, target: *const 
 /// Convert a zig-address space to an llvm address space.
 pub fn toLlvmAddressSpace(address_space: std.lang.AddressSpace, target: *const std.Target) Builder.AddrSpace {
     return switch (target.cpu.arch) {
+        .air64 => switch (address_space) {
+            // Apple's AIR address spaces, LLVM has no backend that names them
+            // (`doc/proposals/metal.md` section 2.3). Function-local memory stays in the
+            // generic space, which is what Apple's own frontend emits.
+            .generic => air64_addr_space.generic,
+            .global => air64_addr_space.device,
+            .constant => air64_addr_space.constant,
+            .shared => air64_addr_space.threadgroup,
+            .local => air64_addr_space.thread,
+            else => unreachable,
+        },
         .amdgcn => switch (address_space) {
             .generic => Builder.AddrSpace.amdgpu.flat,
             .global => Builder.AddrSpace.amdgpu.global,
@@ -4506,6 +4864,23 @@ pub fn toLlvmAddressSpace(address_space: std.lang.AddressSpace, target: *const s
         },
     };
 }
+
+/// Apple's AIR address spaces. `Builder.AddrSpace` has no names for them because LLVM has no
+/// AIR backend; the numbering is the one Apple's toolchain and Metal.jl both use
+/// (`doc/proposals/metal.md` section 2.3). Note that pointers are 64-bit in every one of these
+/// address spaces, unlike NVPTX's and AMDGPU's 32-bit shared/threadgroup pointers.
+pub const air64_addr_space = struct {
+    /// Function-local and flat memory.
+    pub const generic: Builder.AddrSpace = @fromBackingInt(0);
+    /// Device memory: kernel buffer arguments.
+    pub const device: Builder.AddrSpace = @fromBackingInt(1);
+    /// `constant` memory: constant buffers, and the scalars bound with `setBytes:`.
+    pub const constant: Builder.AddrSpace = @fromBackingInt(2);
+    /// Threadgroup memory.
+    pub const threadgroup: Builder.AddrSpace = @fromBackingInt(3);
+    /// Per-thread memory.
+    pub const thread: Builder.AddrSpace = @fromBackingInt(4);
+};
 
 /// On some targets, global values that are in the generic address space must be generated into a
 /// different address space, and then cast back to the generic address space.
@@ -4549,6 +4924,10 @@ pub fn initializeLLVMTarget(io: Io, arch: std.Target.Cpu.Arch) void {
     defer target_registry_mutex.unlock(io);
 
     switch (arch) {
+        // LLVM has no AIR backend: Apple's toolchain does instruction selection, so the air64
+        // target only ever produces LLVM IR. `emit` therefore never looks up a target or
+        // creates a `TargetMachine` for it. See `doc/proposals/metal.md` section 6.3.
+        .air64 => {},
         .aarch64, .aarch64_be => {
             bindings.LLVMInitializeAArch64Target();
             bindings.LLVMInitializeAArch64TargetInfo();

@@ -2300,6 +2300,7 @@ pub const TargetQuery = struct {
     pub const CpuArch = enum(u6) {
         aarch64,
         aarch64_be,
+        air64,
         alpha,
         amdgcn,
         arc,
@@ -2448,6 +2449,7 @@ pub const TargetQuery = struct {
         elf,
         hex,
         macho,
+        metallib,
         plan9,
         raw,
         spirv,

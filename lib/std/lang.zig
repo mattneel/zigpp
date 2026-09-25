@@ -179,6 +179,7 @@ pub const CallingConvention = union(enum(u8)) {
     pub const kernel: CallingConvention = switch (builtin.target.cpu.arch) {
         .amdgcn => .amdgcn_kernel,
         .nvptx, .nvptx64 => .nvptx_kernel,
+        .air64 => .metal_kernel,
         .spirv32, .spirv64 => .{ .spirv_kernel = .{ .x = 1, .y = 1, .z = 1 } },
         else => unreachable,
     };
@@ -380,6 +381,19 @@ pub const CallingConvention = union(enum(u8)) {
     // Calling conventions for the `nvptx` and `nvptx64` architectures.
     nvptx_device,
     nvptx_kernel,
+
+    /// The calling convention of a Metal kernel on the `air64` architecture: the C calling
+    /// convention of a `void`-returning function whose arguments are pointers into the device
+    /// (1) or constant (2) address spaces, followed by value arguments for the kernel's
+    /// builtins (`doc/proposals/metal.md` section 2.4).
+    metal_kernel,
+
+    /// The calling convention of an ordinary function on the `air64` architecture, which is the
+    /// C calling convention of the target: every function that is not a kernel. AIR has no
+    /// separate device convention — kernels and other functions are both `ccc` — so what makes a
+    /// kernel is `metal_kernel` here and the `!air.kernel` metadata in the module, not the
+    /// convention.
+    metal_device,
 
     // Calling conventions for kernels and shaders on the `spirv32` and `spirv64` architectures.
     spirv_device,

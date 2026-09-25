@@ -94,11 +94,22 @@ fn subArchName(target: *const std.Target, comptime family: std.Target.Cpu.Arch.F
     return null;
 }
 
+/// The macOS release whose AIR / Metal / metallib versions an `air64` target must be compiled
+/// for. Targets that do not name a version use the oldest version table row.
+fn macosMajorVersion(target: *const std.Target) u16 {
+    return switch (target.os.versionRange()) {
+        .semver => |ver| @intCast(ver.min.major),
+        .none, .windows, .linux, .hurd => 0,
+    };
+}
+
 pub fn tripleForTarget(allocator: Allocator, target: *const std.Target) ![]const u8 {
     var llvm_triple = std.array_list.Managed(u8).init(allocator);
     defer llvm_triple.deinit();
 
-    const llvm_arch = switch (target.cpu.arch) {
+    // The AIR triple's architecture component carries the AIR version, so unlike every other
+    // architecture it has to be built from the deployment target rather than being a constant.
+    const llvm_arch: []const u8 = switch (target.cpu.arch) {
         .arm => "arm",
         .armeb => "armeb",
         .aarch64 => if (target.abi == .ilp32) "aarch64_32" else "aarch64",
@@ -147,6 +158,13 @@ pub fn tripleForTarget(allocator: Allocator, target: *const std.Target) ![]const
         .wasm32 => "wasm32",
         .wasm64 => "wasm64",
         .ve => "ve",
+
+        .air64 => air: {
+            const air_ver = std.Target.air64.versionsForMacos(macosMajorVersion(target)).air;
+            break :air try std.fmt.allocPrint(allocator, "air64_v{d}{d}", .{
+                air_ver[0], air_ver[1],
+            });
+        },
 
         .alpha,
         .arceb,
@@ -321,9 +339,11 @@ pub fn tripleForTarget(allocator: Allocator, target: *const std.Target) ![]const
             ver.range.min.patch,
         }),
     }
-    try llvm_triple.append('-');
 
-    const llvm_abi = switch (target.abi) {
+    // An AIR triple has no environment component: Apple's toolchain emits
+    // `air64_v28-apple-macosx26.0.0` with nothing after the deployment target, and the AIR
+    // reader is an LLVM-14-era reader.
+    const llvm_abi: ?[]const u8 = if (target.cpu.arch == .air64) null else switch (target.abi) {
         .none => if (target.os.tag == .maccatalyst) "macabi" else "unknown",
         .gnu => "gnu",
         .gnuabin32 => "gnuabin32",
@@ -359,7 +379,10 @@ pub fn tripleForTarget(allocator: Allocator, target: *const std.Target) ![]const
         .ohos, .ohoseabi => "ohos",
         .call0 => "unknown",
     };
-    try llvm_triple.appendSlice(llvm_abi);
+    if (llvm_abi) |abi| {
+        try llvm_triple.append('-');
+        try llvm_triple.appendSlice(abi);
+    }
 
     switch (target.os.versionRange()) {
         .none,
@@ -487,6 +510,9 @@ pub const DataLayout = struct {
                 "e-m:e-Fn32-i64:64-i128:128-n32:64-S128-v256:256:256-v512:512:512"
             else
                 "e-m:e-Fn32-i64:64-i128:128-n32:64",
+            // AIR has no per-address-space pointer widths: pointers are 64-bit in every address
+            // space, including threadgroup (3) (`doc/proposals/metal.md` section 2.2).
+            .air64 => "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32",
             .nvptx => "e-p:32:32-p6:32:32-p7:32:32-i64:64-i128:128-i256:256-v16:16-v32:32-n16:32:64",
             .nvptx64 => "e-p6:32:32-i64:64-i128:128-i256:256-v16:16-v32:32-n16:32:64",
             .amdgcn => "e-m:e-p:64:64-p1:64:64-p2:32:32-p3:32:32-p4:64:64-p5:32:32-p6:32:32-p7:160:256:256:32-p8:128:128:128:48-p9:192:256:256:32-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-v2048:2048-n32:64-S32-A5-G1-ni:7:8:9",

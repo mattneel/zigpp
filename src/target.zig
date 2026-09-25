@@ -19,6 +19,7 @@ pub fn canDynamicLink(target: *const std.Target) bool {
         .nvptx64,
         .spirv32,
         .spirv64,
+        .air64,
         => false,
         .wasm32,
         .wasm64,
@@ -196,6 +197,7 @@ pub fn hasLlvmSupport(target: *const std.Target, ofmt: std.Target.ObjectFormat) 
         .elf,
         .hex,
         .macho,
+        .metallib,
         .spirv,
         .raw,
         .wasm,
@@ -207,6 +209,7 @@ pub fn hasLlvmSupport(target: *const std.Target, ofmt: std.Target.ObjectFormat) 
         .armeb,
         .aarch64,
         .aarch64_be,
+        .air64,
         .arc,
         .avr,
         .bpfel,
@@ -410,6 +413,13 @@ pub fn classifyCompilerRtLibName(name: []const u8) CompilerRtClassification {
 pub fn hasDebugInfo(target: *const std.Target) bool {
     return switch (target.ofmt) {
         .raw, .hex => false,
+        // A Metal library holds AIR, which is LLVM IR, and the container has no room for the
+        // DWARF of an object file: what the compiler would emit there is the debug info of the
+        // module, which is Apple's own format and not something this target writes. The target
+        // says so here so that the module-level and object-level answers to "is this stripped"
+        // agree: `Builder.strip` is true for every object format without debug info, and the
+        // emitter's debug-info paths assert exactly that.
+        .metallib => false,
         else => switch (target.cpu.arch) {
             // TODO: We should make newer PTX versions depend on older ones so we'd just check `ptx75`.
             .nvptx, .nvptx64 => target.cpu.hasAny(.nvptx, &.{
@@ -453,6 +463,8 @@ pub fn canBuildLibCompilerRt(target: *const std.Target) enum { no, yes, llvm_onl
     switch (target.cpu.arch) {
         .spirv32, .spirv64 => return .no,
         .spork8 => return .no,
+        // AIR modules carry compiler-rt with them; there is nothing to link against.
+        .air64 => return .no,
         // Remove this once https://github.com/ziglang/zig/issues/23714 is fixed
         .amdgcn => return .no,
         else => {},
@@ -469,7 +481,7 @@ pub fn canBuildLibCompilerRt(target: *const std.Target) enum { no, yes, llvm_onl
 /// build as a library for AMDGPU (https://github.com/ziglang/zig/issues/23714).
 pub fn bundlesCompilerRt(target: *const std.Target) bool {
     return switch (target.cpu.arch) {
-        .nvptx, .nvptx64, .amdgcn => true,
+        .nvptx, .nvptx64, .amdgcn, .air64 => true,
         else => false,
     };
 }
@@ -478,6 +490,7 @@ pub fn canBuildLibUbsanRt(target: *const std.Target) enum { no, yes, llvm_only, 
     switch (target.cpu.arch) {
         .spork8 => return .no,
         .spirv32, .spirv64 => return .no,
+        .air64 => return .no,
         // Remove this once https://github.com/ziglang/zig/issues/23715 is fixed
         .nvptx, .nvptx64 => return .no,
         else => {},
@@ -641,7 +654,7 @@ pub fn addrSpaceCastIsValid(
 ) bool {
     switch (target.cpu.arch) {
         .x86_64, .x86 => return target.supportsAddressSpace(from, null) and target.supportsAddressSpace(to, null),
-        .nvptx64, .nvptx, .amdgcn => {
+        .nvptx64, .nvptx, .amdgcn, .air64 => {
             const to_generic = target.supportsAddressSpace(from, null) and to == .generic;
             const from_generic = target.supportsAddressSpace(to, null) and from == .generic;
             return to_generic or from_generic;
@@ -948,6 +961,9 @@ pub fn fnCallConvAllowsZigTypes(cc: std.lang.CallingConvention) bool {
         // we end up exposing the ABI. The goal is to experiment with more
         // integrated CPU/GPU code.
         .nvptx_kernel => true,
+        // Same reasoning as `.nvptx_kernel`: Metal kernels pass their arguments
+        // through buffers, so the ABI is the compiler's to choose.
+        .metal_kernel => true,
         else => false,
     };
 }

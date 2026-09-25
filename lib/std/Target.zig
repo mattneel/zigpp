@@ -768,6 +768,7 @@ pub const Os = struct {
 };
 
 pub const aarch64 = @import("Target/aarch64.zig");
+pub const air64 = @import("Target/air64.zig");
 pub const alpha = @import("Target/alpha.zig");
 pub const amdgcn = @import("Target/amdgcn.zig");
 pub const arc = @import("Target/arc.zig");
@@ -1055,6 +1056,8 @@ pub const ObjectFormat = enum {
     hex,
     /// The Mach object format used by macOS and other Apple platforms.
     macho,
+    /// Apple's Metal library container, holding AIR LLVM bitcode for the `air64` architecture.
+    metallib,
     /// The a.out format used by Plan 9 from Bell Labs.
     plan9,
     /// Machine code with no metadata.
@@ -1070,6 +1073,7 @@ pub const ObjectFormat = enum {
             .coff => ".obj",
             .elf, .macho, .wasm => ".o",
             .hex => ".ihex",
+            .metallib => ".metallib",
             .plan9 => arch.plan9Ext(),
             .raw => ".bin",
             .spirv => ".spv",
@@ -1077,6 +1081,9 @@ pub const ObjectFormat = enum {
     }
 
     pub fn default(os_tag: Os.Tag, arch: Cpu.Arch) ObjectFormat {
+        // A metallib container is the only thing AIR modules can be put in, whatever the OS.
+        if (arch == .air64) return .metallib;
+
         return switch (os_tag) {
             .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => .macho,
             .plan9 => .plan9,
@@ -1128,6 +1135,7 @@ pub fn toElfMachine(target: *const Target) std.elf.EM {
         .xcore => .XCORE,
         .xtensa, .xtensaeb => .XTENSA,
 
+        .air64,
         .nvptx,
         .nvptx64,
         .spirv32,
@@ -1158,6 +1166,7 @@ pub fn toCoffMachine(target: *const Target) std.coff.IMAGE.FILE.MACHINE {
         .x86_64 => .AMD64,
 
         .aarch64_be,
+        .air64,
         .amdgcn,
         .arc,
         .arceb,
@@ -1362,6 +1371,7 @@ pub const Cpu = struct {
     pub const Arch = enum {
         aarch64,
         aarch64_be,
+        air64,
         alpha,
         amdgcn,
         arc,
@@ -1427,6 +1437,7 @@ pub const Cpu = struct {
         /// containing CPU model and feature data.
         pub const Family = enum {
             aarch64,
+            air64,
             alpha,
             amdgcn,
             arc,
@@ -1466,6 +1477,7 @@ pub const Cpu = struct {
         pub inline fn family(arch: Arch) Family {
             return switch (arch) {
                 .aarch64, .aarch64_be => .aarch64,
+                .air64 => .air64,
                 .alpha => .alpha,
                 .amdgcn => .amdgcn,
                 .arc, .arceb => .arc,
@@ -1533,6 +1545,10 @@ pub const Cpu = struct {
                 .aarch64, .aarch64_be => true,
                 else => false,
             };
+        }
+
+        pub inline fn isAir64(arch: Arch) bool {
+            return arch == .air64;
         }
 
         pub inline fn isArc(arch: Arch) bool {
@@ -1696,6 +1712,18 @@ pub const Cpu = struct {
             };
         }
 
+        /// GPUs are the targets that run kernels: they have no libc, their kernels are exported
+        /// functions, and their modules carry their own compiler-rt rather than linking against
+        /// a separately built one. SPIR-V is deliberately not included: its modules are loaded
+        /// by whatever consumes the IR, and the SPIR-V backend implements the runtime functions
+        /// itself instead of bundling compiler-rt.
+        pub inline fn isGPU(arch: Arch) bool {
+            return switch (arch) {
+                .air64, .amdgcn, .nvptx, .nvptx64 => true,
+                else => false,
+            };
+        }
+
         pub fn parseCpuModel(arch: Arch, cpu_name: []const u8) ?*const Cpu.Model {
             for (arch.allCpuModels()) |cpu| {
                 if (std.mem.eql(u8, cpu_name, cpu.name)) {
@@ -1768,6 +1796,7 @@ pub const Cpu = struct {
                 => .big,
 
                 // GPU endianness is opaque. For now, assume little endian.
+                .air64,
                 .amdgcn,
                 .nvptx,
                 .nvptx64,
@@ -2021,6 +2050,10 @@ pub const Cpu = struct {
                 .spirv_task,
                 .spirv_mesh,
                 => &.{ .spirv32, .spirv64 },
+
+                .metal_kernel,
+                .metal_device,
+                => &.{.air64},
 
                 .ez80_cet,
                 .ez80_tiflags,
@@ -2293,6 +2326,10 @@ pub inline fn isWasiLibC(target: *const Target) bool {
 /// Does this target require linking libc? This may be the case if the target has an unstable
 /// syscall interface, for example.
 pub fn requiresLibC(target: *const Target) bool {
+    // AIR code runs on a GPU: there is no libc to link, whatever OS tag names the deployment
+    // target it is compiled for.
+    if (target.cpu.arch == .air64) return false;
+
     return switch (target.os.tag) {
         .illumos,
         .driverkit,
@@ -2381,8 +2418,11 @@ pub fn supportsAddressSpace(
 
     const is_nvptx = arch.isNvptx();
     const is_spirv = arch.isSpirV();
-    const is_gpu = is_nvptx or is_spirv or arch == .amdgcn;
+    const is_gpu = is_nvptx or is_spirv or arch == .amdgcn or arch.isAir64();
 
+    // The GPU targets map the address space names onto their own numbering; for air64 (Apple
+    // AIR) that is generic 0, global/device 1, constant 2, shared/threadgroup 3 and
+    // local/thread 4 (`doc/proposals/metal.md` section 2.3).
     return switch (address_space) {
         .generic => true,
         .fs, .gs, .ss => (arch == .x86_64 or arch == .x86 or arch == .x86_16) and (context == null or context == .pointer),
@@ -3036,6 +3076,7 @@ pub fn ptrBitWidth_arch_abi(cpu_arch: Cpu.Arch, abi: Abi) u16 {
 
         .aarch64,
         .aarch64_be,
+        .air64,
         .alpha,
         .amdgcn,
         .bpfeb,
@@ -3638,6 +3679,7 @@ pub fn cTypeAlignment(target: *const Target, c_type: CType) ?u16 {
             .xtensaeb,
             => 4,
 
+            .air64,
             .amdgcn,
             .arm,
             .armeb,
@@ -3745,6 +3787,7 @@ pub fn cMaxIntAlignment(target: *const Target) u16 {
 
         .aarch64,
         .aarch64_be,
+        .air64,
         .alpha,
         .amdgcn,
         .bpfel,
@@ -3839,6 +3882,9 @@ pub fn cCallingConvention(target: *const Target) ?std.builtin.CallingConvention 
         .xcore => .{ .xcore_xs1 = .{} },
         .xtensa, .xtensaeb => .{ .xtensa_call0 = .{} },
         .amdgcn => .{ .amdgcn_device = .{} },
+        // The C convention of an Apple GPU is the convention of an ordinary AIR function; the
+        // kernels are the ones that ask for `.metal_kernel`.
+        .air64 => .metal_device,
         .nvptx, .nvptx64 => .nvptx_device,
         .spirv32, .spirv64 => .spirv_device,
         .ez80 => .ez80_cet,
