@@ -17,6 +17,11 @@
 //!   the AIR rewrites, the downgrade to the bitcode format that Apple's reader wants, and the
 //!   container writer.
 //!
+//! `metal_kernels.zig` also has kernels that only Zig++ builds, because what they test is what it
+//! does to a module before Apple's compiler sees it (issue #18): the checked `usize` multiply of a
+//! Debug build, the 128-bit products and overflow flags of 64-bit multiplies, and tables of
+//! integers and of structs in the constant address space.
+//!
 //! The program is cross-compiled from Linux, where there is no Metal framework and no macOS SDK,
 //! and runs on the Mac:
 //!
@@ -33,8 +38,8 @@
 //!
 //! Every test prints one line, `--- PASS:`, `--- FAIL:` or `--- SKIP:`, and the last line is the
 //! summary, which starts with `PASS` or `FAIL`; the exit status is 1 when a test failed. A kernel
-//! that a library does not have is skipped rather than failed, so a library that holds one of the
-//! two kernels is still worth running.
+//! that a library does not have is skipped rather than failed, so a library that holds some of the
+//! kernels is still worth running.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -71,6 +76,64 @@ const reduce_name = "reduce";
 /// `count` elements. The kernels of the Metal Shading Language that Zig++ compiles take their
 /// scalars the same way.
 const scale_name = "scale";
+
+/// The kernel of an index computed with a `usize` multiply, a checked one in a Debug build:
+/// `out[row * cols + col] = row * cols + col`, over `index2d_rows` threadgroups of `index2d_cols`
+/// threads.
+const index2d_name = "index2d";
+const index2d_rows: u32 = 8;
+const index2d_cols: u32 = 32;
+
+/// The kernel of the multiplies of 64-bit integers that need the high half of the product.
+const mulwide_name = "mulwide";
+const mulwide_block: u32 = 64;
+
+/// The pairs of the `mulwide` test that sit on the edges of the unsigned and the signed
+/// overflow checks; pseudo-random pairs follow them.
+const mulwide_edges = [_][2]u64{
+    .{ 0, 0 },
+    .{ 5, 0 }, // a product of zero never overflows
+    .{ 0, 5 },
+    .{ 1, 1 },
+    .{ 3, 1 << 63 }, // wraps to 2^63: an unsigned overflow that is not below either operand
+    .{ 1 << 32, 1 << 32 }, // exactly 2^64
+    .{ (1 << 32) - 1, (1 << 32) + 1 }, // 2^64 - 1: the largest product that fits
+    .{ std.math.maxInt(u64), std.math.maxInt(u64) }, // signed: -1 * -1
+    .{ std.math.maxInt(u64), 1 },
+    .{ 1 << 62, 2 }, // 2^63: a signed overflow only
+    .{ @bitCast(@as(i64, -(1 << 62))), 2 }, // -2^63: fits in an i64
+    .{ 1 << 63, std.math.maxInt(u64) }, // signed: minInt(i64) * -1
+    .{ 1 << 63, 1 }, // signed: minInt(i64) * 1
+    .{ 0x123456789abcdef0, 0x0fedcba987654321 },
+    .{ 0xffffffff00000000, 0x00000000ffffffff },
+    .{ 0x8000000080000000, 0x7fffffff7fffffff },
+};
+const mulwide_len = 128;
+
+/// The kernel of program-scope constant tables, the tables themselves and the function of them
+/// that it computes (copies of those of `metal_kernels.zig`, which this program cannot import:
+/// its kernels are exported for the GPU), and its number of threads.
+const constant_tables_name = "constant_tables";
+const table_primes = [_]u32{ 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53 };
+const table_wide = [_]u64{
+    0x0123456789abcdef, 0xfedcba9876543210, 0x8000000000000001, 0xffffffffffffffff,
+    1,                  0,                  0x00000000ffffffff, 0xffffffff00000000,
+};
+const Step = struct { scale: u32, bias: u32, shift: u8 };
+const table_steps = [_]Step{
+    .{ .scale = 3, .bias = 7, .shift = 1 },
+    .{ .scale = 5, .bias = 0, .shift = 0 },
+    .{ .scale = 0xffff, .bias = 0xdeadbeef, .shift = 7 },
+    .{ .scale = 1, .bias = 1, .shift = 31 },
+    .{ .scale = 12345, .bias = 678, .shift = 3 },
+};
+fn tableValue(i: u32) u32 {
+    const wide = table_wide[i % table_wide.len];
+    const step = table_steps[i % table_steps.len];
+    const mixed = table_primes[i % table_primes.len] *% @as(u32, @truncate(wide >> @intCast(i % 64)));
+    return (mixed +% step.scale *% i +% step.bias) >> @intCast(step.shift);
+}
+const constant_tables_len = 256;
 
 /// The library of the reference kernels has no kernel of a name that the tests above use, so the
 /// name of this one is not in any library: it is what the test of a missing function asks for.
@@ -334,6 +397,150 @@ fn testScale(run: *Run, report: *Report, context: metal.Context, module: metal.M
     try report.pass("scale: {d} f32 scaled by {d} through setBytes:length:atIndex:", .{ len, factor });
 }
 
+/// `index2d`: `index2d_rows` threadgroups of `index2d_cols` threads, each writing its own index,
+/// which the kernel computes with a `usize` multiply: every element must hold its index.
+fn testIndex2d(run: *Run, report: *Report, context: metal.Context, module: metal.Module) !void {
+    const function = (try findFunction(module, report, index2d_name)) orelse return;
+    defer function.release();
+    const pipeline = (try compilePipeline(function, report, run, index2d_name)) orelse return;
+    defer pipeline.release();
+
+    const len = index2d_rows * index2d_cols;
+    var out: [len]u32 = @splat(std.math.maxInt(u32));
+    const buffer = try context.alloc(u32, len);
+    defer buffer.free();
+    buffer.copyFromHost(&out);
+
+    try pipeline.launch(.{
+        .grid = .{ .x = index2d_rows },
+        .block = .{ .x = index2d_cols },
+    }, .{ buffer, index2d_cols });
+    try context.synchronize();
+    buffer.copyToHost(&out);
+
+    for (out, 0..) |actual, i| {
+        if (actual != i) return report.fail("index2d: element {d}: expected {d}, got {d}", .{ i, i, actual });
+    }
+    try report.pass("index2d: {d} threadgroups of {d} threads, out[row * cols + col] with a usize multiply", .{
+        index2d_rows, index2d_cols,
+    });
+}
+
+/// `mulwide`: the halves of the products of 64-bit integers and the overflow flags of their
+/// checked multiplies, on the edges in `mulwide_edges` and on pseudo-random pairs, each compared
+/// bit for bit with the same arithmetic on the CPU.
+fn testMulwide(run: *Run, report: *Report, context: metal.Context, module: metal.Module) !void {
+    const function = (try findFunction(module, report, mulwide_name)) orelse return;
+    defer function.release();
+    const pipeline = (try compilePipeline(function, report, run, mulwide_name)) orelse return;
+    defer pipeline.release();
+
+    var a: [mulwide_len]u64 = undefined;
+    var b: [mulwide_len]u64 = undefined;
+    var prng: std.Random.DefaultPrng = .init(0x5eed_2026);
+    const random = prng.random();
+    for (&a, &b, 0..) |*x, *y, i| {
+        if (i < mulwide_edges.len) {
+            x.*, y.* = mulwide_edges[i];
+        } else {
+            x.* = random.int(u64);
+            // Every other pair has a narrow second operand, which overflows less often.
+            y.* = if (i % 2 == 0) random.int(u64) else random.int(u32);
+        }
+    }
+
+    var hi: [mulwide_len]u64 = @splat(0);
+    var lo: [mulwide_len]u64 = @splat(0);
+    var shi: [mulwide_len]u64 = @splat(0);
+    var wrapped: [mulwide_len]u64 = @splat(0);
+    var flags: [mulwide_len]u32 = @splat(0);
+    const buffer_a = try context.alloc(u64, mulwide_len);
+    defer buffer_a.free();
+    const buffer_b = try context.alloc(u64, mulwide_len);
+    defer buffer_b.free();
+    const buffer_hi = try context.alloc(u64, mulwide_len);
+    defer buffer_hi.free();
+    const buffer_lo = try context.alloc(u64, mulwide_len);
+    defer buffer_lo.free();
+    const buffer_shi = try context.alloc(u64, mulwide_len);
+    defer buffer_shi.free();
+    const buffer_wrapped = try context.alloc(u64, mulwide_len);
+    defer buffer_wrapped.free();
+    const buffer_flags = try context.alloc(u32, mulwide_len);
+    defer buffer_flags.free();
+    buffer_a.copyFromHost(&a);
+    buffer_b.copyFromHost(&b);
+
+    try pipeline.launch(metal.LaunchConfig.linear(mulwide_len, mulwide_block), .{
+        buffer_a,   buffer_b,       buffer_hi,    buffer_lo,
+        buffer_shi, buffer_wrapped, buffer_flags, @as(u32, mulwide_len),
+    });
+    try context.synchronize();
+    buffer_hi.copyToHost(&hi);
+    buffer_lo.copyToHost(&lo);
+    buffer_shi.copyToHost(&shi);
+    buffer_wrapped.copyToHost(&wrapped);
+    buffer_flags.copyToHost(&flags);
+
+    var unsigned_overflows: usize = 0;
+    var signed_overflows: usize = 0;
+    for (a, b, 0..) |x, y, i| {
+        const product = @as(u128, x) * y;
+        const sx: i64 = @bitCast(x);
+        const sy: i64 = @bitCast(y);
+        const signed_product = @as(i128, sx) * sy;
+        const unsigned_check = @mulWithOverflow(x, y);
+        const signed_check = @mulWithOverflow(sx, sy);
+        const want_hi: u64 = @truncate(product >> 64);
+        const want_lo: u64 = @truncate(product);
+        const want_shi: u64 = @bitCast(@as(i64, @truncate(signed_product >> 64)));
+        const want_flags = @as(u32, unsigned_check[1]) | @as(u32, signed_check[1]) << 1;
+        unsigned_overflows += unsigned_check[1];
+        signed_overflows += signed_check[1];
+        if (hi[i] != want_hi or lo[i] != want_lo or shi[i] != want_shi or
+            wrapped[i] != unsigned_check[0] or flags[i] != want_flags)
+        {
+            return report.fail(
+                "mulwide: pair {d}, 0x{x} * 0x{x}: expected hi 0x{x} lo 0x{x} signed hi 0x{x} wrapped 0x{x} flags {b:0>3}, got hi 0x{x} lo 0x{x} signed hi 0x{x} wrapped 0x{x} flags {b:0>3}",
+                .{ i, x, y, want_hi, want_lo, want_shi, unsigned_check[0], want_flags, hi[i], lo[i], shi[i], wrapped[i], flags[i] },
+            );
+        }
+    }
+    try report.pass("mulwide: {d} pairs of 64-bit integers, 128-bit products and checked multiplies ({d} unsigned and {d} signed overflows) bit for bit", .{
+        mulwide_len, unsigned_overflows, signed_overflows,
+    });
+}
+
+/// `constant_tables`: one thread per element, each reading tables of integers and of structs in
+/// the constant address space, compared with the same reads on the CPU.
+fn testConstantTables(run: *Run, report: *Report, context: metal.Context, module: metal.Module) !void {
+    const function = (try findFunction(module, report, constant_tables_name)) orelse return;
+    defer function.release();
+    const pipeline = (try compilePipeline(function, report, run, constant_tables_name)) orelse return;
+    defer pipeline.release();
+
+    var out: [constant_tables_len]u32 = @splat(0);
+    const buffer = try context.alloc(u32, constant_tables_len);
+    defer buffer.free();
+    buffer.copyFromHost(&out);
+
+    try pipeline.launch(metal.LaunchConfig.linear(constant_tables_len, 64), .{
+        buffer, @as(u32, constant_tables_len),
+    });
+    try context.synchronize();
+    buffer.copyToHost(&out);
+
+    for (out, 0..) |actual, i| {
+        const expected = tableValue(@intCast(i));
+        if (actual != expected) {
+            return report.fail("constant_tables: element {d}: expected {d}, got {d}", .{ i, expected, actual });
+        }
+    }
+    try report.pass("constant_tables: {d} reads of tables of integers and of structs in the constant address space", .{
+        constant_tables_len,
+    });
+}
+
 /// The bytes that are not a `.metallib`, for the test of a library that the framework cannot read.
 const not_a_library = "these are not the bytes of the container of a library of kernels";
 
@@ -463,6 +670,9 @@ fn runLibrary(out: *Io.Writer, run: *Run, path: []const u8, bytes: []const u8) !
     try testVadd(run, &report, context, module);
     try testReduce(run, &report, context, module);
     try testScale(run, &report, context, module);
+    try testIndex2d(run, &report, context, module);
+    try testMulwide(run, &report, context, module);
+    try testConstantTables(run, &report, context, module);
     try report.summary();
     return report.failures == 0;
 }

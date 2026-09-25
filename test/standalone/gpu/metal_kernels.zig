@@ -3,6 +3,11 @@
 //! add, the reduction and the kernel with scalar parameters, with the same names, the same
 //! arguments in the same order, and the same binding of every argument.
 //!
+//! Three kernels have no counterpart in `metal_kernels.metal`, because what they test is what
+//! this compiler does to a module before Apple's compiler sees it: `index2d`, `mulwide` and
+//! `constant_tables` need the high half of 64-bit multiplies and program-scope constant tables,
+//! which Apple's GPU compiler handles only in the form the backend rewrites them into.
+//!
 //! ```sh
 //! zig build-obj -target air64-macos -O ReleaseFast -femit-bin=vadd.metallib metal_kernels.zig
 //! ```
@@ -103,4 +108,91 @@ export fn scale(
     const i = gpu.globalId(.x);
     if (i >= count) return;
     x[i] = x[i] * factor;
+}
+
+/// One element per thread of a grid of threadgroups of `cols` threads: `out[i] = i`, with the
+/// index `row * cols + col` computed in `usize`.
+///
+/// In a Debug build that multiply is checked for overflow, and the check needs the high 64 bits
+/// of the product, which Apple's GPU compiler cannot produce itself: its compiler service dies
+/// instead (issue #18). The compiler rebuilds the check out of 32-bit multiplies, and this is the
+/// kernel that shows an ordinary `usize` multiply of a Debug kernel running.
+export fn index2d(
+    out: [*]addrspace(.global) u32,
+    cols: u32,
+) callconv(.kernel) void {
+    const row: usize = gpu.blockIdx(.x);
+    const col: usize = gpu.threadIdx(.x);
+    const index = row * cols + col;
+    out[index] = @intCast(index);
+}
+
+/// The multiplies of 64-bit integers that need the high half of the 128-bit product, for each
+/// pair `a[i]`, `b[i]` of the first `count`: the high and the low half of the unsigned product,
+/// the high half of the signed product, the wrapped product of `@mulWithOverflow`, and, in `flags`,
+/// the overflow bit of `@mulWithOverflow` on `u64` (bit 0) and on `i64` (bit 1), plus bit 2 when
+/// the two wrapped products differ, which they never should. The host compares each one bit for
+/// bit with the CPU.
+export fn mulwide(
+    a: [*]addrspace(.global) const u64,
+    b: [*]addrspace(.global) const u64,
+    hi: [*]addrspace(.global) u64,
+    lo: [*]addrspace(.global) u64,
+    shi: [*]addrspace(.global) u64,
+    wrapped: [*]addrspace(.global) u64,
+    flags: [*]addrspace(.global) u32,
+    count: u32,
+) callconv(.kernel) void {
+    const i = gpu.globalId(.x);
+    if (i >= count) return;
+    const x = a[i];
+    const y = b[i];
+
+    const product = @as(u128, x) * y;
+    hi[i] = @truncate(product >> 64);
+    lo[i] = @truncate(product);
+
+    const sx: i64 = @bitCast(x);
+    const sy: i64 = @bitCast(y);
+    const signed_product = @as(i128, sx) * sy;
+    shi[i] = @bitCast(@as(i64, @truncate(signed_product >> 64)));
+
+    const unsigned_check = @mulWithOverflow(x, y);
+    const signed_check = @mulWithOverflow(sx, sy);
+    wrapped[i] = unsigned_check[0];
+    const differ = @as(u64, @bitCast(signed_check[0])) != unsigned_check[0];
+    flags[i] = @as(u32, unsigned_check[1]) | @as(u32, signed_check[1]) << 1 |
+        @as(u32, @intFromBool(differ)) << 2;
+}
+
+/// The tables of `constant_tables`, which `metal_host.zig` has copies of.
+pub const table_primes = [_]u32{ 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53 };
+pub const table_wide = [_]u64{
+    0x0123456789abcdef, 0xfedcba9876543210, 0x8000000000000001, 0xffffffffffffffff,
+    1,                  0,                  0x00000000ffffffff, 0xffffffff00000000,
+};
+pub const Step = struct { scale: u32, bias: u32, shift: u8 };
+pub const table_steps = [_]Step{
+    .{ .scale = 3, .bias = 7, .shift = 1 },
+    .{ .scale = 5, .bias = 0, .shift = 0 },
+    .{ .scale = 0xffff, .bias = 0xdeadbeef, .shift = 7 },
+    .{ .scale = 1, .bias = 1, .shift = 31 },
+    .{ .scale = 12345, .bias = 678, .shift = 3 },
+};
+
+/// Program-scope constants read at an index that each thread computes: tables of 32-bit and
+/// 64-bit integers, and of structs, which a Debug build copies out of the table whole. They
+/// live in the constant address space, where an Apple GPU keeps program-scope data (issue #18).
+pub fn tableValue(i: u32) u32 {
+    const wide = table_wide[i % table_wide.len];
+    const step = table_steps[i % table_steps.len];
+    const mixed = table_primes[i % table_primes.len] *% @as(u32, @truncate(wide >> @intCast(i % 64)));
+    return (mixed +% step.scale *% i +% step.bias) >> @intCast(step.shift);
+}
+
+/// `out[i] = tableValue(i)` for the first `count` elements.
+export fn constant_tables(out: [*]addrspace(.global) u32, count: u32) callconv(.kernel) void {
+    const i = gpu.globalId(.x);
+    if (i >= count) return;
+    out[i] = tableValue(i);
 }

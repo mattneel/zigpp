@@ -61,9 +61,17 @@ bool zigAirRewrite(llvm::Module &module, const ZigLLVMAirOptions &options, std::
 
 /* Retype the element-indexed GEPs on kernel buffer parameters to the buffer's element type
  * from `!air.kernel` (the type the host binds and the downgrader recovers pointer pointee
- * types from). Idempotent; run before and after the optimization pipeline, since the
- * pipeline's SROA is what turns Zig's staging allocas into GEPs on the parameters. */
+ * types from). Idempotent; run before the optimization pipeline and after the late
+ * lowerings, since SROA (the pipeline's, and the one moving constants runs) is what turns
+ * Zig's staging allocas into GEPs on the parameters. */
 void zigAirRetypeBufferGEPs(llvm::Module &module, std::string &err);
+
+/* The lowerings that must follow the optimization pipeline, because the pipeline would form
+ * again what they remove (src/zig_air_lower.cpp): program-scope constants move into the
+ * constant address space, with the calls that pointers derived from them cross inlined, and
+ * multiplies whose high 64 bits are needed, which Apple's GPU compiler cannot lower, become
+ * 32-bit pieces. On failure returns false and sets `err`. */
+bool zigAirLowerLate(llvm::Module &module, std::string &err);
 
 #endif // __cplusplus
 
