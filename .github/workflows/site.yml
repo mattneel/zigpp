@@ -199,6 +199,46 @@ jobs:
           echo "zigpp.lol" > _site/CNAME
           find _site -maxdepth 2 | sort
 
+      # The standard library docs and the language reference come from the
+      # release without the book's head, so a link to them would share no
+      # picture. They get the book's card: its image tags from head.hbs, with a
+      # title and an address of their own.
+      - name: Give every page the share card
+        run: |
+          python3 - <<'EOF'
+          import re
+
+          card = [
+              line for line in open("doc/book/theme/head.hbs")
+              if "og:image" in line or "twitter:" in line
+          ]
+          pages = {
+              "_site/std/index.html": (
+                  "The Zig++ standard library",
+                  "https://zigpp.lol/std/",
+                  "Documentation of the Zig++ standard library, from the newest release.",
+              ),
+              "_site/langref.html": (
+                  "The Zig++ language reference",
+                  "https://zigpp.lol/langref.html",
+                  "The language reference of the newest Zig++ release.",
+              ),
+          }
+          for path, (title, url, description) in pages.items():
+              html = open(path).read()
+              head = re.search(r"<head[^>]*>", html, re.IGNORECASE)
+              assert head, f"{path} has no <head>"
+              tags = [
+                  '<meta property="og:type" content="website">\n',
+                  '<meta property="og:site_name" content="The Zig++ Book">\n',
+                  f'<meta property="og:title" content="{title}">\n',
+                  f'<meta property="og:description" content="{description}">\n',
+                  f'<meta property="og:url" content="{url}">\n',
+              ] + card
+              open(path, "w").write(html[: head.end()] + "\n" + "".join(tags) + html[head.end() :])
+              print(f"{path}: {len(tags)} tags")
+          EOF
+
       - name: Configure Pages
         uses: actions/configure-pages@v6
 
