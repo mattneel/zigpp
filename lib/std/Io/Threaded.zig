@@ -3326,11 +3326,19 @@ fn batchApc(
 
 /// If `concurrency` is false, `error.ConcurrencyUnavailable` is unreachable.
 fn batchDrainSubmittedWindows(t: *Threaded, b: *Io.Batch, concurrency: bool) (Io.ConcurrentError || Io.Cancelable)!void {
-    var index = b.submitted.head;
-    errdefer b.submitted.head = index;
-    while (index != .none) {
+    // The first submission not yet taken off the list. An error while one is being started
+    // leaves that one completed as canceled, by the errdefer in the loop, and the ones after it
+    // still submitted, where `Batch.cancel` and `Batch.addAt` expect to find them.
+    var next_index = b.submitted.head;
+    errdefer {
+        b.submitted.head = next_index;
+        if (next_index == .none) b.submitted.tail = .none;
+    }
+    while (next_index != .none) {
+        const index = next_index;
         const storage = &b.storage[index.toIndex()];
         const submission = storage.submission;
+        next_index = submission.node.next;
         storage.* = .{ .pending = .{
             .node = .{ .prev = b.pending.tail, .next = .none },
             .tag = submission.operation,
@@ -3554,7 +3562,6 @@ fn batchDrainSubmittedWindows(t: *Threaded, b: *Io.Batch, concurrency: bool) (Io
                 });
             },
         }
-        index = submission.node.next;
     }
     b.submitted = .{ .head = .none, .tail = .none };
 }
