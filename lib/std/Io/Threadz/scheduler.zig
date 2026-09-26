@@ -934,7 +934,9 @@ pub fn Scheduler(comptime Backend: type) type {
             errdefer gpa.free(spares);
             const idle_stack = try mapStack(idle_stack_size);
             errdefer posix.munmap(idle_stack);
-            const idle_indexes = try gpa.alloc(u32, count);
+            // Workers and replacements both park, and a parked worker is recorded here by its
+            // index, which is past the workers' when it is a replacement.
+            const idle_indexes = try gpa.alloc(u32, count + count);
             errdefer gpa.free(idle_indexes);
             s.* = .{
                 .workers = workers,
@@ -3678,6 +3680,36 @@ test "watchdog: with one worker, what a blocked task queued still runs" {
     try std.testing.expect(stats.replacements >= 1);
     try std.testing.expectEqual(TestBackend.Sched.Stats.Kind.blocked, stats.last_stuck.?.kind);
     try std.testing.expectEqualStrings("blocker", stats.last_stuck.?.name);
+}
+
+test "cpu time: a thread blocked in the kernel reads as almost idle" {
+    // The watchdog tells a blocked worker from a computing one by its thread's CPU time, so a
+    // thread that waits in the kernel has to read as using almost none. This is the shape of the
+    // blocked worker the watchdog classifies: a task on worker 1 waiting in the kernel while the
+    // thread does nothing else, and the same readings the watchdog takes around it.
+    const b = try testBackend(2);
+    defer destroyTestBackend(b);
+    const io = b.io();
+
+    const S = struct {
+        fn wait(word: *std.atomic.Value(u32)) void {
+            Futex.wait(&word.raw, 0, 200 * std.time.ns_per_ms);
+        }
+    };
+    var word: std.atomic.Value(u32) = .init(0);
+    var future = try b.sched.concurrentWith(.{ .affinity = .{ .pinned = 1 } }, S.wait, .{&word});
+    testSleep(50 * std.time.ns_per_ms); // let the task reach its wait
+    const worker = &b.sched.workers[1];
+    const cpu_before = TestBackend.threadCpuTime(b, worker) orelse return error.SkipZigTest; // cannot say
+    const wall_before = testNow();
+    testSleep(100 * std.time.ns_per_ms);
+    const wall_after = testNow();
+    const cpu_after = TestBackend.threadCpuTime(b, worker) orelse return error.SkipZigTest;
+    future.await(io);
+    const cpu = cpu_after -| cpu_before;
+    const wall = wall_after -| wall_before;
+    // Well under the fifth of the wall time the watchdog calls blocked.
+    try std.testing.expect(cpu * 5 < wall);
 }
 
 test "watchdog: an idle instance has no rounds" {
