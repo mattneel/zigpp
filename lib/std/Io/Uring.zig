@@ -7107,6 +7107,11 @@ fn testWatchdog(
 ) !void {
     const testing = std.testing;
     if (workerLimit(ev) < 2) return error.SkipZigTest; // a worker to stick, and one to run elsewhere
+    // The deadline is what the acceptance asks for. ThreadSanitizer multiplies the cost of the
+    // work between the watchdog noticing and the queued tasks finishing by an order of magnitude,
+    // and the detection itself stays on the wall clock, so the margin has to grow with it there;
+    // the runs that pin the deadline are the unsanitized ones.
+    const deadline = if (builtin.sanitize_thread) limit_ns * 10 else limit_ns;
 
     var done: std.atomic.Value(u32) = .init(0);
     var started: std.atomic.Value(bool) = .init(false);
@@ -7120,10 +7125,10 @@ fn testWatchdog(
     while (!started.load(.acquire)) try testing.io.sleep(.fromMicroseconds(50), .awake);
     const start = testNow();
     while (done.load(.acquire) != queued) {
-        try testing.expect(testNow() - start < limit_ns);
+        try testing.expect(testNow() - start < deadline);
         try testing.io.sleep(.fromMicroseconds(200), .awake);
     }
-    try testing.expect(testNow() - start < limit_ns);
+    try testing.expect(testNow() - start < deadline);
     const snapshot = ev.stats();
     const stuck = snapshot.last_stuck orelse return error.TestUnexpectedResult;
     // The same task, name and kind are what the watchdog names in its log line, and only a
