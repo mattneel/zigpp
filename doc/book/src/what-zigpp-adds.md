@@ -188,6 +188,55 @@ const io = threadz.io();
   `.pinned` keeps it on one worker, for tasks that own that worker's
   resources. `.free` lets whichever worker is idle take it. `concurrentWith`
   and `groupConcurrentWith` take the affinity and the stack size of one task.
+- A task may complete 128 `Io` operations that nobody has to wait for before
+  the next one goes to the back of its worker's queue, with its affinity
+  unchanged. A worker takes the task it will run next, and a stuck worker's
+  slot for that task is the watchdog's to hand to the shared queue, so that a
+  worker pays no locked instruction for its own: the watchdog has the backend
+  issue a process-wide barrier, re-reads what that worker wrote at its last
+  switch, and takes the slot only when the worker has not switched since.
+  Counting operations without parking bounds what one task can take
+  from a worker without ever blocking on it, and the count starts over at every
+  park or yield. `scheduler.budget` is the 128.
+- Every task has an id, unique among the tasks the program made, and a name:
+  the function it was spawned with, from `Io.spawnedName`. A log line and, in
+  step 7, the task dump use them.
+- `Io.blocking(fn, args)` is for a call that blocks without making an `Io` call
+  of its own, such as a C library call or a raw syscall. It returns `fn`'s
+  result, errors and all. On Threadz it runs on a dirty pool, an `Io.Threaded`
+  instance the Threadz instance starts with the first such call, while the
+  calling task parks; the arguments and the result stay on the task's stack,
+  where the pool thread reads them and writes the result back. Sixteen calls
+  that each block for 200 ms finish in 205 ms, and the workers go on running
+  tasks while they block. The call is not cancelable once it has started:
+  a cancelation request takes effect at the calling task's next cancelation
+  point after it returns. `Io.Threaded`, and the implementations with no pool
+  of their own, make the call on the calling thread.
+- One watchdog thread per instance, started with the first task the instance
+  makes or runs, samples every worker every 10 ms. A worker whose current task
+  has not switched out for 100 ms is stuck. Two rounds ten milliseconds apart,
+  and the worker thread's CPU time between them, tell the kinds apart: a thread
+  that used less than a fifth of the wall time is blocked, in the kernel or in
+  a C call that never said it blocks, and its task is named in one `std.log`
+  warning scoped `.threadz`, with its id, the function it was spawned with, and how
+  long it has run; its queued tasks, including the ones others made runnable
+  for it and the one in its slot for the next task, become takeable by every
+  worker whatever their number; and one replacement worker is started for it,
+  so that parallelism stays, which stops once it has nothing to run and the
+  stuck worker switches out again. A thread that kept using its time is
+  computing, which is what a compiler task is: its queued work is taken just
+  the same, but no worker is replaced — `-j` and the worker limit mean what
+  they say — and nothing is logged. An instance whose worker limit is one is
+  covered for a blocked task, whose replacement is where the tasks behind it
+  run; a computing task holds the only worker, which is what a limit of one
+  means. Pinned tasks on a stuck worker wait for the worker, which they own the
+  resources of. `Threadz.stats()` reads the counters: workers running,
+  replacements, workers stuck now, the episodes of each kind, the rounds of
+  samples the watchdog made, and the task and kind of the last episode. A
+  worker pays one store per switch for the watchdog, of the task it runs, and
+  one load of a flag when it takes the task in its slot. The watchdog waits
+  without a timeout while every worker is parked, so an idle program is not
+  woken to sample workers that are all asleep.
 - Threads outside the pool can use the synchronization primitives, whose
   futexes they wait on in the kernel. Other `Io` calls from those threads are
   not supported yet.
@@ -216,9 +265,9 @@ throughput of the same servers on threads of their own, with single tiers from
 0.83 to 1.23 times, inside the laptop's own run-to-run spread.
 
 `zig build test-threadz` runs the `Io` tests on Threadz, and the test runner's
-`--io=threadz` runs any test on it. The design, and the steps still to come (a
-cooperative budget, a pool for blocking calls, a watchdog, and the kqueue and
-IOCP cores), are in
+`--io=threadz` runs any test on it. The design, and the steps still to come
+(the kqueue and IOCP cores, arenas and supervisors, the task dump and the
+scheduler gauges, and the `async`/`await` keywords), are in
 [the Threadz proposal](https://github.com/mattneel/zigpp/blob/master/doc/proposals/threadz.md).
 
 ## AI in the toolchain

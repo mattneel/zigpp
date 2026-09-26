@@ -615,6 +615,7 @@ pub fn io(k: *Kqueue) Io {
             .concurrent = concurrent,
             .await = await,
             .cancel = cancel,
+            .blocking = blocking,
 
             .groupAsync = groupAsync,
             .groupConcurrent = groupConcurrent,
@@ -667,9 +668,10 @@ fn async(
     result_alignment: std.mem.Alignment,
     context: []const u8,
     context_alignment: std.mem.Alignment,
+    name: [:0]const u8,
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
 ) ?*Io.AnyFuture {
-    return concurrent(userdata, result.len, result_alignment, context, context_alignment, start) catch {
+    return concurrent(userdata, result.len, result_alignment, context, context_alignment, name, start) catch {
         start(context.ptr, result.ptr);
         return null;
     };
@@ -681,8 +683,10 @@ fn concurrent(
     result_alignment: Alignment,
     context: []const u8,
     context_alignment: Alignment,
+    name: [:0]const u8,
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
 ) Io.ConcurrentError!*Io.AnyFuture {
+    _ = name;
     const k: *Kqueue = @ptrCast(@alignCast(userdata));
     assert(result_alignment.compare(.lte, Fiber.max_result_align)); // TODO
     assert(context_alignment.compare(.lte, Fiber.max_context_align)); // TODO
@@ -765,6 +769,7 @@ fn groupAsync(
     type_erased: *Io.Group,
     context: []const u8,
     context_alignment: Alignment,
+    name: [:0]const u8,
     start: *const fn (context: *const anyopaque) void,
 ) void {
     const k: *Kqueue = @ptrCast(@alignCast(userdata));
@@ -772,6 +777,7 @@ fn groupAsync(
     _ = type_erased;
     _ = context;
     _ = context_alignment;
+    _ = name;
     _ = start;
     @panic("TODO");
 }
@@ -781,6 +787,7 @@ fn groupConcurrent(
     type_erased: *Io.Group,
     context: []const u8,
     context_alignment: Alignment,
+    name: [:0]const u8,
     start: *const fn (context: *const anyopaque) void,
 ) Io.ConcurrentError!void {
     const k: *Kqueue = @ptrCast(@alignCast(userdata));
@@ -788,8 +795,27 @@ fn groupConcurrent(
     _ = type_erased;
     _ = context;
     _ = context_alignment;
+    _ = name;
     _ = start;
     @panic("TODO");
+}
+
+/// There is no pool for blocking calls in this implementation, so the call is made on the
+/// calling thread. See `Io.blocking`.
+fn blocking(
+    userdata: ?*anyopaque,
+    result: []u8,
+    result_alignment: Alignment,
+    context: []const u8,
+    context_alignment: Alignment,
+    name: [:0]const u8,
+    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+) void {
+    _ = userdata;
+    _ = result_alignment;
+    _ = context_alignment;
+    _ = name;
+    start(context.ptr, result.ptr);
 }
 
 fn groupAwait(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *anyopaque) Io.Cancelable!void {

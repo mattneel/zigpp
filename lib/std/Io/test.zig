@@ -784,6 +784,49 @@ test "Event smoke test" {
     try testing.expectEqual(true, event.isSet());
 }
 
+test "Io.blocking" {
+    if (builtin.single_threaded) {
+        // A blocking call has to be handed to another thread to be blocking.
+        return error.SkipZigTest;
+    }
+
+    const io = testing.io;
+
+    const S = struct {
+        /// A call that blocks without making an `Io` call of its own.
+        fn blockUs(us: u64) u64 {
+            if (builtin.os.tag == .linux) {
+                const ts: std.os.linux.timespec = .{
+                    .sec = 0,
+                    .nsec = @intCast(us * std.time.ns_per_us),
+                };
+                _ = std.os.linux.nanosleep(&ts, null);
+            }
+            return us;
+        }
+
+        fn fail() error{Blocked}!void {
+            return error.Blocked;
+        }
+
+        fn inTask(inner_io: Io, result: *std.atomic.Value(u64)) void {
+            result.store(inner_io.blocking(blockUs, .{@as(u64, 1)}), .release);
+        }
+    };
+
+    // The result comes back to the caller, whichever implementation runs it, including one whose
+    // unit of work is not an OS thread.
+    try expectEqual(1, io.blocking(S.blockUs, .{@as(u64, 1)}));
+    try expectError(error.Blocked, io.blocking(S.fail, .{}));
+
+    // A task can make one, and the task's result arrives.
+    var result: std.atomic.Value(u64) = .init(0);
+    var group: Io.Group = .init;
+    group.async(io, S.inTask, .{ io, &result });
+    try group.await(io);
+    try expectEqual(1, result.load(.acquire));
+}
+
 test "Event signaling" {
     if (builtin.single_threaded) {
         // This test requires spawning threads.

@@ -2158,6 +2158,7 @@ pub fn io(t: *Threaded) Io {
             .concurrent = concurrent,
             .await = await,
             .cancel = cancel,
+            .blocking = blocking,
 
             .groupAsync = groupAsync,
             .groupConcurrent = groupConcurrent,
@@ -2410,8 +2411,10 @@ fn async(
     result_alignment: Alignment,
     context: []const u8,
     context_alignment: Alignment,
+    name: [:0]const u8,
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
 ) ?*Io.AnyFuture {
+    _ = name;
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     if (builtin.single_threaded) {
         start(context.ptr, result.ptr);
@@ -2441,8 +2444,10 @@ fn concurrent(
     result_alignment: Alignment,
     context: []const u8,
     context_alignment: Alignment,
+    name: [:0]const u8,
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
 ) Io.ConcurrentError!*Io.AnyFuture {
+    _ = name;
     if (builtin.single_threaded) return error.ConcurrencyUnavailable;
 
     const t: *Threaded = @ptrCast(@alignCast(userdata));
@@ -2465,8 +2470,10 @@ fn groupAsync(
     type_erased: *Io.Group,
     context: []const u8,
     context_alignment: Alignment,
+    name: [:0]const u8,
     start: *const fn (context: *const anyopaque) void,
 ) void {
+    _ = name;
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     const g: Group = .{ .ptr = type_erased };
 
@@ -2503,8 +2510,10 @@ fn groupConcurrent(
     type_erased: *Io.Group,
     context: []const u8,
     context_alignment: Alignment,
+    name: [:0]const u8,
     start: *const fn (context: *const anyopaque) void,
 ) Io.ConcurrentError!void {
+    _ = name;
     if (builtin.single_threaded) return error.ConcurrencyUnavailable;
 
     const t: *Threaded = @ptrCast(@alignCast(userdata));
@@ -2527,6 +2536,24 @@ fn groupConcurrent(
         .canceled = false,
     }, .monotonic);
     t.enqueue(&task.runnable);
+}
+
+/// The calling thread is an OS thread already, so a blocking call is made on it. See
+/// `Io.blocking`.
+fn blocking(
+    userdata: ?*anyopaque,
+    result: []u8,
+    result_alignment: Alignment,
+    context: []const u8,
+    context_alignment: Alignment,
+    name: [:0]const u8,
+    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+) void {
+    _ = userdata;
+    _ = result_alignment;
+    _ = context_alignment;
+    _ = name;
+    start(context.ptr, result.ptr);
 }
 
 fn groupAwait(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *anyopaque) Io.Cancelable!void {
