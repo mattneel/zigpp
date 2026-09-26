@@ -166,6 +166,8 @@ pub fn Scheduler(comptime Backend: type) type {
         mapping_len: usize,
         pool: StackPool,
         idle_stack: []align(page_size_min) u8,
+        /// The pool `io.blocking` calls and a worker's fsyncs run on. See `Dirty`.
+        dirty: Dirty = .{},
         /// The watchdog thread, started with the first worker past worker 0 and stopped by
         /// `deinit`.
         watchdog: std.Thread,
@@ -748,10 +750,142 @@ pub fn Scheduler(comptime Backend: type) type {
             len: u32 = 0,
         };
 
+        /// The pool the calls that may block a worker for a long time run on: `io.blocking`, and
+        /// a regular-file `fsync`. It is an `Io.Threaded` instance this one starts with the first
+        /// such call, and the group its jobs belong to; one job is one task of that pool, and it
+        /// destroys itself when it finishes, so nothing awaits the group. Every core on this
+        /// scheduler shares the pool.
+        pub const Dirty = struct {
+            lock: Io.Mutex = .init,
+            /// `null` until the first blocking call starts the pool.
+            threaded: ?*Io.Threaded = null,
+            group: Io.Group = .init,
+
+            fn deinit(d: *Dirty, s: *Sched) void {
+                const threaded = d.threaded orelse return;
+                threaded.deinit();
+                Backend.allocator(s.backendOf()).destroy(threaded);
+                d.threaded = null;
+            }
+
+            /// Hands `job` to the pool, starting it if it is not running yet. `false` when there
+            /// is no thread to hand it to: the pool is at its limit, or it could not be started,
+            /// and the caller then makes the call itself.
+            fn submit(d: *Dirty, s: *Sched, job: *const Job, name: [:0]const u8) bool {
+                const io = Backend.io(s.backendOf());
+                d.lock.lock(io) catch return false; // canceled: the caller makes the call itself
+                defer d.lock.unlock(io);
+                const threaded = d.threaded orelse started: {
+                    // The pool's threads allocate through it too, so it is the allocator this
+                    // instance hands out, which is thread-safe.
+                    const threaded = Backend.allocator(s.backendOf()).create(Io.Threaded) catch return false;
+                    threaded.* = Io.Threaded.init(Backend.allocator(s.backendOf()), .{});
+                    d.threaded = threaded;
+                    break :started threaded;
+                };
+                const threaded_io = threaded.io();
+                threaded_io.vtable.groupConcurrent(
+                    threaded_io.userdata,
+                    &d.group,
+                    @ptrCast(job),
+                    .of(*Job),
+                    name,
+                    Job.run,
+                ) catch return false;
+                return true;
+            }
+        };
+
+        /// One call handed to the pool: what it runs, where the result goes, and how the calling
+        /// task is made runnable again. It lives on the calling task's stack, which stays put
+        /// while the task is parked, so the pool reads the arguments and writes the result there
+        /// without a copy.
+        pub const Job = struct {
+            sched: *Sched,
+            start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+            context: *const anyopaque,
+            result: *anyopaque,
+            /// The task waiting for the call.
+            task: *Task,
+            /// `waiting` until either the call has returned or the task has parked, whichever
+            /// comes first, and then `done` or `parked`. Exactly one of the pool's thread and the
+            /// parked task makes the task runnable, and this word is what tells them which: the
+            /// two exchange it with the same expected value, so only one of them wins. A word of
+            /// the caller's, since the pool reads the job through a const pointer. See `blocking`.
+            state: *std.atomic.Value(State),
+
+            pub const State = enum(u8) { waiting, parked, done };
+
+            /// On the pool's thread: makes the call, then makes the task runnable.
+            fn run(context: *const anyopaque) void {
+                const job: *const Job = @ptrCast(@alignCast(context));
+                job.start(job.context, job.result);
+                if (job.state.cmpxchgStrong(.waiting, .done, .seq_cst, .monotonic) == null) {
+                    @branchHint(.unlikely);
+                    return; // the task has not parked yet, so it wakes itself when it does
+                }
+                assert(job.state.load(.monotonic) == .parked);
+                job.sched.readyFromForeign(job.task);
+            }
+        };
+
+        /// `Io.blocking`: `start` runs with `context` on a thread of the instance's pool, writing
+        /// its result to `result`, and the calling task parks while it does, so the worker runs
+        /// other tasks meanwhile. A call that has started is not cancelable. A thread that is not
+        /// one of the workers has no task to park, and a job the pool will not take has no thread
+        /// to run it: both make the call on the calling thread, which holds its worker for as long
+        /// as it blocks.
+        pub fn blocking(
+            userdata: ?*anyopaque,
+            result: []u8,
+            result_alignment: Alignment,
+            context: []const u8,
+            context_alignment: Alignment,
+            name: [:0]const u8,
+            start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+        ) void {
+            _ = result_alignment;
+            _ = context_alignment;
+            charge(fromUserdata(userdata));
+            const s = fromUserdata(userdata);
+            const w = Worker.currentOrNull() orelse {
+                start(context.ptr, result.ptr);
+                return;
+            };
+            var state: std.atomic.Value(Job.State) = .init(.waiting);
+            var job: Job = .{
+                .sched = s,
+                .start = start,
+                .context = context.ptr,
+                .result = result.ptr,
+                .task = w.currentTask(),
+                .state = &state,
+            };
+            if (!s.dirty.submit(s, &job, name)) {
+                start(context.ptr, result.ptr);
+                return;
+            }
+            // The task is switched away before either side can make it runnable: the `custom`
+            // pending task runs once it is saved, and the exchange there decides who wakes it.
+            s.yield(null, .{ .custom = .{ .context = &job, .run = blockingParked } });
+        }
+
+        /// Runs after a task that handed a job to the pool has switched away: see `Job.state`.
+        fn blockingParked(s: *Sched, task: *Task, context: *anyopaque) void {
+            const job: *Job = @ptrCast(@alignCast(context));
+            if (job.state.cmpxchgStrong(.waiting, .parked, .seq_cst, .monotonic) != null) {
+                @branchHint(.unlikely);
+                // The call returned before this task was switched away, so the pool's thread left
+                // the wake to this side, which is not running anything else yet.
+                assert(job.state.load(.monotonic) == .done);
+                s.ready(.current(), task);
+            }
+        }
+
         pub const SpinLock = struct {
             locked: std.atomic.Value(bool) = .init(false),
 
-            fn lock(l: *SpinLock) void {
+            pub fn lock(l: *SpinLock) void {
                 var spins: u32 = 0;
                 while (l.locked.swap(true, .acquire)) {
                     while (l.locked.load(.monotonic)) {
@@ -761,7 +895,7 @@ pub fn Scheduler(comptime Backend: type) type {
                 }
             }
 
-            fn unlock(l: *SpinLock) void {
+            pub fn unlock(l: *SpinLock) void {
                 l.locked.store(false, .release);
             }
         };
@@ -825,6 +959,7 @@ pub fn Scheduler(comptime Backend: type) type {
                 .report = .{},
                 .reaped_live = 0,
                 .main_task_buffer = undefined,
+                .dirty = .{},
             };
             @memset(s.spares, .{});
             const main_task = s.mainTask();
@@ -935,6 +1070,7 @@ pub fn Scheduler(comptime Backend: type) type {
                 s.pool.head = free.next;
                 s.unmapFree(free);
             }
+            s.dirty.deinit(s);
             Worker.self = null;
             if (tsan.enable) tsan.__tsan_destroy_fiber(s.workers[0].idle_tsan_fiber);
             posix.munmap(s.idle_stack);
@@ -2152,12 +2288,30 @@ pub fn Scheduler(comptime Backend: type) type {
 
         // Stacks
 
+        /// One mapping per task, the first page unreadable and unwritable: an access to it
+        /// faults instead of silently corrupting whatever is below, and the platform maps the
+        /// stack pages above it as they are touched. Every OS has its own way of asking for that:
+        /// Linux overcommits unless `NORESERVE` says not to and likes `STACK`, FreeBSD and
+        /// DragonFly take `STACK` without `NORESERVE`, OpenBSD requires `STACK`, NetBSD takes it,
+        /// and Darwin has no `STACK` and refuses `NORESERVE` on a mapping it may later grow.
         fn mapStack(len: usize) error{OutOfMemory}![]align(page_size_min) u8 {
-            const mapping = posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{
-                .TYPE = .PRIVATE,
-                .ANONYMOUS = true,
-                .NORESERVE = true,
-                .STACK = true,
+            const mapping = posix.mmap(null, len, .{ .READ = true, .WRITE = true }, switch (builtin.os.tag) {
+                .linux => .{
+                    .TYPE = .PRIVATE,
+                    .ANONYMOUS = true,
+                    .NORESERVE = true,
+                    .STACK = true,
+                },
+                .freebsd, .netbsd, .openbsd, .dragonfly => .{
+                    .TYPE = .PRIVATE,
+                    .ANONYMOUS = true,
+                    .STACK = true,
+                },
+                .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => .{
+                    .TYPE = .PRIVATE,
+                    .ANONYMOUS = true,
+                },
+                else => |os| @compileError("stack mapping for " ++ @tagName(os) ++ " is not implemented"),
             }, -1, 0) catch return error.OutOfMemory;
             guard(mapping[0..std.heap.pageSize()]);
             return mapping;
@@ -2166,18 +2320,20 @@ pub fn Scheduler(comptime Backend: type) type {
         var guard_install: std.atomic.Value(bool) = .init(builtin.os.tag == .linux);
 
         /// Makes an access to `page` fault. Linux 6.13 guards a page without splitting the
-        /// mapping, which keeps one mapping per task; older kernels need a mapping of its own.
+        /// mapping, which keeps one mapping per task; older kernels, and every other OS, need the
+        /// page protected by hand.
         fn guard(page: []align(page_size_min) u8) void {
-            if (builtin.os.tag == .linux and guard_install.load(.monotonic)) {
-                switch (linux.errno(linux.madvise(page.ptr, page.len, linux.MADV.GUARD_INSTALL))) {
-                    .SUCCESS => return,
-                    else => guard_install.store(false, .monotonic),
+            if (builtin.os.tag == .linux) {
+                if (guard_install.load(.monotonic)) {
+                    switch (linux.errno(linux.madvise(page.ptr, page.len, linux.MADV.GUARD_INSTALL))) {
+                        .SUCCESS => return,
+                        else => guard_install.store(false, .monotonic),
+                    }
                 }
+                _ = linux.mprotect(page.ptr, page.len, .{});
+                return;
             }
-            switch (builtin.os.tag) {
-                .linux => _ = linux.mprotect(page.ptr, page.len, .{}),
-                else => _ = std.c.mprotect(page.ptr, page.len, .{}),
-            }
+            _ = std.c.mprotect(@ptrCast(@alignCast(page.ptr)), page.len, .{});
         }
 
         fn takeMapping(s: *Sched, w: *Worker) error{OutOfMemory}![]align(page_size_min) u8 {
@@ -2201,7 +2357,13 @@ pub fn Scheduler(comptime Backend: type) type {
             if (mapping.len != s.mapping_len) return posix.munmap(mapping);
             if (mapping.len > trim_threshold) {
                 const page = std.heap.pageSize();
-                posix.madvise(@alignCast(mapping.ptr + page), mapping.len - page - trim_keep, posix.MADV.DONTNEED) catch {};
+                // Darwin keeps a freed page until the memory is needed again, which is what
+                // `FREE` asks for; the other kernels drop the pages on `DONTNEED`.
+                const advice: u32 = switch (builtin.os.tag) {
+                    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => posix.MADV.FREE,
+                    else => posix.MADV.DONTNEED,
+                };
+                posix.madvise(@alignCast(mapping.ptr + page), mapping.len - page - trim_keep, advice) catch {};
             }
             const free: *FreeMapping = @ptrFromInt(@intFromPtr(mapping.ptr) + mapping.len - @sizeOf(FreeMapping));
             if (w.stacks.len < stack_cache_max) {
@@ -2698,6 +2860,332 @@ pub fn Scheduler(comptime Backend: type) type {
     };
 }
 
+/// How much CPU time another thread of this process has used, where the platform can say:
+/// Darwin through Mach's `thread_info`, which counts the thread's user and system time, and Linux
+/// through the clock named after a thread id. The BSDs' per-thread clocks can only be read by the
+/// thread itself, so there a worker has no CPU time to report and is always taken to be blocked.
+/// See the backend contract's `threadCpuTime`.
+pub const CpuTime = struct {
+    /// What a thread records about itself when it starts, for `read`. A plain struct rather than a
+    /// union so that a core and the test backend may hold it on any platform; the field that does
+    /// not apply stays zero.
+    pub const Source = struct {
+        /// The clock that names this thread, on Linux.
+        clock: u32 = 0,
+        /// The Mach thread port, on Darwin. It is a send right this process owns, and `release`
+        /// gives it back.
+        mach: u32 = 0,
+    };
+
+    /// Records what this thread has to hand out. Called on the thread itself.
+    pub fn acquire() Source {
+        return switch (builtin.os.tag) {
+            .linux => .{ .clock = @bitCast((~linux.gettid() << 3) | 6) }, // the clock named by a thread id
+            .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => .{ .mach = mach.mach_thread_self() },
+            else => .{},
+        };
+    }
+
+    /// Gives back what `acquire` took.
+    pub fn release(source: Source) void {
+        switch (builtin.os.tag) {
+            .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => {
+                if (source.mach != 0) _ = std.c.mach_port_deallocate(std.c.mach_task_self(), source.mach);
+            },
+            else => {},
+        }
+    }
+
+    /// This thread's CPU time in nanoseconds, or `null` when it cannot be read.
+    pub fn read(source: Source) ?u64 {
+        switch (builtin.os.tag) {
+            .linux => {
+                if (source.clock == 0) return null;
+                const clock_id: posix.clockid_t = @bitCast(source.clock);
+                var tp: posix.timespec = undefined;
+                switch (posix.errno(posix.system.clock_gettime(clock_id, &tp))) {
+                    .SUCCESS => {},
+                    else => return null,
+                }
+                return @as(u64, @intCast(@max(0, tp.sec))) * std.time.ns_per_s +
+                    @as(u64, @intCast(@max(0, tp.nsec)));
+            },
+            .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => {
+                if (source.mach == 0) return null;
+                var info: std.c.thread_basic_info = std.mem.zeroes(std.c.thread_basic_info);
+                var count: std.c.mach_msg_type_number_t = std.c.THREAD.BASIC.INFO_COUNT;
+                if (std.c.thread_info(source.mach, std.c.THREAD.BASIC.INFO, @ptrCast(&info), &count) != 0) return null;
+                if (count != std.c.THREAD.BASIC.INFO_COUNT) return null;
+                const seconds = @as(i64, info.user_time.seconds) + @as(i64, info.system_time.seconds);
+                const microseconds = @as(i64, info.user_time.microseconds) + @as(i64, info.system_time.microseconds);
+                const total = seconds * std.time.ns_per_s + microseconds * std.time.ns_per_us;
+                return if (total < 0) 0 else @intCast(total);
+            },
+            else => return null,
+        }
+    }
+
+    /// Mach's own thread port, which the standard library does not bind.
+    const mach = struct {
+        extern "c" fn mach_thread_self() std.c.thread_t;
+    };
+};
+
+/// A futex for a thread that is not one of the workers. A parked task is never woken through
+/// this: the scheduler parks it and its backend wakes it. This is what a foreign thread blocks
+/// in, which is the watchdog and any thread that called one of the instance's `Io` futex
+/// functions, and what a backend that has no kernel object to wait in parks its own wake word
+/// in. A wake has to reach the kernel's waiters and, in such a backend, its own, which is why
+/// `wake` is not just the syscall: a backend's own waiters are woken through the scheduler.
+///
+/// Every platform has its own private operation for one address, and NetBSD's `futex(2)` is not
+/// used by the standard library, which parks threads instead: see `netbsdWaitTable`.
+pub const Futex = struct {
+    /// Blocks the calling thread while `ptr.* == expected`, and returns when it is not, when a
+    /// wake unparks it, or when `timeout_ns` nanoseconds have passed. A return says nothing about
+    /// the word: the caller re-reads it, so a spurious one costs nothing.
+    pub fn wait(ptr: *const u32, expected: u32, timeout_ns: ?u64) void {
+        switch (builtin.os.tag) {
+            .linux => {
+                var ts_buffer: linux.timespec = undefined;
+                const ts: ?*const linux.timespec = if (timeout_ns) |ns| ts: {
+                    ts_buffer = .{
+                        .sec = @intCast(@divFloor(ns, std.time.ns_per_s)),
+                        .nsec = @intCast(@mod(ns, std.time.ns_per_s)),
+                    };
+                    break :ts &ts_buffer;
+                } else null;
+                _ = linux.futex_4arg(ptr, .{ .cmd = .WAIT, .private = true }, expected, ts);
+            },
+            .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => {
+                const c = std.c;
+                // `__ulock_wait` takes microseconds, and zero means no timeout.
+                const us: u32 = if (timeout_ns) |ns| @intCast(
+                    std.math.clamp(@divFloor(ns, std.time.ns_per_us), 1, std.math.maxInt(u32)),
+                ) else 0;
+                _ = c.__ulock_wait(.{ .op = .COMPARE_AND_WAIT, .NO_ERRNO = true }, ptr, expected, us);
+            },
+            .freebsd => {
+                const c = std.c;
+                var time_buffer: c._umtx_time = undefined;
+                var size: usize = 0;
+                var time: ?*const c._umtx_time = null;
+                if (timeout_ns) |ns| {
+                    time_buffer = .{
+                        .timeout = .{
+                            .sec = @intCast(@divFloor(ns, std.time.ns_per_s)),
+                            .nsec = @intCast(@mod(ns, std.time.ns_per_s)),
+                        },
+                        .flags = 0, // a duration, not an absolute time
+                        .clockid = .MONOTONIC,
+                    };
+                    size = @sizeOf(c._umtx_time);
+                    time = &time_buffer;
+                }
+                _ = c._umtx_op(
+                    @intFromPtr(ptr),
+                    @backingInt(c.UMTX_OP.WAIT_UINT_PRIVATE),
+                    @as(c_ulong, expected),
+                    size,
+                    @intFromPtr(time),
+                );
+            },
+            .openbsd => {
+                const c = std.c;
+                var ts_buffer: posix.timespec = undefined;
+                const ts: ?*const posix.timespec = if (timeout_ns) |ns| ts: {
+                    ts_buffer = .{
+                        .sec = @intCast(@divFloor(ns, std.time.ns_per_s)),
+                        .nsec = @intCast(@mod(ns, std.time.ns_per_s)),
+                    };
+                    break :ts &ts_buffer;
+                } else null;
+                _ = c.futex(
+                    ptr,
+                    c.FUTEX.WAIT | c.FUTEX.PRIVATE_FLAG,
+                    @as(c_int, @bitCast(expected)),
+                    ts,
+                    null,
+                );
+            },
+            .dragonfly => {
+                const us: c_int = if (timeout_ns) |ns|
+                    std.math.cast(c_int, ns / std.time.ns_per_us) orelse std.math.maxInt(c_int)
+                else
+                    0;
+                _ = std.c.umtx_sleep(@ptrCast(ptr), @bitCast(expected), us);
+            },
+            .netbsd => netbsdWaitTable.wait(ptr, expected, timeout_ns),
+            else => |os| @compileError("a futex for " ++ @tagName(os) ++ " is not implemented"),
+        }
+    }
+
+    /// Wakes up to `max_waiters` threads blocked in `wait` on `ptr`. A wake with nobody waiting
+    /// is a no-op, not an error.
+    pub fn wake(ptr: *const u32, max_waiters: u32) void {
+        if (max_waiters == 0) return;
+        const n: c_int = @intCast(@min(max_waiters, std.math.maxInt(c_int)));
+        switch (builtin.os.tag) {
+            .linux => _ = linux.futex_3arg(
+                ptr,
+                .{ .cmd = .WAKE, .private = true },
+                @intCast(@min(max_waiters, std.math.maxInt(i32))),
+            ),
+            .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => {
+                const c = std.c;
+                const flags: c.UL = .{
+                    .op = .COMPARE_AND_WAIT,
+                    .NO_ERRNO = true,
+                    .WAKE_ALL = max_waiters > 1,
+                };
+                while (true) {
+                    const status = c.__ulock_wake(flags, ptr, 0);
+                    if (status >= 0) return;
+                    switch (@as(c.E, @fromBackingInt(@intCast(-status)))) {
+                        .INTR, .CANCELED => continue, // spurious
+                        else => return,
+                    }
+                }
+            },
+            .freebsd => _ = std.c._umtx_op(
+                @intFromPtr(ptr),
+                @backingInt(std.c.UMTX_OP.WAKE_PRIVATE),
+                @as(c_ulong, @intCast(n)),
+                0,
+                0,
+            ),
+            .openbsd => _ = std.c.futex(
+                ptr,
+                std.c.FUTEX.WAKE | std.c.FUTEX.PRIVATE_FLAG,
+                @intCast(n),
+                null,
+                null,
+            ),
+            .dragonfly => _ = std.c.umtx_wakeup(@ptrCast(ptr), n),
+            .netbsd => netbsdWaitTable.wake(ptr, max_waiters),
+            else => |os| @compileError("a futex for " ++ @tagName(os) ++ " is not implemented"),
+        }
+    }
+};
+
+/// NetBSD parks threads rather than offering them a futex the standard library trusts, so a wait
+/// is a node in a hashed table of waiters and a `_lwp_park`, and a wake removes the nodes for its
+/// address from the table and unparks the threads, which is what `Io.Threaded` does for the same
+/// reason. The flag a waiter carries is what makes a wake that arrives between the waiter's check
+/// of the word and its park harmless: the waker sets it before unparking, and the waiter checks
+/// it before every park, so the park it is about to make returns at once.
+const netbsdWaitTable = struct {
+    const Bucket = struct {
+        lock: SpinLock = .{},
+        /// The waiters for this bucket's addresses, newest first.
+        head: ?*Waiter = null,
+
+        const SpinLock = struct {
+            locked: std.atomic.Value(bool) = .init(false),
+            fn lock(l: *SpinLock) void {
+                while (l.locked.swap(true, .acquire)) {
+                    while (l.locked.load(.monotonic)) std.atomic.spinLoopHint();
+                }
+            }
+            fn unlock(l: *SpinLock) void {
+                l.locked.store(false, .release);
+            }
+        };
+    };
+
+    const Waiter = struct {
+        next: ?*Waiter,
+        address: usize,
+        lwp: c_int,
+        /// Set by a waker, once. The waiter owns the flip back to false.
+        woken: std.atomic.Value(bool) = .init(false),
+    };
+
+    var buckets: [64]Bucket = @splat(.{});
+
+    fn bucketFor(address: usize) *Bucket {
+        // Fibonacci hashing: the high bits of the golden-ratio multiple spread addresses better
+        // than the low ones, which are the ones a slab allocator varies least.
+        const fibonacci_multiplier = 0x9E3779B97F4A7C15 >> (64 - @bitSizeOf(usize));
+        const hashed = address *% fibonacci_multiplier;
+        return &buckets[hashed >> (@bitSizeOf(usize) - @ctz(buckets.len))];
+    }
+
+    fn wait(ptr: *const u32, expected: u32, timeout_ns: ?u64) void {
+        const bucket = bucketFor(@intFromPtr(ptr));
+        var waiter: Waiter = .{
+            .next = null,
+            .address = @intFromPtr(ptr),
+            .lwp = @bitCast(std.c._lwp_self()),
+        };
+        var ts_buffer: posix.timespec = undefined;
+        const ts: ?*posix.timespec = if (timeout_ns) |ns| ts: {
+            ts_buffer = .{
+                .sec = @intCast(@divFloor(ns, std.time.ns_per_s)),
+                .nsec = @intCast(@mod(ns, std.time.ns_per_s)),
+            };
+            break :ts &ts_buffer;
+        } else null;
+        {
+            bucket.lock.lock();
+            defer bucket.lock.unlock();
+            if (@atomicLoad(u32, ptr, .monotonic) != expected) return;
+            waiter.next = bucket.head;
+            bucket.head = &waiter;
+        }
+        while (!waiter.woken.swap(false, .acquire)) {
+            switch (posix.errno(std.c._lwp_park(std.c.CLOCK.MONOTONIC, .{}, ts, 0, ptr, null))) {
+                .SUCCESS, .ALREADY, .INTR => {},
+                .TIMEDOUT => {
+                    // A wake may have raced the timeout: if it took the node, it is about to
+                    // unpark this thread, and the loop has to let it.
+                    bucket.lock.lock();
+                    defer bucket.lock.unlock();
+                    var link = &bucket.head;
+                    while (link.*) |other| {
+                        if (other != &waiter) {
+                            link = &other.next;
+                            continue;
+                        }
+                        link.* = other.next;
+                        return;
+                    }
+                },
+                else => |err| std.debug.panic("_lwp_park: {t}", .{err}),
+            }
+        }
+        // A waker took the node out of the table.
+    }
+
+    fn wake(ptr: *const u32, max_waiters: u32) void {
+        const bucket = bucketFor(@intFromPtr(ptr));
+        var unpark: [16]c_int = undefined;
+        var len: usize = 0;
+        bucket.lock.lock();
+        var link = &bucket.head;
+        var woken: u32 = 0;
+        while (link.*) |waiter| {
+            if (waiter.address != @intFromPtr(ptr) or woken == max_waiters) {
+                link = &waiter.next;
+                continue;
+            }
+            link.* = waiter.next;
+            waiter.woken.store(true, .release);
+            unpark[len] = waiter.lwp;
+            len += 1;
+            woken += 1;
+            if (len == unpark.len) {
+                // A waiter may be unparked once it is out of the table and flagged, so its
+                // stack is the waker's to leave only after that: unpark under the lock.
+                _ = std.c._lwp_unpark_all(@ptrCast(&unpark), len, ptr);
+                len = 0;
+            }
+        }
+        bucket.lock.unlock();
+        if (len > 0) _ = std.c._lwp_unpark_all(@ptrCast(&unpark), len, ptr);
+    }
+};
+
 /// A backend with no operations, for testing the scheduler alone. Workers block on a futex word,
 /// and `Io` futexes park tasks in a list under one lock.
 const TestBackend = struct {
@@ -2714,8 +3202,10 @@ const TestBackend = struct {
     pub const Completion = struct { result: i32 };
     pub const Worker = struct {
         wake_word: std.atomic.Value(u32),
-        /// The worker's thread id, recorded on its own thread, for `threadCpuTime`.
-        tid: i32 = 0,
+        /// What reads this worker's thread CPU time, recorded on the worker's own thread, for
+        /// `threadCpuTime`. Nothing where this platform cannot say, which leaves every stuck
+        /// worker counted as blocked. See the backend contract.
+        cpu: CpuTime.Source = .{},
     };
 
     const FutexWaiter = struct {
@@ -2729,14 +3219,18 @@ const TestBackend = struct {
         // The commands of `membarrier` have to be registered for before they may be used. A
         // process that cannot register keeps the compare-exchange path, which these tests then
         // exercise.
-        _ = linux.membarrier(linux.MEMBARRIER.REGISTER_PRIVATE_EXPEDITED, 0, 0);
+        if (builtin.os.tag == .linux) {
+            _ = linux.membarrier(linux.MEMBARRIER.REGISTER_PRIVATE_EXPEDITED, 0, 0);
+        }
         try b.sched.init(gpa, .{ .workers = workers });
     }
 
     /// For the scheduler: a barrier that makes this thread's earlier stores visible to every
     /// other thread of the process after their own barriers, or `false` when this process cannot
-    /// issue one. On Linux this is `membarrier`.
+    /// issue one. On Linux this is `membarrier`; no other platform has its equivalent, so a
+    /// backend there says it has none, and every taker of a slot pays a compare-exchange.
     pub fn heavyBarrier(b: *TestBackend) bool {
+        if (builtin.os.tag != .linux) return false;
         if (!b.heavy_barrier.load(.monotonic)) return false;
         return linux.errno(linux.membarrier(linux.MEMBARRIER.PRIVATE_EXPEDITED, 0, 0)) == .SUCCESS;
     }
@@ -2777,26 +3271,18 @@ const TestBackend = struct {
 
     pub fn workerStart(b: *TestBackend, w: *Sched.Worker) void {
         _ = b;
-        w.backend.tid = linux.gettid();
+        w.backend.cpu = CpuTime.acquire();
     }
 
     /// How much CPU time the worker's thread has used: see the backend contract.
     pub fn threadCpuTime(b: *TestBackend, w: *Sched.Worker) ?u64 {
         _ = b;
-        const tid = w.backend.tid;
-        if (tid == 0) return null;
-        var tp: linux.timespec = undefined;
-        const clock_id: linux.clockid_t = @bitCast((~@as(u32, @bitCast(tid)) << 3) | 6);
-        switch (linux.errno(linux.clock_gettime(clock_id, &tp))) {
-            .SUCCESS => {},
-            else => return null,
-        }
-        return @as(u64, @intCast(@max(0, tp.sec))) * std.time.ns_per_s + @as(u64, @intCast(@max(0, tp.nsec)));
+        return CpuTime.read(w.backend.cpu);
     }
 
     pub fn workerDeinit(b: *TestBackend, w: *Sched.Worker) void {
         _ = b;
-        _ = w;
+        CpuTime.release(w.backend.cpu);
     }
 
     pub fn poll(b: *TestBackend, w: *Sched.Worker, mode: PollMode) void {
@@ -2804,7 +3290,7 @@ const TestBackend = struct {
         switch (mode) {
             .nonblocking => _ = w.backend.wake_word.swap(0, .acquire),
             .block => while (w.backend.wake_word.swap(0, .acquire) == 0) {
-                _ = linux.futex_4arg(&w.backend.wake_word.raw, .{ .cmd = .WAIT, .private = true }, 0, null);
+                Futex.wait(&w.backend.wake_word.raw, 0, null);
             },
         }
     }
@@ -2813,14 +3299,14 @@ const TestBackend = struct {
         _ = b;
         _ = from;
         to.backend.wake_word.store(1, .release);
-        _ = linux.futex_4arg(&to.backend.wake_word.raw, .{ .cmd = .WAKE, .private = true }, 1, null);
+        Futex.wake(&to.backend.wake_word.raw, 1);
     }
 
     /// The scheduler's watchdog reads the clock to tell how long a task has held its worker.
     pub fn now(userdata: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
         _ = userdata;
-        var tp: linux.timespec = undefined;
-        switch (linux.errno(linux.clock_gettime(Io.Threaded.clockToPosix(clock), &tp))) {
+        var tp: posix.timespec = undefined;
+        switch (posix.errno(posix.system.clock_gettime(Io.Threaded.clockToPosix(clock), &tp))) {
             .SUCCESS => {},
             else => return .zero,
         }
@@ -2830,7 +3316,7 @@ const TestBackend = struct {
     pub fn wakeForeign(b: *TestBackend, to: *Sched.Worker) void {
         _ = b;
         to.backend.wake_word.store(1, .release);
-        _ = linux.futex_4arg(&to.backend.wake_word.raw, .{ .cmd = .WAKE, .private = true }, 1, null);
+        Futex.wake(&to.backend.wake_word.raw, 1);
     }
 
     pub fn cancelOperation(b: *TestBackend, from: *Sched.Worker, task: *Sched.Task, token: u31) void {
@@ -2850,16 +3336,11 @@ const TestBackend = struct {
         if (Sched.Worker.currentOrNull() == null) {
             // A thread that is not one of the workers blocks in the kernel, as the real backends
             // do. The watchdog is one, and it waits with a timeout.
-            var timespec: linux.timespec = undefined;
-            const timespec_ptr: ?*const linux.timespec = if (timeout.toDurationFromNow(b.io())) |duration| ts: {
-                const ns = @max(0, duration.raw.toNanoseconds());
-                timespec = .{
-                    .sec = @intCast(@divFloor(ns, std.time.ns_per_s)),
-                    .nsec = @intCast(@mod(ns, std.time.ns_per_s)),
-                };
-                break :ts &timespec;
-            } else null;
-            _ = linux.futex_4arg(ptr, .{ .cmd = .WAIT, .private = true }, expected, timespec_ptr);
+            const timeout_ns: ?u64 = if (timeout.toDurationFromNow(b.io())) |duration|
+                @intCast(@max(0, duration.raw.toNanoseconds()))
+            else
+                null;
+            Futex.wait(ptr, expected, timeout_ns);
             return;
         }
         assert(timeout == .none);
@@ -2910,8 +3391,7 @@ const TestBackend = struct {
         }
         // A wake of the kernel for the waiters this backend does not park: a thread that is not
         // one of the workers, such as the watchdog, waits on the futex itself.
-        const n: u32 = @min(max_waiters, std.math.maxInt(i32));
-        _ = linux.futex_4arg(ptr, .{ .cmd = .WAKE, .private = true }, n, null);
+        Futex.wake(ptr, max_waiters);
         // And the tasks this backend parks, which no wake of the kernel reaches: a caller that is
         // not one of the workers makes them runnable through the scheduler, since it has no
         // worker to wake them from.
@@ -2924,7 +3404,25 @@ const TestBackend = struct {
 };
 
 fn testBackend(workers: usize) !*TestBackend {
-    if (builtin.os.tag != .linux or !Io.fiber.supported or builtin.single_threaded) return error.SkipZigTest;
+    if (!Io.fiber.supported or builtin.single_threaded) return error.SkipZigTest;
+    // The OSes with a stack mapping, a futex for a thread that is not a worker, and a way to
+    // read a thread's CPU time: see `mapStack`, `Futex` and `threadCpuTime`.
+    switch (builtin.os.tag) {
+        .linux,
+        .driverkit,
+        .ios,
+        .maccatalyst,
+        .macos,
+        .tvos,
+        .visionos,
+        .watchos,
+        .freebsd,
+        .netbsd,
+        .openbsd,
+        .dragonfly,
+        => {},
+        else => return error.SkipZigTest,
+    }
     const b = try std.testing.allocator.create(TestBackend);
     errdefer std.testing.allocator.destroy(b);
     try b.init(std.testing.allocator, workers);
@@ -3029,9 +3527,23 @@ test "worker limit" {
 
 /// Nanoseconds on the monotonic clock, without an Io call, for tests that must keep a worker.
 fn testNow() u64 {
-    var tp: linux.timespec = undefined;
-    assert(linux.errno(linux.clock_gettime(linux.CLOCK.MONOTONIC, &tp)) == .SUCCESS);
+    var tp: posix.timespec = undefined;
+    assert(posix.errno(posix.system.clock_gettime(posix.CLOCK.MONOTONIC, &tp)) == .SUCCESS);
     return @as(u64, @intCast(tp.sec)) * std.time.ns_per_s + @as(u64, @intCast(tp.nsec));
+}
+
+/// Sleeps this thread for at least `ns`. The tests below wait for the state they check rather
+/// than for a fixed time, so this is only the step between two looks at it.
+fn testSleep(ns: u64) void {
+    var ts: posix.timespec = .{
+        .sec = @intCast(@divFloor(ns, std.time.ns_per_s)),
+        .nsec = @intCast(@mod(ns, std.time.ns_per_s)),
+    };
+    while (true) switch (posix.errno(posix.system.nanosleep(&ts, &ts))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        else => return,
+    };
 }
 
 test "watchdog: with one worker, what a blocked task queued still runs" {
@@ -3051,8 +3563,7 @@ test "watchdog: with one worker, what a blocked task queued still runs" {
             blocked.store(true, .release);
             var waited_ms: u32 = 0;
             while (release.load(.acquire) == 0 and waited_ms < 10_000) : (waited_ms += 100) {
-                const ts: linux.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
-                _ = linux.futex(&release.raw, .{ .cmd = .WAIT, .private = true }, 0, .{ .timeout = &ts }, null, 0);
+                Futex.wait(&release.raw, 0, 100 * std.time.ns_per_ms);
             }
             blocked.store(false, .release);
             future.await(inner_io);
@@ -3063,7 +3574,7 @@ test "watchdog: with one worker, what a blocked task queued still runs" {
         fn short(inner_io: Io, done: *std.atomic.Value(bool), word: *std.atomic.Value(u32), blocked: *std.atomic.Value(bool), release: *std.atomic.Value(u32)) void {
             done.store(blocked.load(.acquire), .release);
             release.store(1, .release);
-            _ = linux.futex_3arg(&release.raw, .{ .cmd = .WAKE, .private = true }, 1);
+            Futex.wake(&release.raw, 1);
             word.store(1, .release);
             inner_io.futexWake(u32, &word.raw, 1);
         }
@@ -3085,8 +3596,7 @@ test "watchdog: with one worker, what a blocked task queued still runs" {
     var stats = b.sched.stats();
     var waited_ms: u32 = 0;
     while (stats.stuck_episodes == 0 and waited_ms < 10_000) : (waited_ms += 1) {
-        const ms: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
-        _ = linux.nanosleep(&ms, null);
+        testSleep(std.time.ns_per_ms);
         stats = b.sched.stats();
     }
     try std.testing.expect(stats.stuck_episodes >= 1);
@@ -3114,19 +3624,17 @@ test "watchdog: an idle instance has no rounds" {
         /// this backend parks itself.
         fn measure(b2: *TestBackend, inner_io: Io, word: *std.atomic.Value(u32), result: *Result) void {
             const s = &b2.sched;
-            const step: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
             var tries: u32 = 0;
-            while (!s.watchdog_sleeping.load(.acquire) and tries < 10_000) : (tries += 1) _ = linux.nanosleep(&step, null);
+            while (!s.watchdog_sleeping.load(.acquire) and tries < 10_000) : (tries += 1) testSleep(std.time.ns_per_ms);
             result.asleep = s.watchdog_sleeping.load(.acquire);
             const start = s.stats().watchdog_rounds;
-            const window: linux.timespec = .{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
-            _ = linux.nanosleep(&window, null);
+            testSleep(200 * std.time.ns_per_ms);
             const end = s.stats().watchdog_rounds;
             result.during = end - start;
             word.store(1, .release);
             inner_io.futexWake(u32, &word.raw, std.math.maxInt(u32)); // every waiter
             tries = 0;
-            while (s.stats().watchdog_rounds == end and tries < 10_000) : (tries += 1) _ = linux.nanosleep(&step, null);
+            while (s.stats().watchdog_rounds == end and tries < 10_000) : (tries += 1) testSleep(std.time.ns_per_ms);
             result.woken = s.stats().watchdog_rounds != end;
         }
 

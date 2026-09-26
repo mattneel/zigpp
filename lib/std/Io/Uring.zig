@@ -77,140 +77,32 @@ random_fd: CachedFd,
 csprng_mutex: Io.Mutex,
 csprng: Csprng,
 
-/// The pool `io.blocking` calls run on. See `Dirty`.
-dirty: Dirty = .{},
-
 /// The ring the watchdog wakes parked workers from. See `Watchdog`.
 watchdog: Watchdog = .{},
-
-/// The pool `io.blocking` calls run on: an `Io.Threaded` instance this instance owns, started
-/// with the first blocking call, and the group the jobs belong to. A job is one task of that
-/// pool, which destroys itself when it finishes, so nothing awaits the group.
-pub const Dirty = struct {
-    lock: Io.Mutex = .init,
-    /// `null` until the first blocking call starts the pool.
-    threaded: ?*Io.Threaded = null,
-    group: Io.Group = .init,
-
-    fn deinit(d: *Dirty, ev: *Evented) void {
-        const threaded = d.threaded orelse return;
-        threaded.deinit();
-        ev.allocator().destroy(threaded);
-        d.threaded = null;
-    }
-
-    /// Runs `job` on the pool, starting it if it is not running yet. `false` if there is no
-    /// thread to hand the job to: the pool is at its limit, or it could not be started.
-    fn submit(d: *Dirty, ev: *Evented, job: *const DirtyJob, name: [:0]const u8) bool {
-        const ev_io = ev.io();
-        d.lock.lock(ev_io) catch return false; // canceled: the caller makes the call itself
-        defer d.lock.unlock(ev_io);
-        const threaded = d.threaded orelse started: {
-            // The pool's threads allocate from the same allocator, so it is the allocator this
-            // instance hands out, which is thread-safe.
-            const threaded = ev.allocator().create(Io.Threaded) catch return false;
-            // The pool's threads allocate through it too, so it is the allocator this instance
-            // hands out, which is thread-safe.
-            threaded.* = Io.Threaded.init(ev.allocator(), .{});
-            d.threaded = threaded;
-            break :started threaded;
-        };
-        const threaded_io = threaded.io();
-        threaded_io.vtable.groupConcurrent(
-            threaded_io.userdata,
-            &d.group,
-            @ptrCast(job),
-            .of(*DirtyJob),
-            name,
-            DirtyJob.run,
-        ) catch return false;
-        return true;
-    }
-};
-
-/// One `io.blocking` call: what the pool runs, and where the result goes. It lives on the
-/// calling task's stack, which stays put while the task is parked, so the pool reads the
-/// arguments and writes the result there without a copy.
-pub const DirtyJob = struct {
-    ev: *Evented,
-    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
-    context: *const anyopaque,
-    result: *anyopaque,
-    /// 0 while the job runs, 1 once it has finished. This is the calling task's own word, on its
-    /// stack: the pool copies the job, but the task parks on and the job's thread wakes this
-    /// word.
-    done: *std.atomic.Value(u32),
-
-    /// On the pool's thread: makes the blocking call, then wakes the task.
-    fn run(context: *const anyopaque) void {
-        const job: *const DirtyJob = @ptrCast(@alignCast(context));
-        job.start(job.context, job.result);
-        @atomicStore(u32, &job.done.raw, 1, .release);
-        // The task waits on this word on its worker's ring, as a futex wait of the kernel.
-        // `futexWake` from a thread that is not a worker is a plain futex wake, which is what
-        // wakes such a waiter.
-        futexWake(@ptrCast(job.ev), &job.done.raw, 1);
-    }
-};
-
-/// Runs `start` with `context` on a thread that may block, writing the result to `result` before
-/// returning. See `Io.blocking`.
-///
-/// A task parks while a job runs, so the worker runs other tasks. The call is not cancelable
-/// once it has started. If the pool is at its limit, or cannot be started, the call is made on
-/// the calling thread, which holds its worker for as long as it blocks.
-fn dirtyBlocking(
-    userdata: ?*anyopaque,
-    result: []u8,
-    result_alignment: Alignment,
-    context: []const u8,
-    context_alignment: Alignment,
-    name: [:0]const u8,
-    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
-) void {
-    charge(userdata);
-    _ = result_alignment;
-    _ = context_alignment;
-    const ev: *Evented = @ptrCast(@alignCast(userdata));
-    if (Scheduler.Worker.currentOrNull() == null) {
-        // A thread that is not one of the workers has no task to park.
-        start(context.ptr, result.ptr);
-        return;
-    }
-    var done: std.atomic.Value(u32) = .init(0);
-    const job: DirtyJob = .{
-        .ev = ev,
-        .start = start,
-        .context = context.ptr,
-        .result = result.ptr,
-        .done = &done,
-    };
-    if (!ev.dirty.submit(ev, &job, name)) {
-        start(context.ptr, result.ptr);
-        return;
-    }
-    // Until the job has run. Uncancelable: the call is not cancelable once it has started. The
-    // word is on this task's stack, and a wake that arrives before the wait below does is not
-    // lost: the wait returns at once when the word is not 0.
-    futexWaitUncancelable(userdata, &done.raw, 0);
-    // Acquire: the pool thread wrote the result before it set this word, so what it wrote is
-    // visible here.
-    assert(done.load(.acquire) != 0);
-}
 
 /// The ring the watchdog wakes parked workers from. A ring has one submitter, so the watchdog
 /// thread owns this one, and starts it the first time it needs it.
 pub const Watchdog = struct {
+    /// The wake ring, and the lock that makes it usable from any thread: the pool the scheduler
+    /// runs blocking calls on wakes tasks with `readyFromForeign` too, so more than the watchdog
+    /// thread sends these wakes. A ring is submitted to by one thread at a time, and this is
+    /// that one thread: the ring is made without `SINGLE_ISSUER`, so a wake may come from
+    /// whichever thread got the lock.
+    lock: Scheduler.SpinLock = .{},
     /// `null` until the first wake.
     ring: ?IoUring = null,
 
     fn deinit(w: *Watchdog) void {
+        w.lock.lock();
+        defer w.lock.unlock();
         if (w.ring) |*ring| ring.deinit();
         w.ring = null;
     }
 
-    /// Wakes `to`, which is parked in `poll`. Called by the watchdog thread only.
+    /// Wakes `to`, which is parked in `poll`. Any thread may call this.
     fn wake(w: *Watchdog, to: *Scheduler.Worker) void {
+        w.lock.lock();
+        defer w.lock.unlock();
         const ring = w.get() orelse return;
         // Completions of earlier sends: a send that failed leaves one, and the ring must not
         // fill up with them.
@@ -239,9 +131,10 @@ pub const Watchdog = struct {
         _ = ring.submit() catch return;
     }
 
+    /// Assumes the lock is held.
     fn get(w: *Watchdog) ?*IoUring {
         if (w.ring) |*ring| return ring;
-        w.ring = IoUring.init(1, linux.IORING_SETUP_SINGLE_ISSUER) catch |err| {
+        w.ring = IoUring.init(1, 0) catch |err| {
             std.log.scoped(.threadz).warn("unable to wake a stuck worker: {t}", .{err});
             return null;
         };
@@ -250,7 +143,8 @@ pub const Watchdog = struct {
 };
 
 /// For the scheduler: wakes `to` from a thread that is not one of the workers, which is the
-/// watchdog: its own ring sends the wake, since a ring may only be submitted to by its thread.
+/// watchdog and the pool a blocking call runs on. A ring of this instance's own sends the wake,
+/// since a worker's ring belongs to the worker.
 pub fn wakeForeign(ev: *Evented, to: *Scheduler.Worker) void {
     ev.watchdog.wake(to);
 }
@@ -628,7 +522,7 @@ pub fn io(ev: *Evented) Io {
             .concurrent = Scheduler.concurrent,
             .await = Scheduler.await,
             .cancel = Scheduler.cancel,
-            .blocking = dirtyBlocking,
+            .blocking = Scheduler.blocking,
 
             .groupAsync = Scheduler.groupAsync,
             .groupConcurrent = Scheduler.groupConcurrent,
@@ -800,7 +694,6 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
 
         .csprng_mutex = .init,
         .csprng = .uninitialized,
-        .dirty = .{},
         .watchdog = .{},
     };
     try ev.sched.init(backing_allocator, .{
@@ -813,7 +706,6 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
 /// called `init`.
 pub fn deinit(ev: *Evented) void {
     ev.sched.deinit(ev.backing_allocator);
-    ev.dirty.deinit(ev);
     ev.watchdog.deinit();
     ev.null_fd.close();
     ev.random_fd.close();
