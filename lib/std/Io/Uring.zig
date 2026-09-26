@@ -7129,7 +7129,19 @@ fn testWatchdog(
         try testing.io.sleep(.fromMicroseconds(200), .awake);
     }
     try testing.expect(testNow() - start < deadline);
-    const snapshot = ev.stats();
+    // The queue opens as soon as the worker is found stuck, which is what the deadline measures;
+    // the kind is decided a round later. Wait for that episode to be counted, for as long as a
+    // loaded machine may take, and read the rest after it.
+    const counted_by = testNow() + 10 * std.time.ns_per_s;
+    var snapshot = ev.stats();
+    while (switch (expect_kind) {
+        .blocked => snapshot.stuck_episodes == before.stuck_episodes or snapshot.replacements == before.replacements,
+        .computing => snapshot.computing_episodes == before.computing_episodes,
+    }) {
+        try testing.expect(testNow() < counted_by);
+        try testing.io.sleep(.fromMicroseconds(200), .awake);
+        snapshot = ev.stats();
+    }
     const stuck = snapshot.last_stuck orelse return error.TestUnexpectedResult;
     // The same task, name and kind are what the watchdog names in its log line, and only a
     // blocked worker gets a replacement: a computing one keeps the worker it is using.

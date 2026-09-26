@@ -1371,7 +1371,13 @@ pub fn Scheduler(comptime Backend: type) type {
                     .free => unreachable, // `drainInbox` never sees one either
                     .pinned => victim.inbox.push(task),
                     .sticky => {
-                        if (taken) |previous| w.local.push(previous, &s.shared);
+                        // Out of the inbox's chain, as `drainInbox` leaves every task it takes:
+                        // a task that keeps a link it is no longer on is one `destroyTask` stops
+                        // at, and one a later push could follow.
+                        if (taken) |previous| {
+                            previous.status = .{ .queue_next = null };
+                            w.local.push(previous, &s.shared);
+                        }
                         taken = task;
                     },
                 }
@@ -1543,14 +1549,17 @@ pub fn Scheduler(comptime Backend: type) type {
             for (s.workers[0..started]) |*w| {
                 if (w.stranded.load(.acquire)) stuck += 1;
             }
+            // The episode counts first: see `classifyStuck`.
+            const stuck_episodes = s.stuck_episodes.load(.acquire);
+            const computing_episodes = s.computing_episodes.load(.acquire);
             const name = s.report.name.load(.acquire);
             return .{
                 .worker_limit = s.limit.load(.monotonic),
                 .workers = started + spares,
                 .spares = spares,
                 .stuck = stuck,
-                .stuck_episodes = s.stuck_episodes.load(.monotonic),
-                .computing_episodes = s.computing_episodes.load(.monotonic),
+                .stuck_episodes = stuck_episodes,
+                .computing_episodes = computing_episodes,
                 .replacements = s.replacements.load(.monotonic),
                 .watchdog_rounds = s.watchdog_rounds.load(.monotonic),
                 .last_stuck = if (name) |n| .{
@@ -1637,7 +1646,8 @@ pub fn Scheduler(comptime Backend: type) type {
         }
 
         /// The watchdog: it samples every worker every `watchdog_interval`, and reports a worker
-        /// whose current task has not switched out for `stuck_after`. See `reportStuck`.
+        /// whose current task has not switched out for `stuck_after`. See `openStuck` and
+        /// `classifyStuck`.
         fn watchdogEntry(s: *Sched) void {
             const gpa = Backend.allocator(s.backendOf());
             const samples = gpa.alloc(Sample, s.workers.len + s.spares.len) catch |err| {
@@ -1676,16 +1686,10 @@ pub fn Scheduler(comptime Backend: type) type {
             const task = w.running.load(.acquire);
             const tick = w.tick.load(.monotonic);
             if (task == null or task != sample.task or tick != sample.tick) {
-                sample.task = task;
-                sample.tick = tick;
-                sample.since = now;
-                sample.measuring = null;
-                if (sample.reported) {
-                    // It switches out again: it is not stuck, and what it had queued goes back
-                    // to being takeable only when the queue is over the threshold.
-                    sample.reported = false;
-                    s.releaseStranded(w);
-                }
+                // It switches out again: it is not stuck, and what it had queued goes back to
+                // being takeable only when the queue is over the threshold.
+                if (sample.reported or sample.measuring != null) s.releaseStranded(w);
+                sample.* = .{ .task = task, .tick = tick, .since = now };
                 return;
             }
             if (sample.reported) return; // reported already; until it switches out, it is stuck
@@ -1698,13 +1702,16 @@ pub fn Scheduler(comptime Backend: type) type {
                 // keeps its worker's share of the parallelism; one that kept using its time is
                 // computing, which is what compiling is, and nothing about it needs replacing.
                 sample.reported = true;
-                s.reportStuck(w, task.?, tick, @intCast(@divTrunc(elapsed, std.time.ns_per_ms)), .{
+                s.classifyStuck(w, task.?, @intCast(@divTrunc(elapsed, std.time.ns_per_ms)), .{
                     .cpu = measuring.cpu,
                     .cpu_now = if (comptime has_thread_cpu_time) Backend.threadCpuTime(s.backendOf(), w) else null,
                     .wall = now - measuring.at,
                 });
                 return;
             }
+            // First found stuck: its queue opens now, whatever it is doing, so that nothing
+            // queued behind it waits for the round that tells what that is.
+            s.openStuck(w, task.?, tick);
             sample.measuring = .{
                 .cpu = if (comptime has_thread_cpu_time) Backend.threadCpuTime(s.backendOf(), w) else null,
                 .at = now,
@@ -1724,30 +1731,11 @@ pub fn Scheduler(comptime Backend: type) type {
             }
         }
 
-        /// Reports worker `w`, whose task `task` has not switched out for `ms`: the task is named
-        /// in one log line, its queued tasks become takeable whatever their number, one
-        /// replacement worker is started for it, and the episode is counted.
-        fn reportStuck(s: *Sched, w: *Worker, task: *Task, tick: u32, ms: u64, measurement: Measurement) void {
-            const blocked: bool = if (measurement.cpu) |before| blk: {
-                const after = measurement.cpu_now orelse break :blk true; // cannot say: blocked
-                if (after <= before) break :blk true; // no time used at all: waiting for something
-                break :blk (after - before) * 5 < measurement.wall; // less than a fifth of the wall
-            } else true; // the backend cannot say: treat it as blocked
-            const kind: Stats.Kind = if (blocked) .blocked else .computing;
-            s.report.kind.store(kind, .monotonic);
-            s.report.ms.store(ms, .monotonic);
-            s.report.worker.store(w.index, .monotonic);
-            s.report.id.store(task.id, .monotonic);
-            s.report.name.store(task.name.ptr, .release);
-            if (blocked) {
-                _ = s.stuck_episodes.fetchAdd(1, .monotonic);
-                std.log.scoped(.threadz).warn(
-                    "task {d} ({s}) has not switched out for {d} ms on worker {d}: it is blocked, its queued tasks are takeable, and a replacement worker was started",
-                    .{ task.id, task.name, ms, w.index },
-                );
-            } else {
-                _ = s.computing_episodes.fetchAdd(1, .monotonic);
-            }
+        /// Worker `w` has run task `task` for `stuck_after` without switching out: its queued
+        /// tasks become takeable whatever their number, the one in its slot included, and the
+        /// idle workers are woken to take them. Whether it also gets a replacement is decided a
+        /// round later, by `classifyStuck`.
+        fn openStuck(s: *Sched, w: *Worker, task: *Task, tick: u32) void {
             w.stranded.store(true, .release);
             if (comptime has_heavy_barrier) {
                 // Make the store above visible to every worker that has not looked at it yet, so
@@ -1760,11 +1748,38 @@ pub fn Scheduler(comptime Backend: type) type {
                         s.takeStuckSlot(w);
                 } else heavy_barrier_available.store(false, .release);
             }
-            // A computing worker keeps its worker: it is using it. Only a blocked one gets a
-            // replacement, so that working around it does not raise the parallelism a program
-            // asked for with `-j` and a worker limit.
-            if (blocked) s.startSpare(w);
             s.wakeIdle();
+        }
+
+        /// A round after `openStuck`, with the worker still in the same task: tells a blocked
+        /// worker from a computing one by its thread's CPU time, names the task in `stats`, and
+        /// counts the episode. A blocked worker also gets one replacement worker and one log
+        /// line; a computing one keeps its worker, since it is using it, so that working around
+        /// it does not raise the parallelism a program asked for with `-j` and a worker limit.
+        fn classifyStuck(s: *Sched, w: *Worker, task: *Task, ms: u64, measurement: Measurement) void {
+            const blocked: bool = if (measurement.cpu) |before| blk: {
+                const after = measurement.cpu_now orelse break :blk true; // cannot say: blocked
+                if (after <= before) break :blk true; // no time used at all: waiting for something
+                break :blk (after - before) * 5 < measurement.wall; // less than a fifth of the wall
+            } else true; // the backend cannot say: treat it as blocked
+            const kind: Stats.Kind = if (blocked) .blocked else .computing;
+            s.report.kind.store(kind, .monotonic);
+            s.report.ms.store(ms, .monotonic);
+            s.report.worker.store(w.index, .monotonic);
+            s.report.id.store(task.id, .monotonic);
+            s.report.name.store(task.name.ptr, .release);
+            // The episode counts are released after the report and the replacement's count, and
+            // `stats` acquires them first: a reader that sees an episode sees what it reported.
+            if (!blocked) {
+                _ = s.computing_episodes.fetchAdd(1, .release);
+                return;
+            }
+            const replaced = s.startSpare(w);
+            _ = s.stuck_episodes.fetchAdd(1, .release);
+            std.log.scoped(.threadz).warn(
+                "task {d} ({s}) has not switched out for {d} ms on worker {d}: it is blocked, its queued tasks are takeable, and {s}",
+                .{ task.id, task.name, ms, w.index, if (replaced) "a replacement worker runs in its place" else "no replacement worker could be started" },
+            );
         }
 
         /// What the deciding round measured: the thread's CPU time before and after, and the wall
@@ -1793,42 +1808,46 @@ pub fn Scheduler(comptime Backend: type) type {
         }
 
         /// Starts a replacement worker for stuck worker `w`, unless it has one already or every
-        /// slot is taken. A replacement is not counted against `limit`.
-        fn startSpare(s: *Sched, w: *Worker) void {
+        /// slot is taken. A replacement is not counted against `limit`. Returns whether `w` has a
+        /// replacement now.
+        fn startSpare(s: *Sched, w: *Worker) bool {
             for (s.spares, 0..) |*spare, i| {
                 switch (spare.state.load(.acquire)) {
                     .unused => {
                         spare.assigned.store(w.index, .monotonic);
                         s.startSpareThread(spare, @intCast(i)) catch {
                             spare.state.store(.unused, .release);
-                            return;
+                            return false;
                         };
                         // Last: the worker, its backend and its thread are ready before any
                         // other thread reads this slot, and a spare that looks at itself while
                         // it is still starting sees the worker it was assigned to, not its own
                         // state.
                         spare.state.store(.running, .release);
-                        return;
+                        return true;
                     },
-                    .running => if (spare.assigned.load(.monotonic) == w.index) return,
+                    .running => if (spare.assigned.load(.monotonic) == w.index) return true,
                     .exited => {},
                 }
             }
+            return false;
         }
 
         /// Starts the thread of spare `i`, and the worker it runs on: its index is past every
-        /// worker in `workers`.
+        /// worker in `workers`. The replacement is counted before its thread starts, so that
+        /// anything the replacement runs happens after the count, for whoever reads it.
         fn startSpareThread(s: *Sched, spare: *Spare, i: u32) error{SystemResources}!void {
             const w = &spare.worker;
             w.* = s.newWorker(@intCast(s.workers.len + i));
             w.spare = spare;
             Backend.workerInit(s.backendOf(), w) catch return error.SystemResources;
             errdefer Backend.workerDeinit(s.backendOf(), w);
+            _ = s.replacements.fetchAdd(1, .monotonic);
+            errdefer _ = s.replacements.fetchSub(1, .monotonic);
             spare.thread = std.Thread.spawn(.{
                 .stack_size = idle_stack_size,
                 .allocator = Backend.allocator(s.backendOf()),
             }, spareEntry, .{ s, spare }) catch return error.SystemResources;
-            _ = s.replacements.fetchAdd(1, .monotonic);
         }
 
         /// The thread of a replacement worker: `workerEntry`, and the thread returns once it has
@@ -3022,21 +3041,29 @@ test "watchdog: with one worker, what a blocked task queued still runs" {
     const io = b.io();
 
     const S = struct {
-        /// Queues one task behind itself, then blocks the only worker in a raw nanosleep: with
-        /// one worker, a computing task would hold it just as well, but a blocked one is what the
-        /// replacement worker exists for, and the replacement is the only way that task runs.
-        fn blocker(inner_io: Io, done: *std.atomic.Value(bool), word: *std.atomic.Value(u32), spinning: *std.atomic.Value(bool), sleep_ns: u64) void {
-            var future = inner_io.concurrent(short, .{ inner_io, done, word, spinning }) catch return;
-            spinning.store(true, .release);
-            const ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(sleep_ns) };
-            _ = linux.nanosleep(&ts, null);
-            spinning.store(false, .release);
+        /// Queues one task behind itself, then blocks the only worker in a raw futex wait
+        /// until that task has run, for ten seconds at most: with one worker, a computing task
+        /// would hold it just as well, but a blocked one is what the replacement worker exists
+        /// for, and the replacement is the only way that task runs. Waiting for the task rather
+        /// than for a fixed time is what keeps the test true on a loaded machine.
+        fn blocker(inner_io: Io, done: *std.atomic.Value(bool), word: *std.atomic.Value(u32), blocked: *std.atomic.Value(bool), release: *std.atomic.Value(u32)) void {
+            var future = inner_io.concurrent(short, .{ inner_io, done, word, blocked, release }) catch return;
+            blocked.store(true, .release);
+            var waited_ms: u32 = 0;
+            while (release.load(.acquire) == 0 and waited_ms < 10_000) : (waited_ms += 100) {
+                const ts: linux.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+                _ = linux.futex(&release.raw, .{ .cmd = .WAIT, .private = true }, 0, .{ .timeout = &ts }, null, 0);
+            }
+            blocked.store(false, .release);
             future.await(inner_io);
         }
 
-        /// Records whether the task that holds the only worker was still holding it.
-        fn short(inner_io: Io, done: *std.atomic.Value(bool), word: *std.atomic.Value(u32), spinning: *std.atomic.Value(bool)) void {
-            done.store(spinning.load(.acquire), .release);
+        /// Records whether the task that holds the only worker was still blocked on it, then
+        /// releases it and wakes the main task.
+        fn short(inner_io: Io, done: *std.atomic.Value(bool), word: *std.atomic.Value(u32), blocked: *std.atomic.Value(bool), release: *std.atomic.Value(u32)) void {
+            done.store(blocked.load(.acquire), .release);
+            release.store(1, .release);
+            _ = linux.futex_3arg(&release.raw, .{ .cmd = .WAKE, .private = true }, 1);
             word.store(1, .release);
             inner_io.futexWake(u32, &word.raw, 1);
         }
@@ -3044,18 +3071,28 @@ test "watchdog: with one worker, what a blocked task queued still runs" {
 
     var done: std.atomic.Value(bool) = .init(false);
     var word: std.atomic.Value(u32) = .init(0);
-    var spinning: std.atomic.Value(bool) = .init(false);
-    var future = try b.sched.concurrentWith(.{}, S.blocker, .{ io, &done, &word, &spinning, 300 * std.time.ns_per_ms });
-    // The main task is the only worker's task: it parks, and the task the spinner queued wakes
+    var blocked: std.atomic.Value(bool) = .init(false);
+    var release: std.atomic.Value(u32) = .init(0);
+    var future = try b.sched.concurrentWith(.{}, S.blocker, .{ io, &done, &word, &blocked, &release });
+    // The main task is the only worker's task: it parks, and the task the blocker queued wakes
     // it when it has run.
     io.futexWaitUncancelable(u32, &word.raw, 0);
-    try std.testing.expect(done.load(.acquire)); // it ran while the spinner still held the worker
-    const stats = b.sched.stats();
+    // Awaited before the checks, so that a failed check fails the test instead of leaving a task
+    // that `deinit` finds never awaited.
+    future.await(io);
+    try std.testing.expect(done.load(.acquire)); // it ran while the blocker still held the worker
+    // The episode is counted by the watchdog, after the replacement started: wait for it.
+    var stats = b.sched.stats();
+    var waited_ms: u32 = 0;
+    while (stats.stuck_episodes == 0 and waited_ms < 10_000) : (waited_ms += 1) {
+        const ms: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = linux.nanosleep(&ms, null);
+        stats = b.sched.stats();
+    }
     try std.testing.expect(stats.stuck_episodes >= 1);
     try std.testing.expect(stats.replacements >= 1);
     try std.testing.expectEqual(TestBackend.Sched.Stats.Kind.blocked, stats.last_stuck.?.kind);
     try std.testing.expectEqualStrings("blocker", stats.last_stuck.?.name);
-    future.await(io);
 }
 
 test "watchdog: an idle instance has no rounds" {
