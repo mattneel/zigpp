@@ -4850,7 +4850,7 @@ fn serve(
                     }
 
                     if (output.errors.errorMessageCount() != 0) {
-                        try server.serveErrorBundle(output.errors);
+                        try server.serveErrorBundle(.error_bundle, output.errors);
                     } else {
                         try server.serveEmitDigest(&output.digest, .{
                             .flags = .{ .cache_hit = output.cache_hit },
@@ -5008,7 +5008,7 @@ fn serveUpdateResults(s: *Server, comp: *Compilation) !void {
     }
 
     if (error_bundle.errorMessageCount() > 0) {
-        try s.serveErrorBundle(error_bundle);
+        try s.serveErrorBundle(.error_bundle, error_bundle);
         return;
     }
 
@@ -5019,7 +5019,7 @@ fn serveUpdateResults(s: *Server, comp: *Compilation) !void {
     }
 
     // Serve empty error bundle to indicate the update is done.
-    try s.serveErrorBundle(std.zig.ErrorBundle.empty);
+    try s.serveErrorBundle(.error_bundle, std.zig.ErrorBundle.empty);
 }
 
 fn runOrTest(
@@ -5553,7 +5553,7 @@ fn jitCmdInner(
             var error_bundle = try comp.getAllErrorsAlloc();
             defer error_bundle.deinit(comp.gpa);
             if (error_bundle.errorMessageCount() > 0) {
-                try server.serveErrorBundle(error_bundle);
+                try server.serveErrorBundle(.error_bundle, error_bundle);
                 process.exit(2);
             }
         } else {

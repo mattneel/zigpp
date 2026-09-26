@@ -105,7 +105,7 @@ fn serveErrorBundle(arena: std.mem.Allocator, io: Io, diagnostics: *const aro.Di
         .out = &stdout_writer.interface,
         .in = undefined,
     };
-    try server.serveErrorBundle(error_bundle);
+    try server.serveErrorBundle(.error_bundle, error_bundle);
 }
 
 pub const usage =
