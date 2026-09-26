@@ -1354,6 +1354,7 @@ pub fn Scheduler(comptime Backend: type) type {
                 // do not starve it.
                 const task = if (s.shared.pop() orelse s.takeLocal(w)) |task| task: {
                     if (counted) s.stopSearching(w);
+                    std.log.scoped(.threadz).warn("diag: worker {d} takes task {d}", .{ w.index, task.id });
                     break :task task;
                 } else s.search(w, counted) orelse {
                     if (s.stopping.load(.acquire)) return;
@@ -1548,6 +1549,9 @@ pub fn Scheduler(comptime Backend: type) type {
                 s.idle.len += 1;
             }
             if (w.inbox.isEmpty() and !s.anyStealable(w) and !s.stopping.load(.seq_cst)) {
+                std.log.scoped(.threadz).warn("diag: worker {d} blocks in poll, shared {d}", .{
+                    w.index, s.shared.len.load(.seq_cst),
+                });
                 Backend.poll(s.backendOf(), w, .block);
             }
             w.parked.store(false, .seq_cst);
@@ -1591,6 +1595,9 @@ pub fn Scheduler(comptime Backend: type) type {
         /// to park announces it with `.seq_cst` stores, then looks at the queues with `.seq_cst`
         /// loads. So either this sees the worker searching or parked, or the worker sees the work.
         fn notify(s: *Sched, from: ?*Worker) void {
+            std.log.scoped(.threadz).warn("diag: notify from {}: searching {d}, parked {d}, shared {d}", .{
+                from != null, s.idle.searching.load(.seq_cst), s.idle.parked.load(.seq_cst), s.shared.len.load(.seq_cst),
+            });
             if (s.idle.searching.load(.seq_cst) != 0) return;
             if (s.idle.parked.load(.seq_cst) != 0) {
                 // The worker woken here counts as searching from now on, so that the work queued
