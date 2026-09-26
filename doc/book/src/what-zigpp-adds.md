@@ -240,6 +240,44 @@ const io = threadz.io();
 - Threads outside the pool can use the synchronization primitives, whose
   futexes they wait on in the kernel. Other `Io` calls from those threads are
   not supported yet.
+- `io.arena()` returns an allocator whose memory belongs to the task: it is
+  created at the first call, out of the implementation's own allocator, and
+  released in one step when the task returns, whether the task freed it or not.
+  It is where a task puts what it builds up and throws away, such as one
+  request's parsed headers, and a value that outlives the task must not point
+  into it: move what crosses a task boundary by `owned` transfer, into another
+  allocator, or by copying it. The main thread has one too, released by
+  `deinit`, and `io.blocking` runs on a thread of its own, which sees neither
+  the calling task's arena nor its scopes.
+- `io.Scoped(T)` is the task-local value. The key is declared once at container
+  level, `const current = std.Io.Scoped(u32)`, bound around a call with
+  `current.run(io, value, function, args)`, and read with `current.get(io)` -
+  in that call, and in every task spawned inside it, a child of a child as much
+  as a child, each by its own copy, until it returns. Outside the call the
+  binding is gone. `threadlocal` cannot serve this on Threadz: a task migrates
+  at a park point, and the fiber switch does not move the thread's TLS base, so
+  `threadlocal` is worker-local here, not task-local, and `Io.Scoped` is what a
+  per-task value uses. The compiler's per-thread ids and a logger's context are
+  the intended movers.
+- `std.Io.Supervisor` is a group of tasks with OTP's restart policy. Children
+  are added with `add` - the function they run and its arguments, which are
+  copied - before the first `run`. `one_for_one` restarts the child that
+  failed, `one_for_all` cancels and restarts every child, and `rest_for_one`
+  the child that failed and the ones added after it. A child that returns
+  normally is not restarted, which is OTP's `transient` and the only restart
+  type in this cut, and a panic stays fatal. More restarts than `intensity`
+  within `period` - three in five seconds by default - cancel every child and
+  return `error.RestartIntensityExceeded`, with the error it gave up on in
+  `lastChildError`. Canceling `run` cancels the children and returns
+  `error.Canceled`.
+- `Io.Queue` takes its overflow policy at `initWithOptions`: `.block`, the
+  default and the behaviour a queue always had; `.drop`, where a put that finds
+  the queue full drops what does not fit, counts it, and never waits, for a
+  mailbox that keeps the newest sample; and `.drop_and_resync`, which does the
+  same and makes the next `get` return `error.Resync` once, for a consumer that
+  must notice a drop rather than act on stale data. `droppedElements` counts
+  what was dropped. The `get` error set has `error.Resync` in it, which only a
+  `drop_and_resync` queue returns.
 
 On Linux, Threadz runs on io_uring, with a ring per worker: sockets, DNS,
 processes, timers, futexes, and file reads are ring operations. The file

@@ -153,6 +153,25 @@ pinning. The stealing policy comes from the table above, not from the current co
 5. **The other cores.** `Kqueue` rewritten on the shared scheduler for macOS and BSD; `Dispatch`
    retired once it reaches parity; IOCP and the Windows fiber work last.
 6. **BEAM shapes.** Arenas, `Io.Scoped`, `Io.Supervisor`, overflow policies.
+
+   Shipped: an arena lives in the shared scheduler's task and in each core's own task state, made at
+   the first `Io.arena` call out of the implementation's allocator and released when the task
+   returns, before its result is published; the main task's is freed by `deinit`. `Io.Scoped(T)` is
+   the key, one per `T`, declared at container level: `Key.run` binds a value for a call, every task
+   spawned inside it inherits a copy - the copies go into the child's own storage at spawn, and a
+   task that inherits nothing pays one check and takes nothing from its header - and `Key.get` reads
+   it, so a grandchild sees the binding and a task spawned outside the call does not.
+   `Io.Supervisor` runs one `Io.Group` per child, so a strategy cancels and awaits exactly the
+   children it names; `one_for_one`, `one_for_all` and `rest_for_one`, OTP's intensity and period,
+   transient-only restarts, and `error.RestartIntensityExceeded` with the last child error.
+   `Io.Queue` gained `.drop` and `.drop_and_resync` at init beside the unchanged `.block`;
+   `droppedBytes` counts drops at the erased level and `Queue(Elem).droppedElements` in elements,
+   and `get` can return `error.Resync` once. Interfaces: the `Io` vtable gained `taskArena`,
+   `scopedGet`, `scopedPush` and `scopedPop`, and `Io.Queue.get`'s error set gained
+   `error.Resync`; an out-of-tree implementation must add the four entries. Tests on both
+   implementations: `Io.test.test.arena`, `Io.test.test.Scoped`,
+   `Io.test.test.Supervisor restarts per strategy`, `Io.test.test.Supervisor intensity`,
+   `Io.test.test.Supervisor canceled` and `Io.test.test.Queue overflow policy`.
 7. **Observability.** Dump, deadlock detection, scheduler metrics. This is where the OpenTelemetry
    plan attaches.
 8. **Keywords.** In their own proposal.

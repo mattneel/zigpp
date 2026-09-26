@@ -2054,8 +2054,15 @@ pub fn Scheduler(comptime Backend: type) type {
             // The caller is the task spawning this one, so what it sees is what this one
             // inherits: a copy of its whole scope chain, in storage of this task's own, taken
             // below the task in the mapping. See `Io.Scoped`.
+            //
+            // A task that inherits nothing - the common case, and every spawn of a program that
+            // uses no `Scoped` - pays this check and nothing else: no room is taken from the
+            // header, and the stack pointer is where it would have been.
             const parent_scopes = w.currentTask().scopes;
-            const scopes_bytes = Io.Scopes.copySize(parent_scopes) + @alignOf(Io.Scopes);
+            const scopes_bytes: usize = if (parent_scopes) |parent|
+                Io.Scopes.copySize(parent) + @alignOf(Io.Scopes)
+            else
+                0;
             const header_size = @sizeOf(Task) + result_space + context.len + context_alignment.toByteUnits() +
                 scopes_bytes + 64;
             const mapping = if (options.stack_size == null and header_size <= default_header_size)
@@ -2080,10 +2087,11 @@ pub fn Scheduler(comptime Backend: type) type {
             // the stack grows down from its pointer, so anything under it would be grown over.
             // The layout, from the top of the mapping down, is
             // `result, task, arguments, inherited bindings, stack, guard page`.
-            const scopes_base: [*]align(@alignOf(Io.Scopes)) u8 = @ptrFromInt(Alignment.of(Io.Scopes).backward(
-                @intFromPtr(context_bytes) - scopes_bytes,
-            ));
-            const sp = std.mem.alignBackward(usize, @intFromPtr(scopes_base), 16);
+            const scopes_base: ?[*]align(@alignOf(Io.Scopes)) u8 = if (scopes_bytes == 0)
+                null
+            else
+                @ptrFromInt(Alignment.of(Io.Scopes).backward(@intFromPtr(context_bytes) - scopes_bytes));
+            const sp = std.mem.alignBackward(usize, @intFromPtr(context_bytes) - scopes_bytes, 16);
             task.* = .{
                 .context = switch (builtin.cpu.arch) {
                     .aarch64, .riscv64 => .{ .sp = sp, .fp = @intFromPtr(task), .pc = @intFromPtr(&taskEntry) },
@@ -2109,7 +2117,7 @@ pub fn Scheduler(comptime Backend: type) type {
                 // The name has to be a comptime string: a task reports it long after the memory
                 // of whoever spawned it is gone. `Io.spawnedName` is one.
                 .name = if (name.len == 0) "unnamed" else name,
-                .scopes = Io.Scopes.copyInto(parent_scopes, scopes_base),
+                .scopes = if (scopes_base) |base| Io.Scopes.copyInto(parent_scopes, base) else null,
                 .tsan_fiber = if (tsan.enable) tsan.__tsan_create_fiber(0),
             };
             if (builtin.cpu.arch == .x86_64) @as(*usize, @ptrFromInt(sp - 8)).* = 0; // no return address

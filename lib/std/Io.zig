@@ -30,6 +30,11 @@ pub const Threaded = @import("Io/Threaded.zig");
 pub const fiber = @import("Io/fiber.zig");
 /// Tasks on their own stacks, parked at every Io call and scheduled across a pool of OS
 /// workers: io_uring on Linux, kqueue on the BSDs, libdispatch on Darwin.
+///
+/// Every task owns an arena (`Io.arena`) and a chain of task-local values (`Io.Scoped`), and a
+/// group of tasks can be supervised (`Io.Supervisor`). `threadlocal` is worker-local on Threadz,
+/// not task-local: a task migrates at a park point, and the fiber switch does not move the
+/// thread's TLS base. `Io.Scoped` is what a per-task value uses.
 pub const Threadz = if (fiber.supported) switch (builtin.os.tag) {
     // The io_uring core keeps a socket handle and a length in one word of an operation's
     // storage, and a pointer in each completion's user data: it needs 64-bit pointers, so
@@ -2130,9 +2135,11 @@ pub const Supervisor = struct {
         }
     }
 
-    /// Whether any child of the current round is running.
+    /// Whether any child of the current round is running. The children are read through their
+    /// pointers, never copied: a copy would read a child's group - whose fields the group's own
+    /// machinery writes atomically on other workers - without an atomic access.
     fn anyRunning(s: *const Supervisor) bool {
-        for (s.children.items) |child| if (child.running) return true;
+        for (s.children.items) |*child| if (child.running) return true;
         return false;
     }
 
@@ -2140,8 +2147,11 @@ pub const Supervisor = struct {
     fn spawn(s: *Supervisor, index: u32) RunError!void {
         const child = &s.children.items[index];
         assert(!child.running);
-        assert(child.group.token.raw == null);
-        child.group = .init;
+        // The child's group is reused: `Io.Group` says a group may be added to again after it has
+        // been awaited or canceled, and the last round's was, which left it empty. It is not
+        // written here - its own machinery wrote those fields on another worker, and rewriting
+        // them plainly would race with that.
+        assert(child.group.token.load(.acquire) == null);
         child.epoch +%= 1;
         var live: Live = .{ .supervisor = s, .index = index, .epoch = child.epoch };
         try s.io.vtable.groupConcurrent(
@@ -2203,6 +2213,12 @@ pub const Supervisor = struct {
         child.group.await(s.io) catch |err| switch (err) {
             error.Canceled => unreachable, // cancelation is blocked for the wait
         };
+        // The group's `state` is the implementation's own atomic cell, and the last thing the
+        // child's task does to the group is a release write to it. Reading it here with acquire
+        // orders everything that task did before that write - the group's own bookkeeping, which
+        // an early-returning `await` above would otherwise leave unordered - before whatever the
+        // monitor does to the group and its memory next.
+        _ = @atomicLoad(usize, &child.group.state, .acquire);
     }
 
     /// Throws away the reports of the tasks a strategy just canceled. Their epochs are past, so
@@ -2210,8 +2226,11 @@ pub const Supervisor = struct {
     fn drain(s: *Supervisor) void {
         const old = s.io.swapCancelProtection(.blocked);
         defer _ = s.io.swapCancelProtection(old);
+        // One at a time, into storage of its own: the queue's ring buffer is the queue's, and a
+        // get into it would copy it onto itself.
+        var scratch: [1]Exit = undefined;
         while (true) {
-            const n = s.exits.get(s.io, s.exits_buffer, 0) catch |err| switch (err) {
+            const n = s.exits.get(s.io, &scratch, 0) catch |err| switch (err) {
                 // Cancelation is blocked, the monitor never closes the queue, and it blocks.
                 error.Canceled, error.Closed, error.Resync => unreachable,
             };
