@@ -3605,13 +3605,18 @@ test "watchdog: with one worker, what a blocked task queued still runs" {
         /// would hold it just as well, but a blocked one is what the replacement worker exists
         /// for, and the replacement is the only way that task runs. Waiting for the task rather
         /// than for a fixed time is what keeps the test true on a loaded machine.
-        fn blocker(inner_io: Io, done: *std.atomic.Value(bool), word: *std.atomic.Value(u32), blocked: *std.atomic.Value(bool), release: *std.atomic.Value(u32)) void {
+        fn blocker(inner_io: Io, done: *std.atomic.Value(bool), word: *std.atomic.Value(u32), blocked: *std.atomic.Value(bool), release: *std.atomic.Value(u32), loop_ns: *std.atomic.Value(u64)) void {
             var future = inner_io.concurrent(short, .{ inner_io, done, word, blocked, release }) catch return;
             blocked.store(true, .release);
+            // How long the loop really took, not how many steps it counted: a wait that returns
+            // at once burns the ten seconds in microseconds, which is what a failure has to tell
+            // apart from a wait that really waited.
+            const started = testNow();
             var waited_ms: u32 = 0;
             while (release.load(.acquire) == 0 and waited_ms < 10_000) : (waited_ms += 100) {
                 Futex.wait(&release.raw, 0, 100 * std.time.ns_per_ms);
             }
+            loop_ns.store(testNow() -% started, .release);
             blocked.store(false, .release);
             future.await(inner_io);
         }
@@ -3631,7 +3636,8 @@ test "watchdog: with one worker, what a blocked task queued still runs" {
     var word: std.atomic.Value(u32) = .init(0);
     var blocked: std.atomic.Value(bool) = .init(false);
     var release: std.atomic.Value(u32) = .init(0);
-    var future = try b.sched.concurrentWith(.{}, S.blocker, .{ io, &done, &word, &blocked, &release });
+    var loop_ns: std.atomic.Value(u64) = .init(0);
+    var future = try b.sched.concurrentWith(.{}, S.blocker, .{ io, &done, &word, &blocked, &release, &loop_ns });
     // The main task is the only worker's task: it parks, and the task the blocker queued wakes
     // it when it has run.
     io.futexWaitUncancelable(u32, &word.raw, 0);
@@ -3653,7 +3659,7 @@ test "watchdog: with one worker, what a blocked task queued still runs" {
         // between a worker it never replaced and a replacement that did not take the task.
         const stuck = stats.last_stuck;
         std.debug.print(
-            "one-worker watchdog: done=false blocked={} stuck={d} computing={d} replacements={d} kind={t} worker={d} stuck_ms={d} cpu_ns={?d}\n",
+            "one-worker watchdog: done=false blocked={} stuck={d} computing={d} replacements={d} kind={t} worker={d} stuck_ms={d} loop_ms={d} cpu_ns={?d}\n",
             .{
                 blocked.load(.acquire),
                 stats.stuck_episodes,
@@ -3662,6 +3668,7 @@ test "watchdog: with one worker, what a blocked task queued still runs" {
                 if (stuck) |st| st.kind else .blocked,
                 if (stuck) |st| st.worker else 0,
                 if (stuck) |st| st.ms else 0,
+                loop_ns.load(.acquire) / std.time.ns_per_ms,
                 TestBackend.threadCpuTime(b, &b.sched.workers[0]),
             },
         );
