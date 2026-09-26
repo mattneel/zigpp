@@ -25,7 +25,9 @@ they touch say so:
   zemscripten's build scripts moved to Zig++'s build API in
   [mattneel/raylib](https://github.com/mattneel/raylib) and
   [mattneel/zemscripten](https://github.com/mattneel/zemscripten), on a `zigpp` branch that
-  merges upstream. raylib's C and its headers are unchanged.
+  merges upstream. raylib's own C and its headers are unchanged; the one C change is a bounds
+  fix in minigamepad, the gamepad library raylib vendors with RGFW, which a Zig++ Debug build
+  stopped at.
 - **The fork follows raylib's master**, not the `6.0` tag: raylib 6.1-dev at the pin, whose
   `raylib.h` has 619 functions, not 600.
 - **Nothing is tagged.** raylibz, the fork and its consumers pin commits, the way a Zig++

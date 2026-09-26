@@ -68,7 +68,7 @@ macOS or Windows.
    good one:
 
    ```sh
-   zig fetch --save https://github.com/mattneel/raylibz/archive/7822b0f143e6320307c4b759c275e8e82e1de90f.tar.gz
+   zig fetch --save https://github.com/mattneel/raylibz/archive/bc0ec551a3e7de06739c60dd67b1760e9f432870.tar.gz
    ```
 
    That records the URL, and the hash of what it downloaded, in
@@ -108,18 +108,19 @@ macOS or Windows.
    zig build run
    ```
 
-   The first build takes a few minutes, because it compiles raylib. A window
-   opens; close it, or press Escape.
+   The first build takes a minute or more, because it compiles Zig++'s build
+   runner and raylib. A window opens; close it, or press Escape.
 
 ## What just happened
 
-- `zig build` fetched raylibz and, as raylibz's own dependency, raylib:
-  [mattneel/raylib](https://github.com/mattneel/raylib), raysan's raylib with
-  its build scripts ported to Zig++'s build API, following raylib's master.
+- `zig fetch` downloaded raylibz. `zig build` then fetched raylibz's own
+  dependency, raylib: [mattneel/raylib](https://github.com/mattneel/raylib),
+  raysan's raylib with its build scripts ported to Zig++'s build API and one
+  fix in the gamepad library it vendors, following raylib's master.
 - raylib's own `build.zig` compiled raylib's C with the Clang inside Zig++, and
   chose raylib's window layer: GLFW, on X11 on Linux. Every one of raylib's
-  build options passes through raylibz unchanged, so
-  `zig build run -Dplatform=rgfw` builds on RGFW instead.
+  build options passes through raylibz unchanged: add `.platform = .rgfw` to
+  the `b.dependency` call from step 5, and the program runs on RGFW instead.
 - The same build script ran translate-c over `raylib.h`, `raymath.h` and
   `rlgl.h`. Zig++'s translator reads C headers and writes Zig declarations for
   them, and raylib's build script publishes those as modules.
