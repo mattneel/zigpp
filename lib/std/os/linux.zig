@@ -1187,6 +1187,34 @@ pub fn futex_3arg(uaddr: *const anyopaque, futex_op: FUTEX_OP, val: u32) usize {
     );
 }
 
+/// The commands of `membarrier`, and the flag it takes in `flags`.
+pub const MEMBARRIER = struct {
+    /// Return the commands the kernel supports, as a bitmask, without doing anything else.
+    pub const QUERY: u32 = 0;
+    /// Wait for all running threads to pass through a state where they executed a memory
+    /// barrier.
+    pub const GLOBAL: u32 = 1;
+    /// As `GLOBAL`, and wait for all running threads to pass through a state where they
+    /// executed a memory barrier, and for all their prior memory accesses to be visible to
+    /// this thread. A process registers for it with `REGISTER_GLOBAL_EXPEDITED` first.
+    pub const GLOBAL_EXPEDITED: u32 = 1 << 0;
+    pub const REGISTER_GLOBAL_EXPEDITED: u32 = 1 << 1;
+    /// As `GLOBAL_EXPEDITED`, for threads of this process that do not share memory with any
+    /// other. A process registers for it with `REGISTER_PRIVATE_EXPEDITED` first.
+    pub const PRIVATE_EXPEDITED: u32 = 1 << 3;
+    pub const REGISTER_PRIVATE_EXPEDITED: u32 = 1 << 4;
+    /// Not a command: the flag that makes `PRIVATE_EXPEDITED` and its registration cooperate
+    /// with dynticks, where a thread is running in user mode away from the kernel.
+    pub const CMD_FLAG_RETRY: u32 = 1 << 5;
+};
+
+/// Registers for or makes the memory barriers of `MEMBARRIER`, which is how a thread makes its
+/// writes visible to threads whose barriers have not run yet. The commands that make a barrier
+/// have to be registered for first, once per process.
+pub fn membarrier(cmd: u32, flags: u32, cpu_id: u32) usize {
+    return syscall3(.membarrier, cmd, flags, cpu_id);
+}
+
 /// Four-argument variation on the v1 futex call.  Only suitable for
 /// futex_op that ignores the remaining arguments (e.g., FUTEX_OP.WAIT).
 pub fn futex_4arg(uaddr: *const anyopaque, futex_op: FUTEX_OP, val: u32, timeout: ?*const timespec) usize {

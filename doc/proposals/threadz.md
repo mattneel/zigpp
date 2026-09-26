@@ -120,7 +120,12 @@ pinning. The stealing policy comes from the table above, not from the current co
    whatever their number, one replacement worker is started for it and released when it switches
    again, `Threadz.stats()` counts the episodes, and one `std.log` line scoped `.threadz` names the
    task, by id and by the function it was spawned with, which is what tasks are named by now (see
-   below). Pinned tasks stay put on a stuck worker. Acceptance: a spinning task costs one worker
+   below). The watchdog starts with the first task the instance makes or runs, so a worker limit
+   of one still reports and replaces. A stuck worker's slot for the next task is the watchdog's to
+   put in the shared queue, which is what lets a worker take its own slot with a plain load and
+   store: the watchdog sets a flag, calls `membarrier`, and re-reads the two words the worker
+   stores at every switch, and if it sees no change it takes the slot with a compare-exchange,
+   which the worker also uses when it sees the flag. Pinned tasks stay put on a stuck worker. Acceptance: a spinning task costs one worker
    and nothing else waits; a blocking C call inside a task is detected and named.
 
    Shipped: the spin test queues 32 tasks behind a task that spins for 500 ms with no Io call and

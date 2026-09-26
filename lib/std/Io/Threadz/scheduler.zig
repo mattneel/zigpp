@@ -40,7 +40,8 @@
 //! * `cancelOperation(backend, from, task, token)`, which cancels the operation `task` is waiting
 //!   for in the worker identified by `token`;
 //! * `allocator(backend)`;
-//! * `io(backend)`, the instance's `Io`, which the watchdog uses to wait between its samples.
+//! * `io(backend)`, the instance's `Io`, which the watchdog uses to wait between its samples and
+//!   to read the clock. Its `now` has to work.
 
 const builtin = @import("builtin");
 const std = @import("../../std.zig");
@@ -99,6 +100,12 @@ pub const stuck_after: u64 = 100 * std.time.ns_per_ms;
 /// Empirically saw >128KB being used by the self-hosted backend to panic.
 /// Empirically saw glibc complain about 256KB.
 const idle_stack_size = 512 * 1024;
+
+/// Whether this process can use `membarrier`, which the watchdog takes a stuck worker's slot
+/// for the next task with: see `Sched.takeNext`. Cleared, for the whole process, if the process
+/// cannot register for it, on a kernel before 4.14 or under a seccomp filter, and every taker
+/// then pays a compare-exchange.
+var membarrier_available: std.atomic.Value(bool) = .init(true);
 
 /// A worker goes through its scheduling loop, which polls the backend, after this many switches,
 /// even if it always has another task to run.
@@ -159,6 +166,11 @@ pub fn Scheduler(comptime Backend: type) type {
         watchdog_started: std.atomic.Value(bool),
         /// The watchdog waits on this between rounds, and `deinit` wakes it with it.
         watchdog_wait: std.atomic.Value(u32),
+        /// Set while the watchdog waits with no timeout, with every worker parked: a worker that
+        /// unparks then wakes it. See `watchdogWait` and `notifyWatchdogUnparked`.
+        watchdog_sleeping: std.atomic.Value(bool),
+        /// Rounds of samples the watchdog made. See `stats`.
+        watchdog_rounds: std.atomic.Value(u64),
         /// Episodes in which a worker was found stuck. See `stats`.
         stuck_episodes: std.atomic.Value(u64),
         /// Replacement workers the watchdog started for stuck workers. See `stats`.
@@ -626,6 +638,9 @@ pub fn Scheduler(comptime Backend: type) type {
             stuck_episodes: u64,
             /// The replacements the watchdog started for stuck workers.
             replacements: u64,
+            /// Rounds of samples the watchdog made. It makes none while every worker is parked:
+            /// it waits, without a timeout, until one of them runs a task again.
+            watchdog_rounds: u64,
             /// The last stuck episode, or null if there has been none.
             last_stuck: ?Stuck = null,
 
@@ -736,6 +751,8 @@ pub fn Scheduler(comptime Backend: type) type {
                 .watchdog = undefined,
                 .watchdog_started = .init(false),
                 .watchdog_wait = .init(0),
+                .watchdog_sleeping = .init(false),
+                .watchdog_rounds = .init(0),
                 .stuck_episodes = .init(0),
                 .replacements = .init(0),
                 .report = .{},
@@ -922,6 +939,10 @@ pub fn Scheduler(comptime Backend: type) type {
                 // What the watchdog samples. Release: it names the task it publishes, and the
                 // task's fields are the ones the queue handoff made visible to this worker.
                 w.running.store(new, .release);
+                // The first task this instance runs starts the watchdog, on any worker, worker 0
+                // included: an instance with one worker still reports a task that is stuck, and
+                // the replacement is the only way anything else runs.
+                if (new != null and !s.watchdog_started.load(.monotonic)) s.startWatchdog();
                 switch (message.pending_task) {
                     .nothing => {},
                     .reschedule => if (old) |task| s.readyYielded(w, task),
@@ -993,6 +1014,8 @@ pub fn Scheduler(comptime Backend: type) type {
         /// may call block in the kernel rather than park.
         pub fn charge(s: *Sched) void {
             const w = Worker.currentOrNull() orelse return;
+            // The idle context runs on the worker's own stack, not in a task.
+            if (w.current_context == &w.idle_context) return;
             const task = w.currentTask();
             if (task.ops < budget) {
                 task.ops += 1;
@@ -1013,7 +1036,7 @@ pub fn Scheduler(comptime Backend: type) type {
         }
 
         fn takeLocal(s: *Sched, w: *Worker) ?*Task {
-            if (s.takeNext(w)) |task| {
+            if (takeNext(w)) |task| {
                 if (w.lifo_streak < lifo_limit) {
                     w.lifo_streak += 1;
                     return task;
@@ -1028,10 +1051,43 @@ pub fn Scheduler(comptime Backend: type) type {
             return s.shared.pop();
         }
 
-        /// Takes the task in `w`'s slot for the next task, if any. Only one taker wins it:
-        /// another worker takes it from a worker that is stuck. See `steal`.
-        fn takeNext(s: *Sched, w: *Worker) ?*Task {
-            _ = s;
+        /// Takes the task in this worker's slot for the next task, if any.
+        ///
+        /// A worker takes its own slot with no locked instruction, because the only other taker
+        /// is the watchdog, and only for a worker it has declared stuck, with a protocol this
+        /// cheap path cannot lose a race with. The watchdog's half is `takeStuckSlot`; together
+        /// they are the asymmetric Dekker argument:
+        ///
+        /// The watchdog samples this worker's `running` task and its `tick`, and declares it
+        /// stuck only when both stay the same for `stuck_after`. It then sets `stranded`, calls
+        /// `membarrier`, and re-reads `running` and `tick`. Those are the words this worker
+        /// stores at every switch, before it can reach this point: `tick` in `nextLocal` on the
+        /// way out of a task, and `running` in `handle`, which is also the store that says the
+        /// worker is looking for work rather than running a task. If the re-read sees either
+        /// changed, the worker switched, and the watchdog takes nothing. If it sees both
+        /// unchanged, then this worker has not reached the load below yet, and it cannot see the
+        /// old `stranded`: the membarrier returns only once every thread of the process has
+        /// passed a memory barrier, so the store of `stranded` is visible to a load that comes
+        /// after this thread's own barrier — which the barrier below makes sure of, for the
+        /// compiler — and this worker takes the compare-exchange path instead of this one.
+        /// Either way one taker wins.
+        fn takeNext(w: *Worker) ?*Task {
+            const maybe_task = w.run_next.load(.monotonic) orelse return null;
+            // The stores this worker made at this switch must not be reordered after the load
+            // below: see the note above.
+            asm volatile ("" ::: .{ .memory = true });
+            if (w.stranded.load(.monotonic) or !membarrier_available.load(.monotonic)) {
+                @branchHint(.unlikely);
+                return takeNextExclusive(w);
+            }
+            w.run_next.store(null, .monotonic);
+            return maybe_task;
+        }
+
+        /// `takeNext`, with a compare-exchange, which only one taker wins. For a worker that the
+        /// watchdog has declared stuck, and for a process where `membarrier` is not available,
+        /// where `takeNext`'s cheaper path cannot be used.
+        fn takeNextExclusive(w: *Worker) ?*Task {
             var maybe_task = w.run_next.load(.monotonic);
             while (maybe_task) |task| {
                 if (w.run_next.cmpxchgStrong(task, null, .acq_rel, .acquire) == null) return task;
@@ -1184,20 +1240,36 @@ pub fn Scheduler(comptime Backend: type) type {
             for (0..started) |i| {
                 const victim = &s.workers[(w.steal_start +% i) % started];
                 if (victim == w) continue;
-                const stranded = victim.stranded.load(.acquire);
-                if (stranded) {
-                    // What only the worker itself could take before it got stuck.
-                    if (s.takeNext(victim)) |task| return task;
-                    if (s.takeInbox(w, victim)) |task| return task;
-                }
-                const n = w.local.grab(&victim.local, if (stranded) 0 else steal_threshold);
-                if (n == 0) continue;
-                const tail = w.local.tail.raw;
-                const task = w.local.load(tail +% n -% 1);
-                if (n > 1) w.local.tail.store(tail +% n -% 1, .seq_cst);
-                return task;
+                if (s.stealFrom(w, victim)) |task| return task;
+            }
+            // Replacements are workers too, and one of them can be the stuck one: what it took
+            // from a stuck worker before that is still anyone's to take.
+            for (s.spares) |*spare| {
+                if (spare.state.load(.acquire) != .running) continue;
+                const victim = &spare.worker;
+                if (victim == w) continue;
+                if (s.stealFrom(w, victim)) |task| return task;
             }
             return null;
+        }
+
+        /// Takes a task from one victim worker, whichever of its queues has one to give: see
+        /// `steal`.
+        fn stealFrom(s: *Sched, w: *Worker, victim: *Worker) ?*Task {
+            const stranded = victim.stranded.load(.acquire);
+            if (stranded) {
+                // What only the worker itself could take before it got stuck: the tasks others
+                // made runnable for it. Its slot for the next task is the watchdog's to take,
+                // because only a slot's own worker takes one without a locked instruction: see
+                // `takeNext`.
+                if (s.takeInbox(w, victim)) |task| return task;
+            }
+            const n = w.local.grab(&victim.local, if (stranded) 0 else steal_threshold);
+            if (n == 0) return null;
+            const tail = w.local.tail.raw;
+            const task = w.local.load(tail +% n -% 1);
+            if (n > 1) w.local.tail.store(tail +% n -% 1, .seq_cst);
+            return task;
         }
 
         /// Takes the tasks others made runnable for stuck worker `victim`, which cannot take
@@ -1259,6 +1331,11 @@ pub fn Scheduler(comptime Backend: type) type {
                 s.idle.stack[i] = s.idle.stack[s.idle.len];
                 break;
             }
+            // About to run a task again, or to look for one: the watchdog is waiting with no
+            // timeout if it saw every worker parked, and it has to sample this one. Announced
+            // only after this worker stopped counting as parked, so that a watchdog that is
+            // deciding right now uses its timeout instead of waiting for a wake.
+            s.notifyWatchdogUnparked();
         }
 
         /// Wakes `target` if it is parked and nobody has woken it yet.
@@ -1278,12 +1355,13 @@ pub fn Scheduler(comptime Backend: type) type {
         }
 
         /// Finds a worker for work any worker may take: wakes a parked one, or starts one, unless
-        /// a worker is searching already.
+        /// a worker is searching already. `from` is the worker the wake comes from, or `null` for
+        /// a caller that is not a worker, which is the watchdog.
         ///
         /// Queueing work is a `.seq_cst` store and the loads here are `.seq_cst`. A worker about
         /// to park announces it with `.seq_cst` stores, then looks at the queues with `.seq_cst`
         /// loads. So either this sees the worker searching or parked, or the worker sees the work.
-        fn notify(s: *Sched, from: *Worker) void {
+        fn notify(s: *Sched, from: ?*Worker) void {
             if (s.idle.searching.load(.seq_cst) != 0) return;
             if (s.idle.parked.load(.seq_cst) != 0) {
                 // The worker woken here counts as searching from now on, so that the work queued
@@ -1307,7 +1385,8 @@ pub fn Scheduler(comptime Backend: type) type {
                     };
                     target.woken_to_search.store(true, .seq_cst);
                     if (target.parked.cmpxchgStrong(true, false, .seq_cst, .monotonic) == null) {
-                        return Backend.wake(s.backendOf(), from, target);
+                        if (from) |worker| Backend.wake(s.backendOf(), worker, target) else Backend.wakeForeign(s.backendOf(), target);
+                        return;
                     }
                     // Awake already. If it took the count over meanwhile, it searches; if not,
                     // the count goes to the next parked worker.
@@ -1342,9 +1421,6 @@ pub fn Scheduler(comptime Backend: type) type {
             };
             // A worker's fields are ready before it is counted as started.
             s.started.store(index + 1, .release);
-            // The first worker past worker 0 starts the watchdog: a program that never runs a
-            // second worker never pays for one.
-            if (index == 1) s.startWatchdog();
         }
 
         /// Starts workers until the one with this index is running.
@@ -1390,6 +1466,7 @@ pub fn Scheduler(comptime Backend: type) type {
                 .stuck = stuck,
                 .stuck_episodes = s.stuck_episodes.load(.monotonic),
                 .replacements = s.replacements.load(.monotonic),
+                .watchdog_rounds = s.watchdog_rounds.load(.monotonic),
                 .last_stuck = if (name) |n| .{
                     .id = s.report.id.load(.monotonic),
                     .name = std.mem.span(n),
@@ -1399,9 +1476,12 @@ pub fn Scheduler(comptime Backend: type) type {
             };
         }
 
-        /// Starts the watchdog thread, once: with the first worker past worker 0.
-        fn startWatchdog(s: *Sched) void {
+        /// Starts the watchdog thread, once: with the first task the instance makes or runs, on
+        /// any worker, worker 0 included. An instance that never makes or runs a task pays
+        /// nothing for one.
+        pub fn startWatchdog(s: *Sched) void {
             if (s.watchdog_started.swap(true, .seq_cst)) return;
+            s.registerMembarrier();
             s.watchdog = std.Thread.spawn(.{
                 .stack_size = idle_stack_size,
                 .allocator = Backend.allocator(s.backendOf()),
@@ -1410,6 +1490,24 @@ pub fn Scheduler(comptime Backend: type) type {
                 std.log.scoped(.threadz).warn("unable to start the watchdog: {t}", .{err});
                 return;
             };
+        }
+
+        /// Registers this process for the expedited private memory barrier the watchdog takes a
+        /// stuck worker's slot with, once per process: it is idempotent, and free after the
+        /// first time. Clears `membarrier_available`, for the whole process, if it fails.
+        fn registerMembarrier(s: *Sched) void {
+            _ = s;
+            if (!membarrier_available.load(.monotonic)) return;
+            switch (linux.errno(linux.membarrier(linux.MEMBARRIER.REGISTER_PRIVATE_EXPEDITED, 0, 0))) {
+                .SUCCESS => {},
+                else => {
+                    membarrier_available.store(false, .release);
+                    std.log.scoped(.threadz).warn(
+                        "unable to take a stuck worker's next task without waiting for it: membarrier is unavailable",
+                        .{},
+                    );
+                },
+            }
         }
 
         /// Stops the watchdog and joins it. Called by `deinit` before the workers it samples go
@@ -1422,15 +1520,48 @@ pub fn Scheduler(comptime Backend: type) type {
             s.watchdog.join();
         }
 
-        /// Waits between two rounds of samples, or until `deinit` stops the watchdog. The wait
-        /// is an Io futex, so a backend that blocks foreign threads in the kernel sleeps here
-        /// rather than spinning.
+        /// Waits between two rounds of samples, or until `deinit` stops the watchdog, or until a
+        /// worker that was parked runs a task again. With every worker parked there is nothing to
+        /// sample, so the wait has no timeout then and an idle program wakes the watchdog no
+        /// more than it runs tasks. The wait is an Io futex, so a backend that blocks foreign
+        /// threads in the kernel sleeps here rather than spinning.
         fn watchdogWait(s: *Sched) void {
             const io = Backend.io(s.backendOf());
-            Io.futexWaitTimeout(io, u32, &s.watchdog_wait.raw, 0, .{ .duration = .{
+            var timeout: Io.Timeout = .{ .duration = .{
                 .raw = .fromNanoseconds(watchdog_interval),
                 .clock = .awake,
-            } }) catch {};
+            } };
+            if (s.allParked()) {
+                // The flag is set before the word is cleared, and the second look is after the
+                // flag: a worker that unparks between the two either sees the flag and wakes the
+                // word, which makes the wait below return at once, or clears its `parked` before
+                // the second look, which keeps the timeout below.
+                s.watchdog_sleeping.store(true, .release);
+                s.watchdog_wait.store(0, .release);
+                if (s.allParked() and !s.stopping.load(.acquire)) timeout = .none;
+            } else s.watchdog_wait.store(0, .release);
+            Io.futexWaitTimeout(io, u32, &s.watchdog_wait.raw, 0, timeout) catch {};
+            s.watchdog_sleeping.store(false, .release);
+        }
+
+        /// Whether every worker that exists is parked, which is when the watchdog has nothing to
+        /// sample. A worker that is looking for work is not parked, and it parks or finds work
+        /// soon.
+        fn allParked(s: *Sched) bool {
+            var workers = s.started.load(.acquire);
+            for (s.spares) |*spare| {
+                if (spare.state.load(.acquire) == .running) workers += 1;
+            }
+            return s.idle.parked.load(.seq_cst) >= workers;
+        }
+
+        /// Wakes the watchdog, which is waiting with no timeout while every worker is parked and
+        /// would not sample this worker: it is about to run a task again.
+        fn notifyWatchdogUnparked(s: *Sched) void {
+            if (!s.watchdog_sleeping.load(.acquire)) return;
+            const io = Backend.io(s.backendOf());
+            s.watchdog_wait.store(1, .release);
+            Io.futexWake(io, u32, &s.watchdog_wait.raw, 1);
         }
 
         /// The watchdog: it samples every worker every `watchdog_interval`, and reports a worker
@@ -1451,6 +1582,7 @@ pub fn Scheduler(comptime Backend: type) type {
         }
 
         fn watchdogRound(s: *Sched, samples: []Sample) void {
+            _ = s.watchdog_rounds.fetchAdd(1, .monotonic);
             const now = Io.Timestamp.now(Backend.io(s.backendOf()), .awake).nanoseconds;
             const started = s.started.load(.acquire);
             for (s.workers[0..started], samples[0..started]) |*w, *sample| s.watchdogWorker(w, sample, now);
@@ -1487,7 +1619,7 @@ pub fn Scheduler(comptime Backend: type) type {
             const elapsed = now - sample.since;
             if (elapsed < stuck_after) return;
             sample.stuck = true;
-            s.reportStuck(w, task.?, @intCast(@divTrunc(elapsed, std.time.ns_per_ms)));
+            s.reportStuck(w, task.?, tick, @intCast(@divTrunc(elapsed, std.time.ns_per_ms)));
         }
 
         /// The worker switches out again: what was queued on it is takeable only when the queue
@@ -1506,7 +1638,7 @@ pub fn Scheduler(comptime Backend: type) type {
         /// Reports worker `w`, whose task `task` has not switched out for `ms`: the task is named
         /// in one log line, its queued tasks become takeable whatever their number, one
         /// replacement worker is started for it, and the episode is counted.
-        fn reportStuck(s: *Sched, w: *Worker, task: *Task, ms: u64) void {
+        fn reportStuck(s: *Sched, w: *Worker, task: *Task, tick: u32, ms: u64) void {
             s.report.ms.store(ms, .monotonic);
             s.report.worker.store(w.index, .monotonic);
             s.report.id.store(task.id, .monotonic);
@@ -1517,8 +1649,27 @@ pub fn Scheduler(comptime Backend: type) type {
                 .{ task.id, task.name, ms, w.index },
             );
             w.stranded.store(true, .release);
+            if (membarrier_available.load(.monotonic)) {
+                // Make the store above visible to every worker that has not looked at it yet, so
+                // that a worker which is switching right now either sees it and takes its slot
+                // with a compare-exchange, or has already made both of the words the re-read
+                // below checks say so. See `takeNext`.
+                _ = linux.membarrier(linux.MEMBARRIER.PRIVATE_EXPEDITED, 0, 0);
+                const current = w.running.load(.acquire);
+                if (current != null and current.? == task and w.tick.load(.monotonic) == tick)
+                    s.takeStuckSlot(w);
+            }
             s.startSpare(w);
             s.wakeIdle();
+        }
+
+        /// Takes the task in stuck worker `w`'s slot for the next task, which only its own worker
+        /// would take, and puts it in the shared queue, where every worker looks. Called by the
+        /// watchdog, which is the only other taker of a slot: see `takeNext`.
+        fn takeStuckSlot(s: *Sched, w: *Worker) void {
+            const task = w.run_next.swap(null, .acquire) orelse return;
+            s.shared.push(&.{task});
+            s.notify(null);
         }
 
         /// Wakes every parked worker, so that work made takeable at once is taken at once.
@@ -1756,6 +1907,10 @@ pub fn Scheduler(comptime Backend: type) type {
             if (builtin.cpu.arch == .x86_64) @as(*usize, @ptrFromInt(sp - 8)).* = 0; // no return address
             @memcpy(context_bytes[0..context.len], context);
             w.live += 1;
+            // A task that runs, or one that is made, starts the watchdog: an instance with one
+            // worker still reports a task that is stuck, and the replacement is the only way
+            // anything else runs. An instance that never makes or runs a task pays nothing.
+            if (!s.watchdog_started.load(.monotonic)) s.startWatchdog();
             return task;
         }
 
@@ -2424,6 +2579,7 @@ const TestBackend = struct {
         v.swapCancelProtection = Sched.swapCancelProtection;
         v.checkCancel = Sched.checkCancel;
         v.blocking = Sched.blockingDirect;
+        v.now = now;
         v.futexWait = futexWait;
         v.futexWaitUncancelable = futexWaitUncancelable;
         v.futexWake = futexWake;
@@ -2460,6 +2616,17 @@ const TestBackend = struct {
         _ = from;
         to.backend.wake_word.store(1, .release);
         _ = linux.futex_4arg(&to.backend.wake_word.raw, .{ .cmd = .WAKE, .private = true }, 1, null);
+    }
+
+    /// The scheduler's watchdog reads the clock to tell how long a task has held its worker.
+    pub fn now(userdata: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
+        _ = userdata;
+        var tp: linux.timespec = undefined;
+        switch (linux.errno(linux.clock_gettime(Io.Threaded.clockToPosix(clock), &tp))) {
+            .SUCCESS => {},
+            else => return .zero,
+        }
+        return Io.Threaded.timestampFromPosix(&tp);
     }
 
     pub fn wakeForeign(b: *TestBackend, to: *Sched.Worker) void {
@@ -2653,4 +2820,122 @@ test "worker limit" {
     for (0..1000) |_| group.async(io, S.spin, .{ 10_000, &sink });
     try group.await(io);
     try std.testing.expect(b.sched.started.load(.monotonic) <= 2);
+}
+
+/// Nanoseconds on the monotonic clock, without an Io call, for tests that must keep a worker.
+fn testNow() u64 {
+    var tp: linux.timespec = undefined;
+    assert(linux.errno(linux.clock_gettime(linux.CLOCK.MONOTONIC, &tp)) == .SUCCESS);
+    return @as(u64, @intCast(tp.sec)) * std.time.ns_per_s + @as(u64, @intCast(tp.nsec));
+}
+
+test "watchdog: with one worker, what a stuck task queued still runs" {
+    const b = try testBackend(4);
+    defer destroyTestBackend(b);
+    b.sched.setWorkerLimit(1);
+    const io = b.io();
+
+    const S = struct {
+        /// Queues one task behind itself, then holds the only worker for 300 ms without making
+        /// an Io call: the replacement is the only way that task runs.
+        fn spinner(inner_io: Io, done: *std.atomic.Value(bool), word: *std.atomic.Value(u32), spinning: *std.atomic.Value(bool), spin_ns: u64) void {
+            var future = inner_io.concurrent(short, .{ inner_io, done, word, spinning }) catch return;
+            spinning.store(true, .release);
+            const until = testNow() + spin_ns;
+            var x: u64 = 0;
+            while (testNow() < until) {
+                inline for (0..8) |i| x +%= i;
+                std.mem.doNotOptimizeAway(x);
+            }
+            spinning.store(false, .release);
+            future.await(inner_io);
+        }
+
+        /// Records whether the task that holds the only worker was still holding it.
+        fn short(inner_io: Io, done: *std.atomic.Value(bool), word: *std.atomic.Value(u32), spinning: *std.atomic.Value(bool)) void {
+            done.store(spinning.load(.acquire), .release);
+            word.store(1, .release);
+            inner_io.futexWake(u32, &word.raw, 1);
+        }
+    };
+
+    var done: std.atomic.Value(bool) = .init(false);
+    var word: std.atomic.Value(u32) = .init(0);
+    var spinning: std.atomic.Value(bool) = .init(false);
+    var future = try b.sched.concurrentWith(.{}, S.spinner, .{ io, &done, &word, &spinning, 300 * std.time.ns_per_ms });
+    // The main task is the only worker's task: it parks, and the task the spinner queued wakes
+    // it when it has run.
+    io.futexWaitUncancelable(u32, &word.raw, 0);
+    try std.testing.expect(done.load(.acquire)); // it ran while the spinner still held the worker
+    const stats = b.sched.stats();
+    try std.testing.expect(stats.stuck_episodes >= 1);
+    try std.testing.expectEqualStrings("spinner", stats.last_stuck.?.name);
+    future.await(io);
+}
+
+test "watchdog: an idle instance has no rounds" {
+    const b = try testBackend(2);
+    defer destroyTestBackend(b);
+    const io = b.io();
+
+    const S = struct {
+        /// Parks itself on a word nobody sets until the end of the test.
+        fn park(inner_io: Io, word: *std.atomic.Value(u32)) void {
+            inner_io.futexWaitUncancelable(u32, &word.raw, 0);
+        }
+
+        /// Waits for every worker to be parked, then measures the watchdog's rounds over a
+        /// window, then wakes the parked tasks.
+        fn measure(b2: *TestBackend, word: *std.atomic.Value(u32), before: *std.atomic.Value(u64), during: *std.atomic.Value(u64)) void {
+            // Wait for the workers to park and the watchdog to settle into its untimed wait.
+            const settle: linux.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+            _ = linux.nanosleep(&settle, null);
+            const start = b2.sched.stats().watchdog_rounds;
+            const window: linux.timespec = .{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
+            _ = linux.nanosleep(&window, null);
+            const end = b2.sched.stats().watchdog_rounds;
+            before.store(start, .release);
+            during.store(end - start, .release);
+            word.store(1, .release);
+            _ = linux.futex_4arg(&word.raw, .{ .cmd = .WAKE, .private = true }, 2, null);
+        }
+    };
+
+    var word: std.atomic.Value(u32) = .init(0);
+    var before: std.atomic.Value(u64) = .init(0);
+    var during: std.atomic.Value(u64) = .init(0);
+    // One task parked on each worker, so that both workers are parked and there is nothing to
+    // sample.
+    var parked_here = try b.sched.concurrentWith(.{ .affinity = .{ .pinned = 1 } }, S.park, .{ io, &word });
+    var parked_there = try b.sched.concurrentWith(.{ .affinity = .{ .pinned = 0 } }, S.park, .{ io, &word });
+    const thread = try std.Thread.spawn(.{}, S.measure, .{ b, &word, &before, &during });
+    io.futexWaitUncancelable(u32, &word.raw, 0);
+    thread.join();
+    try std.testing.expect(before.load(.acquire) >= 1); // the watchdog ran while tasks ran
+    try std.testing.expectEqual(0, during.load(.acquire)); // and no rounds with every worker parked
+    parked_here.await(io);
+    parked_there.await(io);
+}
+
+test "watchdog: a process without membarrier still takes slots" {
+    const b = try testBackend(2);
+    defer destroyTestBackend(b);
+    const io = b.io();
+    if (membarrier_available.load(.monotonic)) {
+        // The fallback for a process that cannot register for membarrier: every taker of a slot
+        // for the next task pays a compare-exchange, and the watchdog takes none.
+        membarrier_available.store(false, .release);
+        defer membarrier_available.store(true, .release);
+    }
+
+    const S = struct {
+        fn add(total: *std.atomic.Value(u64), n: u64) void {
+            _ = total.fetchAdd(n, .monotonic);
+        }
+    };
+    var total: std.atomic.Value(u64) = .init(0);
+    var group: Io.Group = .init;
+    for (0..1000) |i| group.async(io, S.add, .{ &total, i });
+    try group.await(io);
+    try std.testing.expectEqual(1000 * 999 / 2, total.load(.monotonic));
 }
