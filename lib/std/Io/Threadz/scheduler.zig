@@ -1885,11 +1885,13 @@ pub fn Scheduler(comptime Backend: type) type {
                         s.takeStuckSlot(w);
                 } else {
                     // The backend cannot issue the barrier, so from here on every taker of a slot
-                    // pays a compare-exchange: see `takeNext`. An atomic swap is such a taker, so
-                    // the task the stuck worker had next is taken here as well, and the tasks
-                    // behind it do not wait for the worker either.
+                    // pays a compare-exchange: see `takeNext`. This round takes no slot, though:
+                    // a worker that loaded the flag before the store above is inside `takeNext`'s
+                    // cheaper path, a plain load and store, and nothing orders its take against
+                    // this thread's swap — that is the window the barrier and the re-read exist
+                    // to close. The worker's next take is exclusive, and the slot is the
+                    // watchdog's from then on.
                     heavy_barrier_available.store(false, .release);
-                    s.takeStuckSlot(w);
                 }
             } else {
                 // No barrier at all: every taker of a slot pays a compare-exchange already, which
