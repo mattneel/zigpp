@@ -110,6 +110,9 @@ pub fn transFnMacro(mt: *MacroTranslator) ParseError!void {
             if (std.mem.eql(u8, some.data.name, "cast")) {
                 break :ret some.data.args[0];
             }
+            if (std.mem.eql(u8, some.data.name, "DISCARD")) {
+                break :ret ZigTag.void_type.init();
+            }
         }
         if (typeof_arg.castTag(.std_mem_zeroinit)) |some| break :ret some.data.lhs;
         if (typeof_arg.castTag(.std_mem_zeroes)) |some| break :ret some.data;
@@ -957,6 +960,12 @@ fn parseCCastExpr(mt: *MacroTranslator, scope: *Scope) ParseError!ZigNode {
                 return mt.parseCPostfixExpr(scope, type_name);
             }
             const node_to_cast = try mt.parseCCastExpr(scope);
+            if (isVoidType(type_name)) {
+                // Zig has no `void` type to cast to, and an `anyopaque` cast cannot be
+                // returned or stored. A cast to void in C evaluates its operand and
+                // discards the result, which is what DISCARD does.
+                return mt.t.createHelperCallNode(.DISCARD, &.{node_to_cast});
+            }
             return mt.t.createHelperCallNode(.cast, &.{ type_name, node_to_cast });
         }
         mt.i -= 1; // l_paren
@@ -1157,18 +1166,23 @@ fn parseCNumericType(mt: *MacroTranslator) ParseError!ZigNode {
     return error.ParseError;
 }
 
+/// Detects the `void` type, which is translated to a bare `anyopaque` type node. A pointer
+/// to void is translated to `?*anyopaque` instead, so only the bare type node qualifies.
+fn isVoidType(node: ZigNode) bool {
+    const ty = node.castTag(.type) orelse return false;
+    return std.mem.eql(u8, ty.data, "anyopaque");
+}
+
 fn parseCAbstractDeclarator(mt: *MacroTranslator, node: ZigNode) ParseError!ZigNode {
     if (mt.eat(.asterisk)) {
-        if (node.castTag(.type)) |some| {
-            if (std.mem.eql(u8, some.data, "anyopaque")) {
-                const ptr = try ZigTag.single_pointer.create(mt.t.arena, .{
-                    .is_const = false,
-                    .is_volatile = false,
-                    .is_allowzero = false,
-                    .elem_type = node,
-                });
-                return ZigTag.optional_type.create(mt.t.arena, ptr);
-            }
+        if (isVoidType(node)) {
+            const ptr = try ZigTag.single_pointer.create(mt.t.arena, .{
+                .is_const = false,
+                .is_volatile = false,
+                .is_allowzero = false,
+                .elem_type = node,
+            });
+            return ZigTag.optional_type.create(mt.t.arena, ptr);
         }
         return ZigTag.c_pointer.create(mt.t.arena, .{
             .is_const = false,
@@ -1422,4 +1436,97 @@ fn parseCUnaryExpr(mt: *MacroTranslator, scope: *Scope) ParseError!ZigNode {
     }
 
     return try mt.parseCPostfixExpr(scope, null);
+}
+
+/// Runs the whole translate-c pipeline on an in-memory C source. The returned buffer is
+/// allocated with `gpa` and is owned by the caller.
+fn translateSource(gpa: mem.Allocator, source: []const u8) ![]u8 {
+    var diagnostics: aro.Diagnostics = .{ .output = .ignore };
+    var comp = try aro.Compilation.init(.testing);
+    comp.diagnostics = &diagnostics;
+    defer comp.deinit();
+
+    const base_file = try comp.addSourceFromBuffer("test.c", source);
+    const builtin_macros = try comp.generateBuiltinMacros(.no_system_defines);
+
+    var pp = try aro.Preprocessor.init(&comp, .{ .base_file = base_file.id });
+    defer pp.deinit();
+
+    _ = try pp.preprocess(builtin_macros);
+    const eof = try pp.preprocess(base_file);
+    try pp.addToken(eof);
+
+    var tree = try aro.Parser.parse(&pp);
+    defer tree.deinit();
+
+    return Translator.translate(.{
+        .gpa = gpa,
+        .comp = &comp,
+        .pp = &pp,
+        .tree = &tree,
+        .module_libs = true,
+        .pub_static = true,
+        .func_bodies = true,
+        .keep_macro_literals = true,
+        .default_init = true,
+        .strict_flex_arrays = .@"2",
+    });
+}
+
+test "cast to void in macro bodies" {
+    const gpa = std.testing.allocator;
+
+    const rendered = try translateSource(gpa,
+        \\#define TRACELOG(level, ...) (void)0
+        \\#define NOTHING (void)0
+        \\#define USE(x) (void)(x)
+        \\#define PAREN ((void)0)
+        \\#define MORE(a, b) (void)(a)
+        \\static int f(void)
+        \\{
+        \\    (void)5;
+        \\    return 0;
+        \\}
+        \\
+    );
+    defer gpa.free(rendered);
+
+    // A variadic function-like macro whose body is a cast to void has a `void` return
+    // type, and the discarded operand is still evaluated.
+    try std.testing.expect(std.mem.indexOf(u8, rendered,
+        \\pub inline fn TRACELOG(level: anytype) void {
+        \\    _ = &level;
+        \\    return __helpers.DISCARD(@as(c_int, 0));
+        \\}
+    ) != null);
+
+    // Same for an object-like macro, and for extra parentheses.
+    try std.testing.expect(std.mem.indexOf(u8, rendered,
+        \\pub const NOTHING = __helpers.DISCARD(@as(c_int, 0));
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered,
+        \\pub const PAREN = __helpers.DISCARD(@as(c_int, 0));
+    ) != null);
+
+    // `(void)(X)` macros match the DISCARD template.
+    try std.testing.expect(std.mem.indexOf(u8, rendered,
+        \\pub const USE = __helpers.DISCARD;
+    ) != null);
+
+    // A macro that discards only one of its parameters still discards the other.
+    try std.testing.expect(std.mem.indexOf(u8, rendered,
+        \\pub inline fn MORE(a: anytype, b: anytype) void {
+        \\    _ = &a;
+        \\    _ = &b;
+        \\    return __helpers.DISCARD(a);
+        \\}
+    ) != null);
+
+    // A cast to void in a translated function body is a discard statement, as before.
+    try std.testing.expect(std.mem.indexOf(u8, rendered,
+        \\pub fn f() callconv(.c) c_int {
+        \\    _ = @as(c_int, 5);
+        \\    return 0;
+        \\}
+    ) != null);
 }
