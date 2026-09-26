@@ -108,6 +108,9 @@ const register_flags = std.c.EV.ADD | std.c.EV.ONESHOT;
 /// operation needs more.
 const max_registrations = 2;
 
+/// A completion that no worker's parked list holds.
+const unusable_worker = std.math.maxInt(u32);
+
 /// The events one `poll` reads. A worker handles what it gets and polls again, so this is a
 /// batch size, not a limit on the work in flight.
 const max_events = 64;
@@ -241,7 +244,7 @@ pub fn cancelOperation(ev: *Evented, from: *Scheduler.Worker, task: *Fiber, toke
     backend.parked_lock.lock();
     if (findParked(backend, task)) |parked| {
         const completion = parked.resultPointer(Completion);
-        if (completion.state.cmpxchgStrong(.waiting, .canceled, .seq_cst, .monotonic) == null) {
+        if (completion.state.cmpxchgStrong(.waiting, .woken, .seq_cst, .monotonic) == null) {
             // It has not parked yet, so it takes itself out and makes itself runnable as it
             // parks: see `markParked`. Taking it out here would leave it waiting for an event
             // that has been deleted.
@@ -258,6 +261,32 @@ pub fn cancelOperation(ev: *Evented, from: *Scheduler.Worker, task: *Fiber, toke
     }
     backend.parked_lock.unlock();
     if (make_runnable) ev.sched.ready(from, task);
+}
+
+/// Makes the parked task `task` runnable with `outcome`, from a waker that is not the worker
+/// whose kqueue completes it: a futex wake, which has no worker of its own, and any other thread
+/// that decides a parked task should run. The task comes out of its worker's parked list and out
+/// of the kernel, and a task that has not finished parking is left the wake to take itself, so
+/// that it is never runnable twice.
+///
+/// Returns whether the caller makes the task runnable; the task's own side does that when it was
+/// still switching out.
+fn wakeParked(ev: *Evented, task: *Fiber, outcome: Completion.Outcome) bool {
+    const completion = task.resultPointer(Completion);
+    const owner = ev.sched.workerAt(completion.worker_index) orelse return false;
+    const backend = &owner.backend;
+    backend.parked_lock.lock();
+    defer backend.parked_lock.unlock();
+    if (findParked(backend, task) == null) return false; // not parked any more
+    if (completion.state.cmpxchgStrong(.waiting, .woken, .seq_cst, .monotonic) == null) {
+        completion.outcome = outcome;
+        return false;
+    }
+    // A worker completes a parked task only from its own `poll`, which cannot be running while
+    // this holds the lock, so the task is still parked here.
+    assert(completion.state.load(.monotonic) == .parked);
+    unpark(ev, backend, task, null, outcome);
+    return true;
 }
 
 /// For the scheduler: makes `to`'s blocking `kevent` return. A kqueue's events may be changed
@@ -463,9 +492,14 @@ pub const Completion = struct {
     registrations: [max_registrations]Registration = @splat(.{}),
     /// How many of `registrations` are in use.
     count: u8 = 0,
-    /// The park, a completion and a cancellation exchange this word, so that exactly one of them
-    /// makes the task runnable. See `park`.
+    /// The park, a completion and a waker exchange this word, so that exactly one of them makes
+    /// the task runnable: a waker that gets here before the task has parked leaves the wake to the
+    /// task's own side of the exchange. See `park` and `wakeParked`.
     state: std.atomic.Value(State) = .init(.idle),
+    /// The worker whose parked list holds the task, so that a wake that is not a worker's
+    /// completion — a futex wake, a cancellation, the task itself once it runs again — takes the
+    /// task out of that list.
+    worker_index: u32 = unusable_worker,
     /// The next task in its worker's list of parked tasks. See `Worker.parked`.
     next: ?*Fiber = null,
     /// For a futex wait: the bucket the task is waiting in, and its node there, so that a wake
@@ -478,7 +512,16 @@ pub const Completion = struct {
     kq_fd: fd_t = -1,
 
     pub const Outcome = enum(u8) { none, ready, timeout, canceled };
-    pub const State = enum(u8) { idle, waiting, parked, canceled };
+    pub const State = enum(u8) {
+        /// Not parked, and nothing is waiting to complete it.
+        idle,
+        /// Published, but the task has not switched away yet.
+        waiting,
+        /// Switched away, and a waker may make it runnable.
+        parked,
+        /// A waker got here first: the task takes the wake itself once it is switched away.
+        woken,
+    };
 };
 
 /// What a task asked the kernel to watch: an ident and a filter, and for a timer how long it
@@ -522,6 +565,7 @@ fn park(
     completion.futex_bucket = if (futex) |f| f.bucket else null;
     completion.futex_node = if (futex) |f| f.node else null;
     completion.kq_fd = w.backend.kq_fd;
+    completion.worker_index = w.index;
     {
         // Publishing is one step, under the lock: a cancellation must not be able to take the
         // task out of the list before it is in it, nor leave a kernel event behind.
@@ -541,10 +585,16 @@ fn park(
         return error.Canceled;
     };
     s.yield(null, .{ .custom = .{ .context = completion, .run = markParked } });
-    // Running again. A worker that completed the task took its events out already; a wake that
-    // came through the futex table did not, because no worker is involved in it, so the events
-    // that did not fire come out here, on whichever worker the task resumed on: any thread may
-    // change any kqueue.
+    // Running again. A worker that completed the task took it out of its list and out of the
+    // kernel already; a wake that came from the futex table or from a cancellation has no worker
+    // to do that, so both happen here, whichever worker the task resumed on: any thread may
+    // change any kqueue, and the list is behind the owner's lock.
+    if (ev.sched.workerAt(completion.worker_index)) |owner| {
+        owner.backend.parked_lock.lock();
+        defer owner.backend.parked_lock.unlock();
+        if (findParked(&owner.backend, task)) |_| removeParked(&owner.backend, task);
+    }
+    completion.worker_index = unusable_worker;
     deleteRegistrations(completion.kq_fd, completion);
     completion.kq_fd = -1;
     completion.futex_bucket = null;
@@ -567,9 +617,9 @@ fn park(
 fn markParked(s: *Sched, task: *Fiber, context: *anyopaque) void {
     const completion: *Completion = @ptrCast(@alignCast(context));
     if (completion.state.cmpxchgStrong(.waiting, .parked, .seq_cst, .monotonic) == null) return;
-    // A cancellation got there first, and left this side of the exchange the wake: it cannot
-    // make a task runnable that has not finished switching out.
-    assert(completion.state.load(.monotonic) == .canceled);
+    // A waker — a cancellation, or a futex's — got there first and left this side of the exchange
+    // the wake: it cannot make a task runnable that has not finished switching out.
+    assert(completion.state.load(.monotonic) == .woken);
     s.ready(.current(), task);
 }
 
@@ -943,6 +993,7 @@ fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
     const from = Scheduler.Worker.currentOrNull();
     while (woken) |waiter| {
         woken = waiter.next;
+        if (!wakeParked(ev, waiter.task, .ready)) continue; // it takes its own wake, or is gone
         if (from) |w| ev.sched.ready(w, waiter.task) else ev.sched.readyFromForeign(waiter.task);
     }
 }
