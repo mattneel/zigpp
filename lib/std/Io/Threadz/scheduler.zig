@@ -3341,3 +3341,148 @@ test "watchdog: a computing task starts no replacement" {
     try std.testing.expectEqual(TestBackend.Sched.Stats.Kind.computing, after.last_stuck.?.kind);
     future.await(io);
 }
+
+// Case A: a task is cancel-protected and gets a cancelation request while it awaits nothing, then,
+// still protected, awaits a group whose member finishes normally. Nothing but `removeTask` can
+// ready it, and the request must be kept for its next cancelation point after it unblocks.
+test "cancelation: a protected awaiter of a group is readied, and keeps its request" {
+    const b = try testBackend(3);
+    defer destroyTestBackend(b);
+    const io = b.io();
+
+    const Context = struct {
+        /// The member waits on this word; the test sets it to let the member finish.
+        word: u32 = 0,
+        /// The awaiter's task, published by the test, and the handshake that makes the request land
+        /// while the awaiter awaits nothing.
+        task: std.atomic.Value(?*TestBackend.Sched.Task) = .init(null),
+        protected: std.atomic.Value(bool) = .init(false),
+        requested: std.atomic.Value(bool) = .init(false),
+        member_done: std.atomic.Value(bool) = .init(false),
+        resumed: std.atomic.Value(bool) = .init(false),
+        canceled: std.atomic.Value(bool) = .init(false),
+
+        fn member(b_: *TestBackend, ctx: *@This()) void {
+            TestBackend.futexWaitUncancelable(b_, &ctx.word, 0);
+            ctx.member_done.store(true, .release);
+        }
+
+        fn awaiter(inner_io: Io, ctx: *@This(), group: *Io.Group) void {
+            _ = inner_io.swapCancelProtection(.blocked);
+            ctx.protected.store(true, .release);
+            // The request must arrive before this task awaits anything.
+            var spins: usize = 0;
+            while (!ctx.requested.load(.acquire)) : (spins += 1) {
+                if (spins > (1 << 31)) return;
+                std.atomic.spinLoopHint();
+            }
+            group.await(inner_io) catch |err| switch (err) {
+                error.Canceled => unreachable, // cancelation is blocked
+            };
+            // Readied by the group's last member leaving, not by the request.
+            ctx.resumed.store(true, .release);
+            _ = inner_io.swapCancelProtection(.unblocked);
+            inner_io.checkCancel() catch |err| switch (err) {
+                error.Canceled => ctx.canceled.store(true, .release),
+            };
+        }
+    };
+
+    var ctx: Context = .{};
+    var group: Io.Group = .init;
+    try b.sched.groupConcurrentWith(&group, .{ .affinity = .free }, Context.member, .{ b, &ctx });
+    var awaiter = try b.sched.concurrentWith(.{ .affinity = .free }, Context.awaiter, .{ io, &ctx, &group });
+    ctx.task.store(@ptrCast(@alignCast(awaiter.any_future.?)), .release);
+
+    // Wait for the awaiter to be cancel-protected, then request cancelation on it while it awaits
+    // nothing: the request is kept, and nothing else happens.
+    var spins: usize = 0;
+    while (!ctx.protected.load(.acquire)) : (spins += 1) {
+        if (spins > (1 << 31)) return error.TestUnexpectedResult;
+        std.atomic.spinLoopHint();
+    }
+    b.sched.requestCancel(ctx.task.load(.acquire).?);
+    ctx.requested.store(true, .release);
+
+    // Now the member finishes, and the awaiter must be readied by that alone.
+    @atomicStore(u32, &ctx.word, 1, .monotonic);
+    TestBackend.futexWake(b, &ctx.word, 1);
+
+    spins = 0;
+    while (!ctx.resumed.load(.acquire)) : (spins += 1) {
+        if (spins > (1 << 31)) break; // never readied: the assertions below fail
+        std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(ctx.member_done.load(.acquire));
+    try std.testing.expect(ctx.resumed.load(.acquire));
+    awaiter.await(io);
+    try group.await(io);
+    try std.testing.expect(ctx.canceled.load(.acquire));
+}
+
+// Case B: a cancel request arrives at a registered, cancel-protected awaiter at the same time as
+// the group's last member leaves. The request must not read the awaiter's group state after the
+// group has reset it, and the awaiter must resume exactly once.
+test "cancelation: a cancel request racing the last member's exit" {
+    const b = try testBackend(3);
+    defer destroyTestBackend(b);
+    const io = b.io();
+
+    const Context = struct {
+        word: u32 = 0,
+        member_done: std.atomic.Value(bool) = .init(false),
+        resumed: std.atomic.Value(bool) = .init(false),
+        canceled: std.atomic.Value(bool) = .init(false),
+        finished: std.atomic.Value(bool) = .init(false),
+
+        fn member(b_: *TestBackend, ctx: *@This()) void {
+            TestBackend.futexWaitUncancelable(b_, &ctx.word, 0);
+            ctx.member_done.store(true, .release);
+        }
+
+        fn awaiter(inner_io: Io, ctx: *@This(), group: *Io.Group) void {
+            _ = inner_io.swapCancelProtection(.blocked);
+            group.await(inner_io) catch |err| switch (err) {
+                error.Canceled => unreachable,
+            };
+            ctx.resumed.store(true, .release);
+            _ = inner_io.swapCancelProtection(.unblocked);
+            inner_io.checkCancel() catch |err| switch (err) {
+                error.Canceled => ctx.canceled.store(true, .release),
+            };
+            ctx.finished.store(true, .release);
+        }
+    };
+
+    var iteration: usize = 0;
+    while (iteration < 200) : (iteration += 1) {
+        var ctx: Context = .{};
+        var group: Io.Group = .init;
+        try b.sched.groupConcurrentWith(&group, .{ .affinity = .free }, Context.member, .{ b, &ctx });
+        var awaiter = try b.sched.concurrentWith(.{ .affinity = .free }, Context.awaiter, .{ io, &ctx, &group });
+        const task: *TestBackend.Sched.Task = @ptrCast(@alignCast(awaiter.any_future.?));
+
+        // Wait until the awaiter has registered itself with the group, so the request below races
+        // the member's exit.
+        var spins: usize = 0;
+        while (@atomicLoad(TestBackend.Sched.Group.Awaiter, TestBackend.Sched.Group.awaiterPtr(.{ .ptr = &group }), .monotonic).awaiter == .null) : (spins += 1) {
+            if (spins > (1 << 31)) return error.TestUnexpectedResult;
+            std.atomic.spinLoopHint();
+        }
+
+        b.sched.requestCancel(task);
+        @atomicStore(u32, &ctx.word, 1, .monotonic);
+        TestBackend.futexWake(b, &ctx.word, 1);
+
+        spins = 0;
+        while (!ctx.finished.load(.acquire)) : (spins += 1) {
+            if (spins > (1 << 31)) break;
+            std.atomic.spinLoopHint();
+        }
+        try std.testing.expect(ctx.member_done.load(.acquire));
+        try std.testing.expect(ctx.resumed.load(.acquire));
+        awaiter.await(io);
+        try group.await(io);
+        try std.testing.expect(ctx.canceled.load(.acquire));
+    }
+}
