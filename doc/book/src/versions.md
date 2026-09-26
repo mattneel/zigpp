@@ -46,10 +46,9 @@ smoke test runs `zig version` and `zig env`, compiles and runs a program that
 uses private fields, checks that naming a private field from another file is
 rejected, and compiles and runs C with the Clang and libc the archive carries.
 
-A newer push to master cancels the release run of an older one that is still
-in progress: the newer release supersedes it. Pushes that change only the book,
-the proposals, ppup, or the other workflows publish no release, since the
-archives would not change.
+Every push to master is a release, including one that changes only the book, and
+no push's run cancels another's: a burst of pushes publishes one release for
+each of them. Their runs can finish in any order.
 
 A pull request that changes the release machinery builds the archives and
 checks them, and publishes nothing.
