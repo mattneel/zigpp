@@ -1,10 +1,13 @@
-//! Throughput and latency of the `Io` task primitives, on the `Io.Threaded` of this tree.
+//! Throughput and latency of the `Io` task primitives, on the `Io.Threaded` or the `Io.Threadz`
+//! of this tree.
 //!
-//!     zig run -OReleaseFast lib/std/Io/benchmark.zig -- [--threads N] [--filter NAME] [--runs N]
+//!     zig run -OReleaseFast lib/std/Io/benchmark.zig -- [--io threaded|threadz] [--threads N]
+//!         [--filter NAME] [--runs N]
 //!
-//! `--threads` is the `async_limit` of the `Io.Threaded` under test, which is the number of worker
-//! threads it may add to the pool; the default is the implementation's own default, one less than
-//! the number of CPUs. Each benchmark runs `--runs` times (3 by default) and reports the best run.
+//! `--threads` is the number of threads the implementation may add to the calling one: the
+//! `async_limit` of an `Io.Threaded`, the `thread_limit` of an `Io.Threadz`. The default is each
+//! implementation's own, one less than the number of CPUs. Each benchmark runs `--runs` times (3
+//! by default) and reports the best run.
 //!
 //! The tasks do a few dozen nanoseconds of work each, so what is measured is the cost of spawning,
 //! scheduling, waking and joining them, not the work.
@@ -69,9 +72,12 @@ fn spawnShare(io: Io, group: *Io.Group, share: usize) void {
 }
 
 fn spawnerCount(io: Io) usize {
-    const threaded: *Io.Threaded = @ptrCast(@alignCast(io.userdata));
-    return @max(1, @min(64, @backingInt(threaded.async_limit) / 4));
+    _ = io;
+    return @max(1, @min(64, added_threads / 4));
 }
+
+/// The threads the implementation under test may add to the calling one.
+var added_threads: usize = undefined;
 
 /// A binary tree of tasks: every inner node spawns its two children into a group of its own and
 /// awaits it. Tasks spawn tasks from the workers, and inner nodes block in `await`.
@@ -141,6 +147,7 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
 
+    var implementation: enum { threaded, threadz } = .threaded;
     var threads: ?usize = null;
     var filter: ?[]const u8 = null;
     var runs: usize = 3;
@@ -148,7 +155,10 @@ pub fn main(init: std.process.Init) !void {
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (i + 1 == args.len) usage();
-        if (std.mem.eql(u8, arg, "--threads")) {
+        if (std.mem.eql(u8, arg, "--io")) {
+            i += 1;
+            implementation = std.meta.stringToEnum(@TypeOf(implementation), args[i]) orelse usage();
+        } else if (std.mem.eql(u8, arg, "--threads")) {
             i += 1;
             threads = std.fmt.parseUnsigned(usize, args[i], 10) catch usage();
         } else if (std.mem.eql(u8, arg, "--filter")) {
@@ -160,18 +170,39 @@ pub fn main(init: std.process.Init) !void {
         } else usage();
     }
 
-    var threaded: Io.Threaded = .init(std.heap.smp_allocator, .{
-        .async_limit = if (threads) |n| .limited(n) else null,
-    });
-    defer threaded.deinit();
-    const io = threaded.io();
-
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = Io.File.stdout().writer(init.io, &stdout_buffer);
     const out = &stdout_writer.interface;
-    try out.print("Io.Threaded, async_limit {d}, {s}, best of {d}\n", .{
-        @backingInt(threaded.async_limit), @tagName(builtin.mode), runs,
-    });
+    switch (implementation) {
+        .threaded => {
+            var threaded: Io.Threaded = .init(std.heap.smp_allocator, .{
+                .async_limit = if (threads) |n| .limited(n) else null,
+            });
+            defer threaded.deinit();
+            added_threads = @backingInt(threaded.async_limit);
+            try out.print("Io.Threaded, async_limit {d}, {s}, best of {d}\n", .{
+                added_threads, @tagName(builtin.mode), runs,
+            });
+            try runAll(threaded.io(), out, filter, runs);
+        },
+        .threadz => {
+            if (Io.Threadz == void) usage();
+            var threadz: Io.Threadz = undefined;
+            try threadz.init(std.heap.smp_allocator, .{
+                .backing_allocator_needs_mutex = false,
+                .thread_limit = threads,
+            });
+            defer threadz.deinit();
+            added_threads = threads orelse (std.Thread.getCpuCount() catch 1) - 1;
+            try out.print("Io.Threadz, thread_limit {d}, {s}, best of {d}\n", .{
+                added_threads, @tagName(builtin.mode), runs,
+            });
+            try runAll(threadz.io(), out, filter, runs);
+        },
+    }
+}
+
+fn runAll(io: Io, out: *Io.Writer, filter: ?[]const u8, runs: usize) !void {
     try out.flush();
 
     for (benchmarks) |b| {
@@ -192,6 +223,6 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn usage() noreturn {
-    std.debug.print("usage: benchmark [--threads N] [--filter NAME] [--runs N]\n", .{});
+    std.debug.print("usage: benchmark [--io threaded|threadz] [--threads N] [--filter NAME] [--runs N]\n", .{});
     std.process.exit(1);
 }

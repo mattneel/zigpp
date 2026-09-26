@@ -509,6 +509,29 @@ pub fn build(b: *std.Build) !void {
     const test_modules_step = b.step("test-modules", "Run the per-target module tests");
     test_step.dependOn(test_modules_step);
 
+    // The `Io` contract, networking and scheduler tests again, with `std.testing.io` an
+    // `Io.Threadz`. Threadz runs the tests on Linux; elsewhere the step has nothing to do.
+    const test_threadz_step = b.step("test-threadz", "Run the Io tests on Io.Threadz");
+    test_step.dependOn(test_threadz_step);
+    if (b.graph.host.result.os.tag == .linux) {
+        const threadz_tests = b.addTest(.{
+            .name = "std-threadz",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("lib/std/std.zig"),
+                .target = b.graph.host,
+                .optimize = .debug,
+            }),
+            .filters = if (test_filters.len != 0)
+                test_filters
+            else
+                &.{ "Io.test.test.", "Io.net.test.test.", "Io.Threadz" },
+            .zig_lib_dir = b.path("lib"),
+        });
+        const run_threadz_tests = b.addRunArtifact(threadz_tests);
+        run_threadz_tests.addArg("--io=threadz");
+        test_threadz_step.dependOn(&run_threadz_tests.step);
+    }
+
     test_modules_step.dependOn(tests.addModuleTests(b, .{
         .test_filters = test_filters,
         .test_target_filters = test_target_filters,

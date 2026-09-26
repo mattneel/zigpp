@@ -21,6 +21,8 @@ var stdout_buffer: [4096]u8 = undefined;
 var stdin_reader: Io.File.Reader = undefined;
 var stdout_writer: Io.File.Writer = undefined;
 const runner_threaded_io: Io = Io.Threaded.global_single_threaded.io();
+/// The implementation behind `std.testing.io`, from `--io=threaded` (the default) or `--io=threadz`.
+var testing_io_kind: testing.IoInstance.Kind = .threaded;
 
 /// Keep in sync with logic in `std.Build.addRunArtifact` which decides whether
 /// the test runner will communicate with the build runner via `std.zig.Server`.
@@ -58,6 +60,9 @@ pub fn main(init: std.process.Init.Minimal) void {
                 @panic("unable to parse --seed command line argument");
         } else if (std.mem.startsWith(u8, arg, "--cache-dir")) {
             opt_cache_dir = arg["--cache-dir=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--io=")) {
+            testing_io_kind = std.meta.stringToEnum(testing.IoInstance.Kind, arg["--io=".len..]) orelse
+                panic("unknown Io implementation: {s}", .{arg["--io=".len..]});
         } else {
             panic("unrecognized command line argument: {s}", .{arg});
         }
@@ -127,7 +132,7 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                     .canary = 0xc3a701ba,
                     .check_write_after_free = true,
                 });
-                testing.io_instance = .init(testing.allocator, .{
+                testing.io_instance.init(testing_io_kind, testing.allocator, .{
                     .argv0 = .init(init.args),
                     .environ = init.environ,
                 });
@@ -276,7 +281,7 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
             .canary = 0xc3a701ba,
             .check_write_after_free = true,
         });
-        testing.io_instance = .init(testing.allocator, .{
+        testing.io_instance.init(testing_io_kind, testing.allocator, .{
             .argv0 = .init(init.args),
             .environ = init.environ,
         });
@@ -377,7 +382,7 @@ pub fn mainSimple() anyerror!void {
     };
 
     testing.allocator_instance = .init(std.heap.page_allocator, .{});
-    testing.io_instance = .init(testing.allocator, .{});
+    testing.io_instance.init(.threaded, testing.allocator, .{});
 
     var passed: u64 = 0;
     var skipped: u64 = 0;
@@ -442,7 +447,7 @@ var fuzz_runner: if (builtin.fuzz) struct {
         defer if (testing.allocator_instance.deinit() != 0) std.process.exit(1);
         is_fuzz_test = false;
 
-        testing.io_instance = .init(testing.allocator, .{
+        testing.io_instance.init(testing_io_kind, testing.allocator, .{
             .argv0 = fuzz_runner.threaded_io.argv0,
             .environ = fuzz_runner.threaded_io.environ.process_environ,
         });
