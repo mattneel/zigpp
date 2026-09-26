@@ -16,6 +16,18 @@
 //! OS commits stack pages as they are touched. Mappings of the default size are reused through a
 //! small cache per worker and a shared pool, and unmapped beyond those.
 //!
+//! A task may complete `budget` Io operations without parking. The operation past that yields it
+//! first: it goes to the back of its worker's queue, keeping its affinity, and then the operation
+//! runs where the task landed. See `charge`, which every Threadz entry point calls.
+//!
+//! A worker whose current task does not switch out for `stuck_after` is stuck: it is running
+//! something that neither parks nor yields, such as a spinning loop or a C call that blocks its
+//! thread. One watchdog thread per instance samples every worker every `watchdog_interval` and,
+//! for a stuck worker: makes its queued tasks takeable whatever their number, starts one
+//! replacement worker so that parallelism stays, counts the episode, and names the task in one
+//! log line. A task that owns its worker's resources, being pinned, waits for the worker instead;
+//! see `Affinity.pinned`. The watchdog costs a relaxed store per switch and nothing else.
+//!
 //! A backend embeds the scheduler as its field `sched` and declares:
 //! * `Worker`, its state for each worker, with `workerInit`, `workerStart` (called on the worker's
 //!   own thread before it runs anything) and `workerDeinit`;
@@ -23,9 +35,12 @@
 //! * `poll(backend, worker, mode)`, which submits queued operations and passes each task whose
 //!   operation finished to `readyFromPoll`. With `.block` it waits for at least one event.
 //! * `wake(backend, from, to)`, which ends `to`'s current or next blocking `poll`;
+//! * `wakeForeign(backend, to)`, the same from a thread that is not one of the workers, which is
+//!   the watchdog. It must be safe to call from any thread;
 //! * `cancelOperation(backend, from, task, token)`, which cancels the operation `task` is waiting
 //!   for in the worker identified by `token`;
-//! * `allocator(backend)`.
+//! * `allocator(backend)`;
+//! * `io(backend)`, the instance's `Io`, which the watchdog uses to wait between its samples.
 
 const builtin = @import("builtin");
 const std = @import("../../std.zig");
@@ -67,6 +82,16 @@ pub const default_stack_size = 256 * 1024;
 
 /// Workers with more than this many sticky tasks waiting let other workers take some.
 pub const steal_threshold = 1;
+
+/// The Io operations a task may complete without parking before the scheduler yields it. See
+/// `Scheduler.charge`.
+pub const budget = 128;
+
+/// The watchdog samples every worker this often.
+pub const watchdog_interval: u64 = 10 * std.time.ns_per_ms;
+
+/// A worker whose current task has not switched out for this long is stuck. See `Scheduler`.
+pub const stuck_after: u64 = 100 * std.time.ns_per_ms;
 
 /// Worker 0 runs its scheduling loop on a stack of this size, since the thread's own stack belongs
 /// to the main task. The other workers' threads get stacks of this size.
@@ -117,6 +142,9 @@ pub fn Scheduler(comptime Backend: type) type {
         reserved: std.atomic.Value(u32),
         /// No more than this many workers are started.
         limit: std.atomic.Value(u32),
+        /// The replacement workers the watchdog starts for stuck ones, one slot per worker. A
+        /// slot holds a worker only once one has been started in it.
+        spares: []Spare,
         shared: TaskQueue,
         idle: Idle,
         stopping: std.atomic.Value(bool),
@@ -125,6 +153,23 @@ pub fn Scheduler(comptime Backend: type) type {
         mapping_len: usize,
         pool: StackPool,
         idle_stack: []align(page_size_min) u8,
+        /// The watchdog thread, started with the first worker past worker 0 and stopped by
+        /// `deinit`.
+        watchdog: std.Thread,
+        watchdog_started: std.atomic.Value(bool),
+        /// The watchdog waits on this between rounds, and `deinit` wakes it with it.
+        watchdog_wait: std.atomic.Value(u32),
+        /// Episodes in which a worker was found stuck. See `stats`.
+        stuck_episodes: std.atomic.Value(u64),
+        /// Replacement workers the watchdog started for stuck workers. See `stats`.
+        replacements: std.atomic.Value(u64),
+        /// What the watchdog reported about the last stuck episode. See `stats`.
+        report: StuckReport,
+        /// The `live` counts of the replacement workers that have ended: a task spawned on one
+        /// worker and ended on a replacement is counted on the replacement, which is gone by the
+        /// time `deinit` adds the counts up. Only the watchdog writes it, once the replacement's
+        /// thread has joined, and `deinit` reads it.
+        reaped_live: isize,
         /// The thread that calls `init` runs as this task, on its own stack, followed by room for
         /// a completion.
         main_task_buffer: [@sizeOf(Task) + completion_space]u8 align(@alignOf(Task)),
@@ -169,13 +214,24 @@ pub fn Scheduler(comptime Backend: type) type {
                 },
             },
             result_align: Alignment,
+            /// The operations this task completed without parking since it last parked or
+            /// yielded. See `Sched.charge`.
+            ops: u32,
             context_bytes: [*]u8,
             /// Empty for the main task.
             mapping: []align(page_size_min) u8,
-            name: if (tracy.enable) [*:0]const u8 else void,
+            /// This task's number, unique among the tasks every Threadz instance in the program
+            /// made, in the order they were made. A log line and, later, a task dump name a
+            /// task with it.
+            id: u64,
+            /// The name of the function this task runs, for the task names a log line reports.
+            /// `Io.spawnedName` is where it comes from for a spawn through `Io`. The name of a
+            /// task outlives it: it is a comptime string.
+            name: [:0]const u8,
             tsan_fiber: tsan.Fiber,
 
-            var next_name: u64 = 0;
+            /// The number the next task is given. See `Task.id`.
+            var next_id: std.atomic.Value(u64) = .init(1);
 
             pub const finished: ?*Task = @ptrFromInt(@alignOf(Task));
 
@@ -298,8 +354,10 @@ pub fn Scheduler(comptime Backend: type) type {
             thread: std.Thread,
             idle_context: Io.fiber.Context,
             current_context: *Io.fiber.Context,
-            /// The task to run next, which no other worker takes.
-            run_next: ?*Task,
+            /// The task this worker runs next, which no other worker takes unless this one is
+            /// stuck. It is atomic because a worker that is stuck has its slot taken from it;
+            /// otherwise only this worker touches it.
+            run_next: std.atomic.Value(?*Task),
             lifo_streak: u8,
             /// Runnable tasks pinned here, oldest first.
             pinned: TaskList,
@@ -318,7 +376,18 @@ pub fn Scheduler(comptime Backend: type) type {
             /// Tasks spawned here minus tasks that ended here. The sum over all workers counts
             /// the tasks alive.
             live: isize,
-            name_arena: if (tracy.enable) std.heap.ArenaAllocator.State else struct {},
+            /// The task this worker is running, or `null` while it runs no task. This worker
+            /// publishes it with a release store at every switch; the watchdog reads it to tell
+            /// a running task from a worker that is looking for work, and to name a stuck task.
+            running: std.atomic.Value(?*Task) align(std.atomic.cache_line),
+            /// Switches out of a task. The watchdog samples it to tell a task that keeps
+            /// switching out from one that has not. Relaxed: the watchdog only compares values.
+            switched: std.atomic.Value(u64),
+            /// Set by the watchdog while this worker is stuck: its queued tasks are takeable
+            /// whatever their number. Cleared, by the watchdog, once the worker switches again.
+            stranded: std.atomic.Value(bool),
+            /// Set while this worker is a replacement for a stuck one. See `Spare`.
+            spare: ?*Spare,
             idle_tsan_fiber: tsan.Fiber,
 
             threadlocal var self: ?*Worker = null;
@@ -448,17 +517,18 @@ pub fn Scheduler(comptime Backend: type) type {
             }
 
             /// Owner of `q` only, and only while `q` is empty. Moves the older half of what
-            /// `victim` has beyond `steal_threshold`, rounded up, into `q` without publishing
-            /// them, and returns how many.
-            fn grab(q: *LocalQueue, victim: *LocalQueue) u32 {
+            /// `victim` has beyond `threshold`, rounded up, into `q` without publishing them,
+            /// and returns how many. `threshold` is `steal_threshold`, or 0 for a worker that is
+            /// stuck, whose tasks are all takeable.
+            fn grab(q: *LocalQueue, victim: *LocalQueue, threshold: u32) u32 {
                 const tail = q.tail.raw;
                 while (true) {
                     const victim_head = victim.head.load(.acquire);
                     const victim_tail = victim.tail.load(.seq_cst); // see `notify`
                     const available = victim_tail -% victim_head;
                     if (available > capacity) continue; // `victim_head` was read before `victim_tail` moved on
-                    if (available <= steal_threshold) return 0;
-                    const excess = available - steal_threshold;
+                    if (available <= threshold) return 0;
+                    const excess = available - threshold;
                     const n = excess - excess / 2;
                     for (0..n) |i| {
                         const offset: u32 = @intCast(i);
@@ -505,6 +575,86 @@ pub fn Scheduler(comptime Backend: type) type {
 
         const FreeMapping = struct { next: ?*FreeMapping };
 
+        /// A worker the watchdog starts to replace a stuck one. A spare is not counted against
+        /// `limit`: it runs what was queued behind the stuck task, and it stops once it has
+        /// nothing to run and the worker it replaced switches out again.
+        pub const Spare = struct {
+            /// Its worker, whose index is past every worker in `workers`.
+            worker: Worker = undefined,
+            thread: std.Thread = undefined,
+            state: std.atomic.Value(State) = .init(.unused),
+            /// The worker this spare replaces. Only the watchdog writes it, before the thread
+            /// starts, and the spare reads it.
+            assigned: std.atomic.Value(u32) = .init(0),
+
+            pub const State = enum(u8) {
+                /// No thread: another stuck worker may use this slot.
+                unused,
+                /// Its thread runs, whatever it is doing.
+                running,
+                /// Its thread has returned. The watchdog joins it and frees the slot.
+                exited,
+            };
+        };
+
+        /// What the watchdog keeps about the last stuck episode, for `stats`.
+        const StuckReport = struct {
+            /// The task's number, or 0 before the first episode.
+            id: std.atomic.Value(u64) = .init(0),
+            /// The name of the function the task runs, or null before the first episode.
+            name: std.atomic.Value(?[*:0]const u8) = .init(null),
+            /// How long the task had not switched out, as the watchdog sampled it.
+            ms: std.atomic.Value(u64) = .init(0),
+            /// The worker it ran on.
+            worker: std.atomic.Value(u32) = .init(0),
+        };
+
+        /// What a program can read about a Threadz instance: the gauges the runtime keeps. The
+        /// rest of the observability plan, the task dump and the scheduler meters, is Threadz
+        /// step 7.
+        pub const Stats = struct {
+            /// The most workers that may run, counting worker 0 and not replacements.
+            worker_limit: u32,
+            /// The workers running now: worker 0, the workers started for work, and the
+            /// replacements the watchdog started for stuck ones.
+            workers: u32,
+            /// The replacements among `workers`.
+            spares: u32,
+            /// The workers stuck right now.
+            stuck: u32,
+            /// Episodes in which a worker was found stuck: its current task had not switched out
+            /// for `stuck_after`. The watchdog writes one log line per episode, naming the task.
+            stuck_episodes: u64,
+            /// The replacements the watchdog started for stuck workers.
+            replacements: u64,
+            /// The last stuck episode, or null if there has been none.
+            last_stuck: ?Stuck = null,
+
+            pub const Stuck = struct {
+                /// The task's number. See `Task.id`.
+                id: u64,
+                /// The name of the function the task runs.
+                name: [:0]const u8,
+                /// How long the task had not switched out, as the watchdog sampled it: at least
+                /// `stuck_after`, and at most that plus one `watchdog_interval`.
+                ms: u64,
+                /// The worker it ran on.
+                worker: u32,
+            };
+        };
+
+        /// What the watchdog keeps about one worker between samples.
+        const Sample = struct {
+            /// The task that worker runs, or null while it runs no task.
+            task: ?*Task = null,
+            /// Its switch count when the sample last saw it change.
+            switched: u64 = 0,
+            /// When it last saw this task with this switch count.
+            since: i96 = 0,
+            /// Whether this worker has been reported stuck and has not switched out since.
+            stuck: bool = false,
+        };
+
         /// Mappings of the default size kept by one worker, linked through their top bytes.
         const StackCache = struct {
             head: ?*FreeMapping = null,
@@ -540,6 +690,15 @@ pub fn Scheduler(comptime Backend: type) type {
             return @fieldParentPtr("sched", s);
         }
 
+        /// The worker with this index: one of `workers`, or the replacement running in a spare
+        /// slot. `null` for a spare that is not running.
+        pub fn workerAt(s: *Sched, index: u32) ?*Worker {
+            if (index < s.workers.len) return &s.workers[index];
+            const spare = &s.spares[index - s.workers.len];
+            if (spare.state.load(.acquire) != .running) return null;
+            return &spare.worker;
+        }
+
         fn fromUserdata(userdata: ?*anyopaque) *Sched {
             const backend: *Backend = @ptrCast(@alignCast(userdata));
             return &backend.sched;
@@ -556,6 +715,8 @@ pub fn Scheduler(comptime Backend: type) type {
             const page = std.heap.pageSize();
             const workers = try gpa.alloc(Worker, count);
             errdefer gpa.free(workers);
+            const spares = try gpa.alloc(Spare, count);
+            errdefer gpa.free(spares);
             const idle_stack = try mapStack(idle_stack_size);
             errdefer posix.munmap(idle_stack);
             const idle_indexes = try gpa.alloc(u32, count);
@@ -565,6 +726,7 @@ pub fn Scheduler(comptime Backend: type) type {
                 .started = .init(1),
                 .reserved = .init(1),
                 .limit = .init(count),
+                .spares = spares,
                 .shared = .{},
                 .idle = .{ .stack = idle_indexes },
                 .stopping = .init(false),
@@ -572,8 +734,16 @@ pub fn Scheduler(comptime Backend: type) type {
                 .mapping_len = std.mem.alignForward(usize, page + options.stack_size + default_header_size, page),
                 .pool = .{},
                 .idle_stack = idle_stack,
+                .watchdog = undefined,
+                .watchdog_started = .init(false),
+                .watchdog_wait = .init(0),
+                .stuck_episodes = .init(0),
+                .replacements = .init(0),
+                .report = .{},
+                .reaped_live = 0,
                 .main_task_buffer = undefined,
             };
+            @memset(s.spares, .{});
             const main_task = s.mainTask();
             main_task.* = .{
                 .context = undefined,
@@ -585,9 +755,11 @@ pub fn Scheduler(comptime Backend: type) type {
                 .home = 0,
                 .start = .main,
                 .result_align = .@"1",
+                .ops = 0,
                 .context_bytes = undefined,
                 .mapping = &.{},
-                .name = if (tracy.enable) "main task",
+                .id = Task.next_id.fetchAdd(1, .monotonic),
+                .name = "main task",
                 .tsan_fiber = if (tsan.enable) tsan.__tsan_get_current_fiber(),
             };
             const w = &workers[0];
@@ -614,7 +786,7 @@ pub fn Scheduler(comptime Backend: type) type {
                 .thread = undefined,
                 .idle_context = undefined,
                 .current_context = undefined,
-                .run_next = null,
+                .run_next = .init(null),
                 .lifo_streak = 0,
                 .pinned = .{},
                 .local = .{},
@@ -625,7 +797,10 @@ pub fn Scheduler(comptime Backend: type) type {
                 .steal_start = index,
                 .stacks = .{},
                 .live = 0,
-                .name_arena = .{},
+                .running = .init(null),
+                .switched = .init(0),
+                .stranded = .init(false),
+                .spare = null,
                 .idle_tsan_fiber = undefined,
             };
         }
@@ -639,18 +814,38 @@ pub fn Scheduler(comptime Backend: type) type {
             // worker may have been starting one more meanwhile, which `.stop` did not wake. Once
             // it has, every worker is woken again: each one sees `stopping` and returns.
             while (s.reserved.load(.acquire) != s.started.load(.acquire)) std.Thread.yield() catch {};
+            // The watchdog first: it samples the workers, and it may still be starting a
+            // replacement for one of them.
+            s.stopWatchdog();
             const started = s.started.load(.acquire);
             for (s.workers[1..started]) |*w| Backend.wake(s.backendOf(), &s.workers[0], w);
+            for (s.spares) |*spare| {
+                if (spare.state.load(.acquire) != .running) continue;
+                Backend.wake(s.backendOf(), &s.workers[0], &spare.worker);
+            }
             for (s.workers[1..started]) |*w| w.thread.join();
             var live: isize = 0;
             for (s.workers[0..started]) |*w| {
                 live += w.live;
-                while (w.stacks.head) |free| {
-                    w.stacks.head = free.next;
-                    s.unmapFree(free);
-                }
+                s.unmapStacks(w);
                 Backend.workerDeinit(s.backendOf(), w);
             }
+            // The replacements: joined and freed whatever they were doing, with their tasks
+            // counted in `live` like any other worker's.
+            for (s.spares) |*spare| {
+                if (spare.state.load(.acquire) == .unused) continue;
+                if (spare.state.load(.acquire) == .running) {
+                    spare.thread.join();
+                    const w = &spare.worker;
+                    if (tsan.enable) tsan.__tsan_destroy_fiber(w.idle_tsan_fiber);
+                    live += w.live;
+                    s.unmapStacks(w);
+                    Backend.workerDeinit(s.backendOf(), w);
+                } else {
+                    s.reapSpare(spare);
+                }
+            }
+            live += s.reaped_live;
             assert(live == 0); // a task was never awaited
             while (s.pool.head) |free| {
                 s.pool.head = free.next;
@@ -660,8 +855,16 @@ pub fn Scheduler(comptime Backend: type) type {
             if (tsan.enable) tsan.__tsan_destroy_fiber(s.workers[0].idle_tsan_fiber);
             posix.munmap(s.idle_stack);
             gpa.free(s.idle.stack);
+            gpa.free(s.spares);
             gpa.free(s.workers);
             s.* = undefined;
+        }
+
+        fn unmapStacks(s: *Sched, w: *Worker) void {
+            while (w.stacks.head) |free| {
+                w.stacks.head = free.next;
+                s.unmapFree(free);
+            }
         }
 
         /// Starts no more workers than `n`, counting worker 0, and at most as many as `init` allowed.
@@ -700,18 +903,30 @@ pub fn Scheduler(comptime Backend: type) type {
             fn handle(message: *const SwitchMessage, s: *Sched) void {
                 const w: *Worker = .current();
                 w.current_context = message.contexts.new;
-                if (message.contexts.new != &w.idle_context) {
-                    const task: *Task = @alignCast(@fieldParentPtr("context", message.contexts.new));
+                const new: ?*Task = if (message.contexts.new != &w.idle_context)
+                    @alignCast(@fieldParentPtr("context", message.contexts.new))
+                else
+                    null;
+                if (new) |task| {
                     switch (task.affinity) {
                         .pinned => assert(task.home == w.index),
                         .sticky, .free => @atomicStore(u32, &task.home, w.index, .monotonic),
                     }
-                    if (tracy.enable) tracy.fiberEnter(task.name);
+                    if (tracy.enable) tracy.fiberEnter(task.name.ptr);
                 } else if (tracy.enable) tracy.fiberLeave();
                 const old: ?*Task = if (message.contexts.old != &w.idle_context)
                     @alignCast(@fieldParentPtr("context", message.contexts.old))
                 else
                     null;
+                if (old) |task| {
+                    // It parked or yielded: its budget starts over, and the watchdog sees that
+                    // this worker switched out of a task.
+                    task.ops = 0;
+                    _ = w.switched.store(w.switched.load(.monotonic) +% 1, .monotonic);
+                }
+                // What the watchdog samples. Release: it names the task it publishes, and the
+                // task's fields are the ones the queue handoff made visible to this worker.
+                w.running.store(new, .release);
                 switch (message.pending_task) {
                     .nothing => {},
                     .reschedule => if (old) |task| s.readyYielded(w, task),
@@ -771,6 +986,28 @@ pub fn Scheduler(comptime Backend: type) type {
             s.yield(null, .nothing);
         }
 
+        /// Charges one Io operation to the calling task, and yields it first when it has
+        /// completed `budget` operations without parking: the task goes to the back of its
+        /// worker's queue, keeping its affinity, and then the operation runs where the task
+        /// landed.
+        ///
+        /// Called at the Threadz entry points, for every operation that can return without
+        /// parking. An operation that then parks resets the count as it switches out, so
+        /// charging an operation that always parks changes nothing. Does nothing on a thread
+        /// that is not one of the workers: those threads run no task, and the operations they
+        /// may call block in the kernel rather than park.
+        pub fn charge(s: *Sched) void {
+            const w = Worker.currentOrNull() orelse return;
+            const task = w.currentTask();
+            if (task.ops < budget) {
+                task.ops += 1;
+            } else {
+                @branchHint(.unlikely);
+                task.ops = 0;
+                s.yield(null, .reschedule);
+            }
+        }
+
         /// The next task this worker can run without looking at other workers or polling, or
         /// `null` every `poll_interval` switches so that its scheduling loop polls.
         fn nextLocal(s: *Sched, w: *Worker) ?*Task {
@@ -780,20 +1017,31 @@ pub fn Scheduler(comptime Backend: type) type {
         }
 
         fn takeLocal(s: *Sched, w: *Worker) ?*Task {
-            if (w.run_next) |task| {
-                w.run_next = null;
+            if (s.takeNext(w)) |task| {
                 if (w.lifo_streak < lifo_limit) {
                     w.lifo_streak += 1;
                     return task;
                 }
                 // Tasks that keep waking each other do not get to starve the queue.
                 w.local.push(task, &s.shared);
-            }
-            w.lifo_streak = 0;
+                w.lifo_streak = 0;
+            } else w.lifo_streak = 0;
             s.drainInbox(w);
             if (w.pinned.pop()) |task| return task;
             if (w.local.pop()) |task| return task;
             return s.shared.pop();
+        }
+
+        /// Takes the task in `w`'s slot for the next task, if any. Only one taker wins it:
+        /// another worker takes it from a worker that is stuck. See `steal`.
+        fn takeNext(s: *Sched, w: *Worker) ?*Task {
+            _ = s;
+            var maybe_task = w.run_next.load(.monotonic);
+            while (maybe_task) |task| {
+                if (w.run_next.cmpxchgStrong(task, null, .acq_rel, .acquire) == null) return task;
+                maybe_task = w.run_next.load(.monotonic);
+            }
+            return null;
         }
 
         fn drainInbox(s: *Sched, w: *Worker) void {
@@ -834,6 +1082,9 @@ pub fn Scheduler(comptime Backend: type) type {
                     break :task task;
                 } else s.search(w, counted) orelse {
                     if (s.stopping.load(.acquire)) return;
+                    // A replacement worker that has nothing to run and is no longer wanted
+                    // stops here: the stuck worker it replaced switches out again.
+                    if (w.spare) |spare| if (!s.spareWanted(spare)) return;
                     s.parkWorker(w);
                     continue;
                 };
@@ -927,15 +1178,23 @@ pub fn Scheduler(comptime Backend: type) type {
             if (s.idle.searching.fetchSub(1, .seq_cst) == 1 and s.anyStealable(w)) s.notify(w);
         }
 
-        /// Takes tasks from another worker whose queue has more than `steal_threshold`: the
-        /// older half of the excess, returning the last one taken to run.
+        /// Takes tasks from another worker whose queue has more than `steal_threshold`, or any
+        /// it has at all while it is stuck: the older half of the excess, returning the last one
+        /// taken to run. A stuck worker's slot for the next task and the tasks others made
+        /// runnable for it are taken too.
         fn steal(s: *Sched, w: *Worker) ?*Task {
             const started = s.started.load(.acquire);
             w.steal_start +%= 1;
             for (0..started) |i| {
                 const victim = &s.workers[(w.steal_start +% i) % started];
                 if (victim == w) continue;
-                const n = w.local.grab(&victim.local);
+                const stranded = victim.stranded.load(.acquire);
+                if (stranded) {
+                    // What only the worker itself could take before it got stuck.
+                    if (s.takeNext(victim)) |task| return task;
+                    if (s.takeInbox(w, victim)) |task| return task;
+                }
+                const n = w.local.grab(&victim.local, if (stranded) 0 else steal_threshold);
                 if (n == 0) continue;
                 const tail = w.local.tail.raw;
                 const task = w.local.load(tail +% n -% 1);
@@ -945,10 +1204,37 @@ pub fn Scheduler(comptime Backend: type) type {
             return null;
         }
 
+        /// Takes the tasks others made runnable for stuck worker `victim`, which cannot take
+        /// them itself. Its pinned tasks stay there: they own its resources, and they wait for
+        /// the worker as they would anyway. Returns one task for `w` to run, with the rest on its
+        /// own queue.
+        fn takeInbox(s: *Sched, w: *Worker, victim: *Worker) ?*Task {
+            var maybe_task: ?*Task = victim.inbox.takeAll();
+            var taken: ?*Task = null;
+            while (maybe_task) |task| {
+                maybe_task = task.status.queue_next;
+                switch (task.affinity) {
+                    .free => unreachable, // `drainInbox` never sees one either
+                    .pinned => victim.inbox.push(task),
+                    .sticky => {
+                        if (taken) |previous| w.local.push(previous, &s.shared);
+                        taken = task;
+                    },
+                }
+            }
+            const task = taken orelse return null;
+            task.status = .{ .queue_next = null };
+            if (w.local.len() > steal_threshold) s.notify(w);
+            return task;
+        }
+
         fn anyStealable(s: *Sched, w: *Worker) bool {
             if (s.shared.len.load(.seq_cst) != 0) return true;
             for (s.workers[0..s.started.load(.acquire)]) |*victim| {
-                if (victim != w and victim.local.len() > steal_threshold) return true;
+                if (victim == w) continue;
+                const threshold: u32 = if (victim.stranded.load(.acquire)) 0 else steal_threshold;
+                if (victim.local.len() > threshold) return true;
+                if (threshold == 0 and !victim.inbox.isEmpty()) return true;
             }
             return false;
         }
@@ -986,6 +1272,15 @@ pub fn Scheduler(comptime Backend: type) type {
             Backend.wake(s.backendOf(), from, target);
         }
 
+        /// `wakeWorker`, from a thread that is not one of the workers: the watchdog, or a
+        /// replacement worker it started, which can send no ring wake from the worker the wake
+        /// would come from.
+        pub fn wakeWorkerFromForeign(s: *Sched, target: *Worker) void {
+            if (!target.parked.load(.seq_cst)) return; // see `parkWorker`
+            if (target.parked.cmpxchgStrong(true, false, .seq_cst, .monotonic) != null) return;
+            Backend.wakeForeign(s.backendOf(), target);
+        }
+
         /// Finds a worker for work any worker may take: wakes a parked one, or starts one, unless
         /// a worker is searching already.
         ///
@@ -1010,7 +1305,10 @@ pub fn Scheduler(comptime Backend: type) type {
                         s.idle.len -= 1;
                         break :index s.idle.stack[s.idle.len];
                     };
-                    const target = &s.workers[index];
+                    const target = s.workerAt(index) orelse {
+                        _ = s.idle.searching.fetchSub(1, .seq_cst);
+                        return;
+                    };
                     target.woken_to_search.store(true, .seq_cst);
                     if (target.parked.cmpxchgStrong(true, false, .seq_cst, .monotonic) == null) {
                         return Backend.wake(s.backendOf(), from, target);
@@ -1048,6 +1346,9 @@ pub fn Scheduler(comptime Backend: type) type {
             };
             // A worker's fields are ready before it is counted as started.
             s.started.store(index + 1, .release);
+            // The first worker past worker 0 starts the watchdog: a program that never runs a
+            // second worker never pays for one.
+            if (index == 1) s.startWatchdog();
         }
 
         /// Starts workers until the one with this index is running.
@@ -1065,6 +1366,245 @@ pub fn Scheduler(comptime Backend: type) type {
             for (s.workers[0..s.started.load(.acquire)]) |*target| {
                 if (target != w) Backend.wake(s.backendOf(), w, target);
             }
+            for (s.spares) |*spare| {
+                if (spare.state.load(.acquire) != .running) continue;
+                Backend.wake(s.backendOf(), w, &spare.worker);
+            }
+        }
+
+
+        // The watchdog
+
+        /// What a program can read about this instance. See `Stats`.
+        pub fn stats(s: *Sched) Stats {
+            const started = s.started.load(.acquire);
+            var spares: u32 = 0;
+            for (s.spares) |*spare| {
+                if (spare.state.load(.acquire) == .running) spares += 1;
+            }
+            var stuck: u32 = 0;
+            for (s.workers[0..started]) |*w| {
+                if (w.stranded.load(.acquire)) stuck += 1;
+            }
+            const name = s.report.name.load(.acquire);
+            return .{
+                .worker_limit = s.limit.load(.monotonic),
+                .workers = started + spares,
+                .spares = spares,
+                .stuck = stuck,
+                .stuck_episodes = s.stuck_episodes.load(.monotonic),
+                .replacements = s.replacements.load(.monotonic),
+                .last_stuck = if (name) |n| .{
+                    .id = s.report.id.load(.monotonic),
+                    .name = std.mem.span(n),
+                    .ms = s.report.ms.load(.monotonic),
+                    .worker = s.report.worker.load(.monotonic),
+                } else null,
+            };
+        }
+
+        /// Starts the watchdog thread, once: with the first worker past worker 0.
+        fn startWatchdog(s: *Sched) void {
+            if (s.watchdog_started.swap(true, .seq_cst)) return;
+            s.watchdog = std.Thread.spawn(.{
+                .stack_size = idle_stack_size,
+                .allocator = Backend.allocator(s.backendOf()),
+            }, watchdogEntry, .{s}) catch |err| {
+                s.watchdog_started.store(false, .release);
+                std.log.scoped(.threadz).warn("unable to start the watchdog: {t}", .{err});
+                return;
+            };
+        }
+
+        /// Stops the watchdog and joins it. Called by `deinit` before the workers it samples go
+        /// away.
+        fn stopWatchdog(s: *Sched) void {
+            if (!s.watchdog_started.load(.acquire)) return;
+            const io = Backend.io(s.backendOf());
+            s.watchdog_wait.store(1, .release);
+            Io.futexWake(io, u32, &s.watchdog_wait.raw, 1);
+            s.watchdog.join();
+        }
+
+        /// Waits between two rounds of samples, or until `deinit` stops the watchdog. The wait
+        /// is an Io futex, so a backend that blocks foreign threads in the kernel sleeps here
+        /// rather than spinning.
+        fn watchdogWait(s: *Sched) void {
+            const io = Backend.io(s.backendOf());
+            Io.futexWaitTimeout(io, u32, &s.watchdog_wait.raw, 0, .{ .duration = .{
+                .raw = .fromNanoseconds(watchdog_interval),
+                .clock = .awake,
+            } }) catch {};
+        }
+
+        /// The watchdog: it samples every worker every `watchdog_interval`, and reports a worker
+        /// whose current task has not switched out for `stuck_after`. See `reportStuck`.
+        fn watchdogEntry(s: *Sched) void {
+            const gpa = Backend.allocator(s.backendOf());
+            const samples = gpa.alloc(Sample, s.workers.len + s.spares.len) catch |err| {
+                std.log.scoped(.threadz).warn("unable to start the watchdog: {t}", .{err});
+                return;
+            };
+            defer gpa.free(samples);
+            @memset(samples, .{});
+            while (true) {
+                s.watchdogWait();
+                if (s.stopping.load(.acquire)) return;
+                s.watchdogRound(samples);
+            }
+        }
+
+        fn watchdogRound(s: *Sched, samples: []Sample) void {
+            const now = Io.Timestamp.now(Backend.io(s.backendOf()), .awake).nanoseconds;
+            const started = s.started.load(.acquire);
+            for (s.workers[0..started], samples[0..started]) |*w, *sample| s.watchdogWorker(w, sample, now);
+            for (s.spares, samples[started..][0..s.spares.len]) |*spare, *sample| {
+                if (spare.state.load(.acquire) != .running) continue;
+                s.watchdogWorker(&spare.worker, sample, now);
+            }
+            // Replacements that stopped: joined here, where the thread that joins is not the one
+            // that would have to wait for it in `deinit`.
+            for (s.spares) |*spare| {
+                if (spare.state.load(.acquire) != .exited) continue;
+                s.reapSpare(spare);
+            }
+        }
+
+        /// Samples one worker. A task that switches out, or a worker that runs no task, is doing
+        /// something: the sample starts over. A task that does not for `stuck_after` is stuck.
+        fn watchdogWorker(s: *Sched, w: *Worker, sample: *Sample, now: i96) void {
+            const task = w.running.load(.acquire);
+            const switched = w.switched.load(.monotonic);
+            if (task == null or task != sample.task or switched != sample.switched) {
+                sample.task = task;
+                sample.switched = switched;
+                sample.since = now;
+                if (sample.stuck) {
+                    // It switches out again: it is not stuck, and what it had queued goes back
+                    // to being takeable only when the queue is over the threshold.
+                    sample.stuck = false;
+                    s.releaseStranded(w);
+                }
+                return;
+            }
+            if (sample.stuck) return; // reported already; until it switches out, it is stuck
+            const elapsed = now - sample.since;
+            if (elapsed < stuck_after) return;
+            sample.stuck = true;
+            s.reportStuck(w, task.?, @intCast(@divTrunc(elapsed, std.time.ns_per_ms)));
+        }
+
+        /// The worker switches out again: what was queued on it is takeable only when the queue
+        /// is over the threshold, and a replacement running for it is released.
+        fn releaseStranded(s: *Sched, w: *Worker) void {
+            w.stranded.store(false, .release);
+            for (s.spares) |*spare| {
+                if (spare.state.load(.acquire) != .running) continue;
+                if (spare.assigned.load(.monotonic) != w.index) continue;
+                // A replacement stops once it has nothing to run, so it has to look at itself
+                // again to notice that it is no longer wanted.
+                s.wakeWorkerFromForeign(&spare.worker);
+            }
+        }
+
+        /// Reports worker `w`, whose task `task` has not switched out for `ms`: the task is named
+        /// in one log line, its queued tasks become takeable whatever their number, one
+        /// replacement worker is started for it, and the episode is counted.
+        fn reportStuck(s: *Sched, w: *Worker, task: *Task, ms: u64) void {
+            s.report.ms.store(ms, .monotonic);
+            s.report.worker.store(w.index, .monotonic);
+            s.report.id.store(task.id, .monotonic);
+            s.report.name.store(task.name.ptr, .release);
+            _ = s.stuck_episodes.fetchAdd(1, .monotonic);
+            std.log.scoped(.threadz).warn(
+                "task {d} ({s}) has not switched out for {d} ms on worker {d}: its queued tasks are takeable, and a replacement worker was started",
+                .{ task.id, task.name, ms, w.index },
+            );
+            w.stranded.store(true, .release);
+            s.startSpare(w);
+            s.wakeIdle();
+        }
+
+        /// Wakes every parked worker, so that work made takeable at once is taken at once.
+        fn wakeIdle(s: *Sched) void {
+            for (s.workers[0..s.started.load(.acquire)]) |*target| s.wakeWorkerFromForeign(target);
+        }
+
+        /// Starts a replacement worker for stuck worker `w`, unless it has one already or every
+        /// slot is taken. A replacement is not counted against `limit`.
+        fn startSpare(s: *Sched, w: *Worker) void {
+            for (s.spares, 0..) |*spare, i| {
+                switch (spare.state.load(.acquire)) {
+                    .unused => {
+                        spare.assigned.store(w.index, .monotonic);
+                        spare.state.store(.running, .release);
+                        s.startSpareThread(spare, @intCast(i)) catch {
+                            spare.state.store(.unused, .release);
+                        };
+                        return;
+                    },
+                    .running => if (spare.assigned.load(.monotonic) == w.index) return,
+                    .exited => {},
+                }
+            }
+        }
+
+        /// Starts the thread of spare `i`, and the worker it runs on: its index is past every
+        /// worker in `workers`.
+        fn startSpareThread(s: *Sched, spare: *Spare, i: u32) error{SystemResources}!void {
+            const w = &spare.worker;
+            w.* = s.newWorker(@intCast(s.workers.len + i));
+            w.spare = spare;
+            Backend.workerInit(s.backendOf(), w) catch return error.SystemResources;
+            errdefer Backend.workerDeinit(s.backendOf(), w);
+            spare.thread = std.Thread.spawn(.{
+                .stack_size = idle_stack_size,
+                .allocator = Backend.allocator(s.backendOf()),
+            }, spareEntry, .{ s, spare }) catch return error.SystemResources;
+            _ = s.replacements.fetchAdd(1, .monotonic);
+        }
+
+        /// The thread of a replacement worker: `workerEntry`, and the thread returns once it has
+        /// nothing to run and the worker it replaced switches out again.
+        fn spareEntry(s: *Sched, spare: *Spare) void {
+            const w = &spare.worker;
+            Worker.self = w;
+            w.current_context = &w.idle_context;
+            if (tsan.enable) w.idle_tsan_fiber = tsan.__tsan_get_current_fiber();
+            Backend.workerStart(s.backendOf(), w);
+            s.schedulingLoop(w);
+            // Tasks that arrived for this worker as it stopped: the shared queue, which any
+            // worker takes from. Nothing pinned can be here: pinned tasks have a worker of their
+            // own, not a replacement.
+            var maybe_task = w.inbox.takeAll();
+            var any = false;
+            while (maybe_task) |task| {
+                maybe_task = task.status.queue_next;
+                task.status = .{ .queue_next = null };
+                s.shared.push(&.{task});
+                any = true;
+            }
+            if (any) s.notify(w);
+            spare.state.store(.exited, .release);
+        }
+
+        /// Joins a replacement that has stopped and frees its worker, so that the slot may hold
+        /// another one.
+        fn reapSpare(s: *Sched, spare: *Spare) void {
+            spare.thread.join();
+            const w = &spare.worker;
+            if (tsan.enable) tsan.__tsan_destroy_fiber(w.idle_tsan_fiber);
+            s.reaped_live += w.live;
+            s.unmapStacks(w);
+            Backend.workerDeinit(s.backendOf(), w);
+            spare.state.store(.unused, .release);
+        }
+
+        /// Whether a replacement worker still has a reason to run: the worker it replaces is
+        /// still stuck.
+        fn spareWanted(s: *Sched, spare: *Spare) bool {
+            if (spare.state.load(.acquire) != .running) return false;
+            return s.workers[spare.assigned.load(.monotonic)].stranded.load(.acquire);
         }
 
         // Making tasks runnable
@@ -1079,7 +1619,9 @@ pub fn Scheduler(comptime Backend: type) type {
                 .sticky, .pinned => {
                     const home = @atomicLoad(u32, &task.home, .monotonic);
                     if (home == w.index) return s.readyHere(w, task, .next);
-                    const target = &s.workers[home];
+                    // A task that last ran on a replacement whose thread has stopped goes to the
+                    // shared queue: there is no worker of its own any more.
+                    const target = s.workerAt(home) orelse return s.readyAnywhere(w, task);
                     target.inbox.push(task);
                     s.wakeWorker(w, target);
                 },
@@ -1098,6 +1640,13 @@ pub fn Scheduler(comptime Backend: type) type {
                 else
                     s.ready(w, task),
             }
+        }
+
+        /// `task` goes to the shared queue, which any worker takes from. For a task that has no
+        /// worker of its own, such as one that last ran on a replacement worker that stopped.
+        fn readyAnywhere(s: *Sched, w: *Worker, task: *Task) void {
+            s.shared.push(&.{task});
+            s.notify(w);
         }
 
         fn readyYielded(s: *Sched, w: *Worker, task: *Task) void {
@@ -1120,12 +1669,15 @@ pub fn Scheduler(comptime Backend: type) type {
             switch (when) {
                 .next => {
                     task.status = .{ .queue_next = null };
-                    const displaced = w.run_next orelse {
-                        w.run_next = task;
+                    // The slot holds one task: whichever got there first. A task that finds it
+                    // taken goes to the queue behind the one already there, and a stealer that
+                    // takes the slot while this worker is stuck takes nothing this worker has
+                    // not put there itself.
+                    if (w.run_next.load(.monotonic) == null) {
+                        w.run_next.store(task, .monotonic);
                         return;
-                    };
-                    w.run_next = task;
-                    w.local.push(displaced, &s.shared);
+                    }
+                    w.local.push(task, &s.shared);
                 },
                 .later => w.local.push(task, &s.shared),
             }
@@ -1142,6 +1694,8 @@ pub fn Scheduler(comptime Backend: type) type {
 
         // Spawning
 
+        /// Makes a task for `start` and its arguments. `name` is the name of the function it
+        /// will run, for the task names a log line reports: see `Io.spawnedName`.
         fn spawn(
             s: *Sched,
             options: SpawnOptions,
@@ -1149,6 +1703,7 @@ pub fn Scheduler(comptime Backend: type) type {
             result_alignment: Alignment,
             context: []const u8,
             context_alignment: Alignment,
+            name: [:0]const u8,
             start: @FieldType(Task, "start"),
         ) Io.ConcurrentError!*Task {
             const w: *Worker = .current();
@@ -1192,18 +1747,13 @@ pub fn Scheduler(comptime Backend: type) type {
                 .home = home,
                 .start = start,
                 .result_align = result_alignment,
+                .ops = 0,
                 .context_bytes = context_bytes,
                 .mapping = mapping,
-                .name = if (tracy.enable) name: {
-                    var name_arena = w.name_arena.promote(std.heap.page_allocator);
-                    defer w.name_arena = name_arena.state;
-                    break :name std.fmt.allocPrintSentinel(
-                        name_arena.allocator(),
-                        "task {d}",
-                        .{@atomicRmw(u64, &Task.next_name, .Add, 1, .monotonic)},
-                        0,
-                    ) catch return error.ConcurrencyUnavailable;
-                },
+                .id = Task.next_id.fetchAdd(1, .monotonic),
+                // The name has to be a comptime string: a task reports it long after the memory
+                // of whoever spawned it is gone. `Io.spawnedName` is one.
+                .name = if (name.len == 0) "unnamed" else name,
                 .tsan_fiber = if (tsan.enable) tsan.__tsan_create_fiber(0),
             };
             if (builtin.cpu.arch == .x86_64) @as(*usize, @ptrFromInt(sp - 8)).* = 0; // no return address
@@ -1211,6 +1761,7 @@ pub fn Scheduler(comptime Backend: type) type {
             w.live += 1;
             return task;
         }
+
 
         /// Queues a task that was just spawned.
         fn enqueueSpawned(s: *Sched, w: *Worker, task: *Task) void {
@@ -1370,6 +1921,29 @@ pub fn Scheduler(comptime Backend: type) type {
         }
 
         // The Io vtable functions the scheduler implements.
+        /// `Io.blocking` for a backend with no pool for blocking calls: the call is made on the
+        /// calling thread. See `Io.blocking`.
+        pub fn blockingDirect(
+            userdata: ?*anyopaque,
+            result: []u8,
+            result_alignment: Alignment,
+            context: []const u8,
+            context_alignment: Alignment,
+            name: [:0]const u8,
+            start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+        ) void {
+            charged(userdata);
+            _ = result_alignment;
+            _ = context_alignment;
+            _ = name;
+            start(context.ptr, result.ptr);
+        }
+
+        /// `charge`, from a vtable entry point's `userdata`.
+        pub fn charged(userdata: ?*anyopaque) void {
+            charge(fromUserdata(userdata));
+        }
+
 
         pub fn async(
             userdata: ?*anyopaque,
@@ -1377,9 +1951,10 @@ pub fn Scheduler(comptime Backend: type) type {
             result_alignment: Alignment,
             context: []const u8,
             context_alignment: Alignment,
+            name: [:0]const u8,
             start: *const fn (context: *const anyopaque, result: *anyopaque) void,
         ) ?*Io.AnyFuture {
-            return concurrent(userdata, result.len, result_alignment, context, context_alignment, start) catch {
+            return concurrent(userdata, result.len, result_alignment, context, context_alignment, name, start) catch {
                 start(context.ptr, result.ptr);
                 return null;
             };
@@ -1391,10 +1966,12 @@ pub fn Scheduler(comptime Backend: type) type {
             result_alignment: Alignment,
             context: []const u8,
             context_alignment: Alignment,
+            name: [:0]const u8,
             start: *const fn (context: *const anyopaque, result: *anyopaque) void,
         ) Io.ConcurrentError!*Io.AnyFuture {
             const s = fromUserdata(userdata);
-            return s.spawnFuture(.{}, result_len, result_alignment, context, context_alignment, start);
+            charge(s);
+            return s.spawnFuture(.{}, result_len, result_alignment, context, context_alignment, name, start);
         }
 
         fn spawnFuture(
@@ -1404,9 +1981,10 @@ pub fn Scheduler(comptime Backend: type) type {
             result_alignment: Alignment,
             context: []const u8,
             context_alignment: Alignment,
+            name: [:0]const u8,
             start: *const fn (context: *const anyopaque, result: *anyopaque) void,
         ) Io.ConcurrentError!*Io.AnyFuture {
-            const task = try s.spawn(options, result_len, result_alignment, context, context_alignment, .{ .future = start });
+            const task = try s.spawn(options, result_len, result_alignment, context, context_alignment, name, .{ .future = start });
             s.enqueueSpawned(.current(), task);
             return @ptrCast(task);
         }
@@ -1418,6 +1996,7 @@ pub fn Scheduler(comptime Backend: type) type {
             result_alignment: Alignment,
         ) void {
             const s = fromUserdata(userdata);
+            charge(s);
             const awaiting: *Task = @ptrCast(@alignCast(future));
             if (@atomicLoad(?*Task, &awaiting.link.awaiter, .acquire) != Task.finished)
                 s.yield(null, .{ .await = awaiting });
@@ -1464,9 +2043,10 @@ pub fn Scheduler(comptime Backend: type) type {
             type_erased: *Io.Group,
             context: []const u8,
             context_alignment: Alignment,
+            name: [:0]const u8,
             start: *const fn (context: *const anyopaque) void,
         ) void {
-            return groupConcurrent(userdata, type_erased, context, context_alignment, start) catch {
+            return groupConcurrent(userdata, type_erased, context, context_alignment, name, start) catch {
                 start(context.ptr);
             };
         }
@@ -1476,10 +2056,12 @@ pub fn Scheduler(comptime Backend: type) type {
             type_erased: *Io.Group,
             context: []const u8,
             context_alignment: Alignment,
+            name: [:0]const u8,
             start: *const fn (context: *const anyopaque) void,
         ) Io.ConcurrentError!void {
             const s = fromUserdata(userdata);
-            return s.spawnGroupMember(.{}, type_erased, context, context_alignment, start);
+            charge(s);
+            return s.spawnGroupMember(.{}, type_erased, context, context_alignment, name, start);
         }
 
         fn spawnGroupMember(
@@ -1488,10 +2070,11 @@ pub fn Scheduler(comptime Backend: type) type {
             type_erased: *Io.Group,
             context: []const u8,
             context_alignment: Alignment,
+            name: [:0]const u8,
             start: *const fn (context: *const anyopaque) void,
         ) Io.ConcurrentError!void {
             const group: Group = .{ .ptr = type_erased };
-            const task = try s.spawn(options, 0, .@"1", context, context_alignment, .{ .group = .{
+            const task = try s.spawn(options, 0, .@"1", context, context_alignment, name, .{ .group = .{
                 .group = group,
                 .start = start,
             } });
@@ -1502,12 +2085,14 @@ pub fn Scheduler(comptime Backend: type) type {
         pub fn groupAwait(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *anyopaque) Io.Cancelable!void {
             const s = fromUserdata(userdata);
             _ = initial_token;
+            charge(s);
             s.yield(null, .{ .group_await = .{ .ptr = type_erased } });
         }
 
         pub fn groupCancel(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *anyopaque) void {
             const s = fromUserdata(userdata);
             _ = initial_token;
+            charge(s);
             s.yield(null, .{ .group_cancel = .{ .ptr = type_erased } });
         }
 
@@ -1524,7 +2109,8 @@ pub fn Scheduler(comptime Backend: type) type {
         }
 
         pub fn checkCancel(userdata: ?*anyopaque) Io.Cancelable!void {
-            _ = userdata;
+            const s = fromUserdata(userdata);
+            charge(s);
             const task = Worker.current().currentTask();
             switch (task.cancel_protection.check()) {
                 .unblocked => {
@@ -1578,6 +2164,7 @@ pub fn Scheduler(comptime Backend: type) type {
                 .of(Result),
                 @ptrCast(&args),
                 .of(Args),
+                Io.spawnedName(function),
                 TypeErased.start,
             );
             return future;
@@ -1597,7 +2184,7 @@ pub fn Scheduler(comptime Backend: type) type {
                     _ = @as(Io.Cancelable!void, @call(.auto, function, args_casted.*)) catch {};
                 }
             };
-            return s.spawnGroupMember(options, group, @ptrCast(&args), .of(Args), TypeErased.start);
+            return s.spawnGroupMember(options, group, @ptrCast(&args), .of(Args), Io.spawnedName(function), TypeErased.start);
         }
 
         pub const Group = struct {
@@ -1839,6 +2426,7 @@ const TestBackend = struct {
         v.recancel = Sched.recancel;
         v.swapCancelProtection = Sched.swapCancelProtection;
         v.checkCancel = Sched.checkCancel;
+        v.blocking = Sched.blockingDirect;
         v.futexWait = futexWait;
         v.futexWaitUncancelable = futexWaitUncancelable;
         v.futexWake = futexWake;
@@ -1877,6 +2465,12 @@ const TestBackend = struct {
         _ = linux.futex_4arg(&to.backend.wake_word.raw, .{ .cmd = .WAKE, .private = true }, 1, null);
     }
 
+    pub fn wakeForeign(b: *TestBackend, to: *Sched.Worker) void {
+        _ = b;
+        to.backend.wake_word.store(1, .release);
+        _ = linux.futex_4arg(&to.backend.wake_word.raw, .{ .cmd = .WAKE, .private = true }, 1, null);
+    }
+
     pub fn cancelOperation(b: *TestBackend, from: *Sched.Worker, task: *Sched.Task, token: u31) void {
         _ = b;
         _ = from;
@@ -1890,6 +2484,22 @@ const TestBackend = struct {
     }
 
     fn futexWait(userdata: ?*anyopaque, ptr: *const u32, expected: u32, timeout: Io.Timeout) Io.Cancelable!void {
+        const b: *TestBackend = @ptrCast(@alignCast(userdata));
+        if (Sched.Worker.currentOrNull() == null) {
+            // A thread that is not one of the workers blocks in the kernel, as the real backends
+            // do. The watchdog is one, and it waits with a timeout.
+            var timespec: linux.timespec = undefined;
+            const timespec_ptr: ?*const linux.timespec = if (timeout.toDurationFromNow(b.io())) |duration| ts: {
+                const ns = @max(0, duration.raw.toNanoseconds());
+                timespec = .{
+                    .sec = @intCast(@divFloor(ns, std.time.ns_per_s)),
+                    .nsec = @intCast(@mod(ns, std.time.ns_per_s)),
+                };
+                break :ts &timespec;
+            } else null;
+            _ = linux.futex_4arg(ptr, .{ .cmd = .WAIT, .private = true }, expected, timespec_ptr);
+            return;
+        }
         assert(timeout == .none);
         try Sched.checkCancel(userdata);
         futexWaitUncancelable(userdata, ptr, expected);

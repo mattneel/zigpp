@@ -351,6 +351,7 @@ pub fn io(ev: *Evented) Io {
             .concurrent = concurrent,
             .await = await,
             .cancel = cancel,
+            .blocking = blocking,
 
             .groupAsync = groupAsync,
             .groupConcurrent = groupConcurrent,
@@ -1037,10 +1038,11 @@ fn async(
     result_alignment: Alignment,
     context: []const u8,
     context_alignment: Alignment,
+    name: [:0]const u8,
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
 ) ?*std.Io.AnyFuture {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    return concurrent(ev, result.len, result_alignment, context, context_alignment, start) catch {
+    return concurrent(ev, result.len, result_alignment, context, context_alignment, name, start) catch {
         start(context.ptr, result.ptr);
         return null;
     };
@@ -1052,8 +1054,10 @@ fn concurrent(
     result_alignment: Alignment,
     context: []const u8,
     context_alignment: Alignment,
+    name: [:0]const u8,
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
 ) Io.ConcurrentError!*std.Io.AnyFuture {
+    _ = name;
     assert(result_alignment.compare(.lte, Fiber.max_result_align)); // TODO
     assert(context_alignment.compare(.lte, Fiber.max_context_align)); // TODO
     assert(result_len <= Fiber.max_result_size); // TODO
@@ -1380,10 +1384,11 @@ fn groupAsync(
     type_erased: *Io.Group,
     context: []const u8,
     context_alignment: Alignment,
+    name: [:0]const u8,
     start: *const fn (context: *const anyopaque) void,
 ) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    return groupConcurrent(ev, type_erased, context, context_alignment, start) catch {
+    return groupConcurrent(ev, type_erased, context, context_alignment, name, start) catch {
         start(context.ptr);
     };
 }
@@ -1393,8 +1398,10 @@ fn groupConcurrent(
     type_erased: *Io.Group,
     context: []const u8,
     context_alignment: Alignment,
+    name: [:0]const u8,
     start: *const fn (context: *const anyopaque) void,
 ) Io.ConcurrentError!void {
+    _ = name;
     assert(context_alignment.compare(.lte, Fiber.max_context_align)); // TODO
     assert(context.len <= Fiber.max_context_size); // TODO
 
@@ -1435,6 +1442,24 @@ fn groupConcurrent(
     @memcpy(closure.contextPointer(), context);
     group.addFiber(ev, fiber);
     ev.queue.async(fiber, &Fiber.@"resume");
+}
+
+/// There is no pool for blocking calls in this implementation, so the call is made on the
+/// calling thread. See `Io.blocking`.
+fn blocking(
+    userdata: ?*anyopaque,
+    result: []u8,
+    result_alignment: Alignment,
+    context: []const u8,
+    context_alignment: Alignment,
+    name: [:0]const u8,
+    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+) void {
+    _ = userdata;
+    _ = result_alignment;
+    _ = context_alignment;
+    _ = name;
+    start(context.ptr, result.ptr);
 }
 
 fn groupAwait(

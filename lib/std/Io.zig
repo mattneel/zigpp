@@ -73,6 +73,9 @@ pub const VTable = struct {
         /// Copied and then passed to `start`.
         context: []const u8,
         context_alignment: std.mem.Alignment,
+        /// The name of the function the future is for, for the task names an implementation
+        /// reports. See `spawnedName`.
+        name: [:0]const u8,
         start: *const fn (context: *const anyopaque, result: *anyopaque) void,
     ) ?*AnyFuture,
     /// Thread-safe.
@@ -84,6 +87,8 @@ pub const VTable = struct {
         /// Copied and then passed to `start`.
         context: []const u8,
         context_alignment: std.mem.Alignment,
+        /// The name of the function the future is for. See `async`.
+        name: [:0]const u8,
         start: *const fn (context: *const anyopaque, result: *anyopaque) void,
     ) ConcurrentError!*AnyFuture,
     /// This function is only called when `async` returns a non-null value.
@@ -115,6 +120,25 @@ pub const VTable = struct {
         result_alignment: std.mem.Alignment,
     ) void,
 
+    /// Runs `start` with `context` on a thread that may block, and writes its result with
+    /// `start` before returning. See `Io.blocking`.
+    ///
+    /// Thread-safe.
+    blocking: *const fn (
+        /// Corresponds to `Io.userdata`.
+        userdata: ?*anyopaque,
+        /// Points to a buffer where the result is written. Unlike `async`, this pointer stays
+        /// valid for the whole call: it is the caller's own storage.
+        result: []u8,
+        result_alignment: std.mem.Alignment,
+        /// Passed to `start`. Stays valid for the whole call.
+        context: []const u8,
+        context_alignment: std.mem.Alignment,
+        /// The name of the function being run. See `spawnedName`.
+        name: [:0]const u8,
+        start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+    ) void,
+
     /// Thread-safe.
     groupAsync: *const fn (
         /// Corresponds to `Io.userdata`.
@@ -124,6 +148,8 @@ pub const VTable = struct {
         /// Copied and then passed to `start`.
         context: []const u8,
         context_alignment: std.mem.Alignment,
+        /// The name of the function the task is for. See `async`.
+        name: [:0]const u8,
         start: *const fn (context: *const anyopaque) void,
     ) void,
     /// Thread-safe.
@@ -135,6 +161,8 @@ pub const VTable = struct {
         /// Copied and then passed to `start`.
         context: []const u8,
         context_alignment: std.mem.Alignment,
+        /// The name of the function the task is for. See `async`.
+        name: [:0]const u8,
         start: *const fn (context: *const anyopaque) void,
     ) ConcurrentError!void,
     groupAwait: *const fn (?*anyopaque, *Group, token: *anyopaque) Cancelable!void,
@@ -249,6 +277,46 @@ pub const VTable = struct {
     netInterfaceName: *const fn (?*anyopaque, net.Interface) net.Interface.NameError!net.Interface.Name,
     netLookup: *const fn (?*anyopaque, net.HostName, *Queue(net.HostName.LookupResult), net.HostName.LookupOptions) net.HostName.LookupError!void,
 };
+
+/// The name of `function`, for the task names an implementation reports: `Io.async`,
+/// `Io.concurrent`, `Group.async`, `Group.concurrent` and `Io.blocking` pass it to the
+/// implementation, and `std.Io.Threadz` names the tasks it makes in its logs and its dump with
+/// it.
+///
+/// The language has no reflection from a function value to the declaration it names, so the
+/// name comes from the type name of an instantiation of `Spawned` that carries the function:
+/// `std.Io.Spawned((function 'foo'))`. If that instantiation does not name the function, the
+/// whole type name is the name of the task.
+pub fn spawnedName(comptime function: anytype) [:0]const u8 {
+    return comptime blk: {
+        const full = @typeName(Spawned(function));
+        const inner = inner: {
+            const open = "(function '";
+            const start = std.mem.indexOf(u8, full, open) orelse break :inner full;
+            const quoted = full[start + open.len ..];
+            const end = std.mem.indexOfScalar(u8, quoted, '\'') orelse break :inner full;
+            break :inner quoted[0..end];
+        };
+        // Copied so that the name ends at a null, which is what an implementation that reports
+        // it to a profiler needs.
+        const named = static: {
+            var buffer: [inner.len:0]u8 = undefined;
+            @memcpy(buffer[0..inner.len], inner);
+            break :static buffer;
+        };
+        break :blk &named;
+    };
+}
+
+/// Carries `function` for `spawnedName`, which reads its name from this instantiation's type
+/// name. The field is what makes each function its own instantiation.
+fn Spawned(comptime function: anytype) type {
+    return struct {
+        comptime {
+            _ = @TypeOf(function);
+        }
+    };
+}
 
 pub const Operation = union(enum) {
     file_read_streaming: FileReadStreaming,
@@ -1371,7 +1439,7 @@ pub const Group = struct {
                 _ = @as(Cancelable!void, @call(.auto, function, args_casted.*)) catch {};
             }
         };
-        io.vtable.groupAsync(io.userdata, g, @ptrCast(&args), .of(Args), TypeErased.start);
+        io.vtable.groupAsync(io.userdata, g, @ptrCast(&args), .of(Args), spawnedName(function), TypeErased.start);
     }
 
     /// Equivalent to `Io.concurrent`, except the task is spawned in this
@@ -1392,7 +1460,7 @@ pub const Group = struct {
                 _ = @as(Cancelable!void, @call(.auto, function, args_casted.*)) catch {};
             }
         };
-        return io.vtable.groupConcurrent(io.userdata, g, @ptrCast(&args), .of(Args), TypeErased.start);
+        return io.vtable.groupConcurrent(io.userdata, g, @ptrCast(&args), .of(Args), spawnedName(function), TypeErased.start);
     }
 
     /// Blocks until all tasks of the group finish. During this time,
@@ -1554,7 +1622,7 @@ pub fn Select(comptime U: type) type {
                 }
             };
             const context: Context = .{ .select = s, .args = args };
-            s.io.vtable.groupAsync(s.io.userdata, &s.group, @ptrCast(&context), .of(Context), Context.start);
+            s.io.vtable.groupAsync(s.io.userdata, &s.group, @ptrCast(&context), .of(Context), spawnedName(function), Context.start);
         }
 
         /// Calls `function` with `args` concurrently. The resource spawned is
@@ -1591,7 +1659,7 @@ pub fn Select(comptime U: type) type {
                 }
             };
             const context: Context = .{ .select = s, .args = args };
-            try s.io.vtable.groupConcurrent(s.io.userdata, &s.group, @ptrCast(&context), .of(Context), Context.start);
+            try s.io.vtable.groupConcurrent(s.io.userdata, &s.group, @ptrCast(&context), .of(Context), spawnedName(function), Context.start);
         }
 
         /// Blocks until another task of the select finishes.
@@ -2547,6 +2615,7 @@ pub fn async(
         .of(Result),
         @ptrCast(&args),
         .of(Args),
+        spawnedName(function),
         TypeErased.start,
     );
     return future;
@@ -2586,9 +2655,53 @@ pub fn concurrent(
         .of(Result),
         @ptrCast(&args),
         .of(Args),
+        spawnedName(function),
         TypeErased.start,
     );
     return future;
+}
+
+/// Calls `function` with `args` on a thread that may block, and returns its result.
+///
+/// A blocking call is one that waits without making progress, such as a C library call, a
+/// blocking syscall, or a lock of a lock the `Io` interface knows nothing about. On an
+/// implementation whose unit of work is not an OS thread, such as `Io.Threadz`, the call is
+/// made on a thread the implementation keeps for blocking calls while the calling task waits
+/// for its result, so that the call holds no worker. An implementation whose unit of work *is*
+/// an OS thread, such as `Io.Threaded`, calls `function` on the calling thread.
+///
+/// The result is `function`'s return value, whatever it is: an error union is returned as the
+/// error union.
+///
+/// The call is not cancelable once it has started: a cancelation request takes effect at the
+/// calling task's next cancelation point after this call returns.
+///
+/// Thread-safe.
+pub fn blocking(
+    io: Io,
+    function: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(function)),
+) @typeInfo(@TypeOf(function)).@"fn".return_type.? {
+    const Result = @typeInfo(@TypeOf(function)).@"fn".return_type.?;
+    const Args = @TypeOf(args);
+    const TypeErased = struct {
+        fn start(context: *const anyopaque, result: *anyopaque) void {
+            const args_casted: *const Args = @ptrCast(@alignCast(context));
+            const result_casted: *Result = @ptrCast(@alignCast(result));
+            result_casted.* = @call(.auto, function, args_casted.*);
+        }
+    };
+    var result: Result = undefined;
+    io.vtable.blocking(
+        io.userdata,
+        std.mem.asBytes(&result),
+        .of(Result),
+        std.mem.asBytes(&args),
+        .of(Args),
+        spawnedName(function),
+        TypeErased.start,
+    );
+    return result;
 }
 
 /// Waits until a specified amount of time has passed on `clock`.
@@ -2722,6 +2835,7 @@ pub const failing: std.Io = .{
         .concurrent = failingConcurrent,
         .await = unreachableAwait,
         .cancel = unreachableCancel,
+        .blocking = failingBlocking,
 
         .groupAsync = noGroupAsync,
         .groupConcurrent = failingGroupConcurrent,
@@ -2842,10 +2956,11 @@ pub fn noCrashHandler(userdata: ?*anyopaque) void {
     _ = userdata;
 }
 
-pub fn noAsync(userdata: ?*anyopaque, result: []u8, result_alignment: std.mem.Alignment, context: []const u8, context_alignment: std.mem.Alignment, start: *const fn (context: *const anyopaque, result: *anyopaque) void) ?*AnyFuture {
+pub fn noAsync(userdata: ?*anyopaque, result: []u8, result_alignment: std.mem.Alignment, context: []const u8, context_alignment: std.mem.Alignment, name: [:0]const u8, start: *const fn (context: *const anyopaque, result: *anyopaque) void) ?*AnyFuture {
     _ = userdata;
     _ = result_alignment;
     _ = context_alignment;
+    _ = name;
     start(context.ptr, result.ptr);
     return null;
 }
@@ -2856,6 +2971,7 @@ pub fn failingConcurrent(
     result_alignment: std.mem.Alignment,
     context: []const u8,
     context_alignment: std.mem.Alignment,
+    name: [:0]const u8,
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
 ) ConcurrentError!*AnyFuture {
     _ = userdata;
@@ -2863,8 +2979,27 @@ pub fn failingConcurrent(
     _ = result_alignment;
     _ = context;
     _ = context_alignment;
+    _ = name;
     _ = start;
     return error.ConcurrencyUnavailable;
+}
+
+/// There is no thread to hand blocking calls to, so this system runs them here. See
+/// `Io.blocking`.
+pub fn failingBlocking(
+    userdata: ?*anyopaque,
+    result: []u8,
+    result_alignment: std.mem.Alignment,
+    context: []const u8,
+    context_alignment: std.mem.Alignment,
+    name: [:0]const u8,
+    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+) void {
+    _ = userdata;
+    _ = result_alignment;
+    _ = context_alignment;
+    _ = name;
+    start(context.ptr, result.ptr);
 }
 
 pub fn unreachableAwait(
@@ -2898,11 +3033,13 @@ pub fn noGroupAsync(
     group: *Group,
     context: []const u8,
     context_alignment: std.mem.Alignment,
+    name: [:0]const u8,
     start: *const fn (context: *const anyopaque) void,
 ) void {
     _ = userdata;
     _ = group;
     _ = context_alignment;
+    _ = name;
     start(context.ptr);
 }
 
@@ -2911,12 +3048,14 @@ pub fn failingGroupConcurrent(
     group: *Group,
     context: []const u8,
     context_alignment: std.mem.Alignment,
+    name: [:0]const u8,
     start: *const fn (context: *const anyopaque) void,
 ) ConcurrentError!void {
     _ = userdata;
     _ = group;
     _ = context;
     _ = context_alignment;
+    _ = name;
     _ = start;
     return error.ConcurrencyUnavailable;
 }

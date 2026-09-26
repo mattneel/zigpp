@@ -77,6 +77,182 @@ random_fd: CachedFd,
 csprng_mutex: Io.Mutex,
 csprng: Csprng,
 
+/// The pool `io.blocking` calls run on. See `Dirty`.
+dirty: Dirty = .{},
+
+/// The ring the watchdog wakes parked workers from. See `Watchdog`.
+watchdog: Watchdog = .{},
+
+/// The pool `io.blocking` calls run on: an `Io.Threaded` instance this instance owns, started
+/// with the first blocking call, and the group the jobs belong to. A job is one task of that
+/// pool, which destroys itself when it finishes, so nothing awaits the group.
+pub const Dirty = struct {
+    lock: Io.Mutex = .init,
+    /// `null` until the first blocking call starts the pool.
+    threaded: ?*Io.Threaded = null,
+    group: Io.Group = .init,
+
+    fn deinit(d: *Dirty, ev: *Evented) void {
+        const threaded = d.threaded orelse return;
+        threaded.deinit();
+        ev.allocator().destroy(threaded);
+        d.threaded = null;
+    }
+
+    /// Runs `job` on the pool, starting it if it is not running yet. `false` if there is no
+    /// thread to hand the job to: the pool is at its limit, or it could not be started.
+    fn submit(d: *Dirty, ev: *Evented, job: *const DirtyJob, name: [:0]const u8) bool {
+        const ev_io = ev.io();
+        d.lock.lock(ev_io) catch return false; // canceled: the caller makes the call itself
+        defer d.lock.unlock(ev_io);
+        const threaded = d.threaded orelse started: {
+            // The pool's threads allocate from the same allocator, so it is the allocator this
+            // instance hands out, which is thread-safe.
+            const threaded = ev.allocator().create(Io.Threaded) catch return false;
+            // The pool's threads allocate through it too, so it is the allocator this instance
+            // hands out, which is thread-safe.
+            threaded.* = Io.Threaded.init(ev.allocator(), .{});
+            d.threaded = threaded;
+            break :started threaded;
+        };
+        const threaded_io = threaded.io();
+        threaded_io.vtable.groupConcurrent(
+            threaded_io.userdata,
+            &d.group,
+            @ptrCast(job),
+            .of(*DirtyJob),
+            name,
+            DirtyJob.run,
+        ) catch return false;
+        return true;
+    }
+};
+
+/// One `io.blocking` call: what the pool runs, and where the result goes. It lives on the
+/// calling task's stack, which stays put while the task is parked, so the pool reads the
+/// arguments and writes the result there without a copy.
+pub const DirtyJob = struct {
+    ev: *Evented,
+    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+    context: *const anyopaque,
+    result: *anyopaque,
+    /// 0 while the job runs, 1 once it has finished. This is the calling task's own word, on its
+    /// stack: the pool copies the job, but the task parks on and the job's thread wakes this
+    /// word.
+    done: *std.atomic.Value(u32),
+
+    /// On the pool's thread: makes the blocking call, then wakes the task.
+    fn run(context: *const anyopaque) void {
+        const job: *const DirtyJob = @ptrCast(@alignCast(context));
+        job.start(job.context, job.result);
+        @atomicStore(u32, &job.done.raw, 1, .release);
+        // The task waits on this word on its worker's ring, as a futex wait of the kernel.
+        // `futexWake` from a thread that is not a worker is a plain futex wake, which is what
+        // wakes such a waiter.
+        futexWake(@ptrCast(job.ev), &job.done.raw, 1);
+    }
+};
+
+/// Runs `start` with `context` on a thread that may block, writing the result to `result` before
+/// returning. See `Io.blocking`.
+///
+/// A task parks while a job runs, so the worker runs other tasks. The call is not cancelable
+/// once it has started. If the pool is at its limit, or cannot be started, the call is made on
+/// the calling thread, which holds its worker for as long as it blocks.
+fn dirtyBlocking(
+    userdata: ?*anyopaque,
+    result: []u8,
+    result_alignment: Alignment,
+    context: []const u8,
+    context_alignment: Alignment,
+    name: [:0]const u8,
+    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+) void {
+    charge(userdata);
+    _ = result_alignment;
+    _ = context_alignment;
+    const ev: *Evented = @ptrCast(@alignCast(userdata));
+    if (Scheduler.Worker.currentOrNull() == null) {
+        // A thread that is not one of the workers has no task to park.
+        start(context.ptr, result.ptr);
+        return;
+    }
+    var done: std.atomic.Value(u32) = .init(0);
+    const job: DirtyJob = .{
+        .ev = ev,
+        .start = start,
+        .context = context.ptr,
+        .result = result.ptr,
+        .done = &done,
+    };
+    if (!ev.dirty.submit(ev, &job, name)) {
+        start(context.ptr, result.ptr);
+        return;
+    }
+    // Until the job has run. Uncancelable: the call is not cancelable once it has started. The
+    // word is on this task's stack, and a wake that arrives before the wait below does is not
+    // lost: the wait returns at once when the word is not 0.
+    futexWaitUncancelable(userdata, &done.raw, 0);
+    assert(done.raw != 0);
+}
+
+/// The ring the watchdog wakes parked workers from. A ring has one submitter, so the watchdog
+/// thread owns this one, and starts it the first time it needs it.
+pub const Watchdog = struct {
+    /// `null` until the first wake.
+    ring: ?IoUring = null,
+
+    fn deinit(w: *Watchdog) void {
+        if (w.ring) |*ring| ring.deinit();
+        w.ring = null;
+    }
+
+    /// Wakes `to`, which is parked in `poll`. Called by the watchdog thread only.
+    fn wake(w: *Watchdog, to: *Scheduler.Worker) void {
+        const ring = w.get() orelse return;
+        // Completions of earlier sends: a send that failed leaves one, and the ring must not
+        // fill up with them.
+        var cqes: [8]linux.io_uring_cqe = undefined;
+        while (ring.cq_ready() != 0) _ = ring.copy_cqes(&cqes, 0) catch break;
+        const sqe = ring.get_sqe() catch resubmit: {
+            _ = ring.submit() catch return;
+            break :resubmit ring.get_sqe() catch return;
+        };
+        sqe.* = .{
+            .opcode = .MSG_RING,
+            .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
+            .ioprio = 0,
+            .fd = to.backend.io_uring.fd,
+            .off = @backingInt(Completion.Userdata.wakeup),
+            .addr = @backingInt(linux.IORING_MSG_RING_COMMAND.DATA),
+            .len = 0,
+            .rw_flags = 0,
+            .user_data = @backingInt(Completion.Userdata.wakeup),
+            .buf_index = 0,
+            .personality = 0,
+            .splice_fd_in = 0,
+            .addr3 = 0,
+            .resv = 0,
+        };
+        _ = ring.submit() catch return;
+    }
+
+    fn get(w: *Watchdog) ?*IoUring {
+        if (w.ring) |*ring| return ring;
+        w.ring = IoUring.init(1, linux.IORING_SETUP_SINGLE_ISSUER) catch |err| {
+            std.log.scoped(.threadz).warn("unable to wake a stuck worker: {t}", .{err});
+            return null;
+        };
+        return &w.ring.?;
+    }
+};
+
+/// For the scheduler: wakes `to` from a thread that is not one of the workers, which is the
+/// watchdog: its own ring sends the wake, since a ring may only be submitted to by its thread.
+pub fn wakeForeign(ev: *Evented, to: *Scheduler.Worker) void {
+    ev.watchdog.wake(to);
+}
+
 /// A worker's io_uring and the state that goes with it.
 const Thread = struct {
     io_uring: IoUring,
@@ -380,6 +556,16 @@ fn free(userdata: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_ad
     return ev.backing_allocator.rawFree(memory, alignment, ret_addr);
 }
 
+/// Charges one operation to the calling task, if the calling thread is one of the workers: every
+/// entry point of the vtable below is one Io operation the task made, and a task that makes
+/// `Scheduler.budget` of them without parking yields at the next one. See `Scheduler.charge`.
+///
+/// An entry point that reaches another one is charged for both. That only makes a task that
+/// loops on such an operation yield a little sooner.
+inline fn charge(userdata: ?*anyopaque) void {
+    Scheduler.charged(userdata);
+}
+
 pub fn io(ev: *Evented) Io {
     return .{
         .userdata = ev,
@@ -390,6 +576,7 @@ pub fn io(ev: *Evented) Io {
             .concurrent = Scheduler.concurrent,
             .await = Scheduler.await,
             .cancel = Scheduler.cancel,
+            .blocking = dirtyBlocking,
 
             .groupAsync = Scheduler.groupAsync,
             .groupConcurrent = Scheduler.groupConcurrent,
@@ -561,6 +748,8 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
 
         .csprng_mutex = .init,
         .csprng = .uninitialized,
+        .dirty = .{},
+        .watchdog = .{},
     };
     try ev.sched.init(backing_allocator, .{
         .workers = if (options.thread_limit) |thread_limit| 1 + thread_limit else null,
@@ -572,6 +761,8 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
 /// called `init`.
 pub fn deinit(ev: *Evented) void {
     ev.sched.deinit(ev.backing_allocator);
+    ev.dirty.deinit(ev);
+    ev.watchdog.deinit();
     ev.null_fd.close();
     ev.random_fd.close();
     ev.* = undefined;
@@ -611,6 +802,14 @@ pub fn setWorkerLimit(ev: *Evented, n: usize) void {
 /// pinned to a worker has an index below this.
 pub fn workerLimit(ev: *Evented) u32 {
     return ev.sched.limit.load(.monotonic);
+}
+
+/// What a program can read about this instance: see `Scheduler.Stats`, which is this type. The
+/// stuck counter and the last stuck episode are the watchdog's; see `Scheduler`.
+pub const Stats = Scheduler.Stats;
+
+pub fn stats(ev: *Evented) Stats {
+    return ev.sched.stats();
 }
 
 /// The `Evented` behind `any_io`, or `null` if `any_io` is another `Io` implementation.
@@ -1018,6 +1217,7 @@ fn futexWait(
     expected: u32,
     timeout: Io.Timeout,
 ) Io.Cancelable!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     if (Scheduler.Worker.currentOrNull() == null) return futexWaitForeign(ev, ptr, expected, timeout);
     const timespec: ?linux.kernel_timespec, const clock: Io.Clock, const timeout_flags: u32 = timespec: switch (timeout) {
@@ -1101,6 +1301,7 @@ fn futexWait(
 }
 
 fn futexWaitUncancelable(userdata: ?*anyopaque, ptr: *const u32, expected: u32) void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     if (Scheduler.Worker.currentOrNull() == null) return futexWaitForeign(ev, ptr, expected, .none);
     var cancel_region: CancelRegion = .initBlocked();
@@ -1136,6 +1337,7 @@ fn futexWaitUncancelable(userdata: ?*anyopaque, ptr: *const u32, expected: u32) 
 }
 
 fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = ev;
     // The kernel takes the count as an `int`, and wakes one waiter for a negative one.
@@ -1165,6 +1367,7 @@ fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
 }
 
 fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
     defer maybe_sync.deinit(ev);
@@ -1322,6 +1525,7 @@ fn deviceIoControl(
 }
 
 fn batchAwaitAsync(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
     defer maybe_sync.deinit(ev);
@@ -1344,6 +1548,7 @@ fn batchAwaitConcurrent(
     batch: *Io.Batch,
     timeout: Io.Timeout,
 ) Io.Batch.AwaitConcurrentError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
     defer maybe_sync.deinit(ev);
@@ -1739,6 +1944,7 @@ fn batchDrainReady(batch: *Io.Batch) Io.Timeout.Error!void {
 }
 
 fn batchCancel(userdata: ?*anyopaque, batch: *Io.Batch) void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     batchDrainReady(batch) catch |err| switch (err) {
         error.Timeout => unreachable, // no timeout
@@ -1786,6 +1992,7 @@ fn dirCreateDir(
     sub_path: []const u8,
     permissions: Dir.Permissions,
 ) Dir.CreateDirError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     var path_buffer: [PATH_MAX]u8 = undefined;
@@ -1824,6 +2031,7 @@ fn dirCreateDirPath(
     sub_path: []const u8,
     permissions: Dir.Permissions,
 ) Dir.CreateDirPathError!Dir.CreatePathStatus {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     var it = Dir.path.componentIterator(sub_path);
@@ -1891,6 +2099,7 @@ fn dirCreateDirPathOpen(
     permissions: Dir.Permissions,
     options: Dir.OpenOptions,
 ) Dir.CreateDirPathOpenError!Dir {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     return dirOpenDir(ev, dir, sub_path, options) catch |err| switch (err) {
         error.FileNotFound => {
@@ -1907,6 +2116,7 @@ fn dirOpenDir(
     sub_path: []const u8,
     options: Dir.OpenOptions,
 ) Dir.OpenError!Dir {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     var path_buffer: [PATH_MAX]u8 = undefined;
@@ -1937,6 +2147,7 @@ fn dirOpenDir(
 }
 
 fn dirStat(userdata: ?*anyopaque, dir: Dir) Dir.StatError!Dir.Stat {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
@@ -1949,6 +2160,7 @@ fn dirStatFile(
     sub_path: []const u8,
     options: Dir.StatFileOptions,
 ) Dir.StatFileError!File.Stat {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var path_buffer: [PATH_MAX]u8 = undefined;
     const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
@@ -1964,6 +2176,7 @@ fn dirAccess(
     sub_path: []const u8,
     options: Dir.AccessOptions,
 ) Dir.AccessError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     var path_buffer: [PATH_MAX]u8 = undefined;
@@ -2006,6 +2219,7 @@ fn dirCreateFile(
     sub_path: []const u8,
     flags: Dir.CreateFileOptions,
 ) File.OpenError!File {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     var path_buffer: [PATH_MAX]u8 = undefined;
@@ -2044,6 +2258,7 @@ fn dirCreateFileAtomic(
     dest_path: []const u8,
     options: Dir.CreateFileAtomicOptions,
 ) Dir.CreateFileAtomicError!File.Atomic {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     // Linux has O_TMPFILE, but linkat() does not support AT_REPLACE, so it's
     // useless when we have to make up a bogus path name to do the rename()
@@ -2190,6 +2405,7 @@ fn dirOpenFile(
     sub_path: []const u8,
     flags: Dir.OpenFileOptions,
 ) File.OpenError!File {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     var path_buffer: [PATH_MAX]u8 = undefined;
@@ -2239,11 +2455,13 @@ fn dirOpenFile(
 }
 
 fn dirClose(userdata: ?*anyopaque, dirs: []const Dir) void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     for (dirs) |dir| ev.close(dir.handle);
 }
 
 fn dirRead(userdata: ?*anyopaque, dr: *Dir.Reader, buffer: []Dir.Entry) Dir.Reader.Error!usize {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var buffer_index: usize = 0;
     while (buffer.len - buffer_index != 0) {
@@ -2331,6 +2549,7 @@ fn dirRead(userdata: ?*anyopaque, dr: *Dir.Reader, buffer: []Dir.Entry) Dir.Read
 }
 
 fn dirRealPath(userdata: ?*anyopaque, dir: Dir, out_buffer: []u8) Dir.RealPathError!usize {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
@@ -2343,6 +2562,7 @@ fn dirRealPathFile(
     sub_path: []const u8,
     out_buffer: []u8,
 ) Dir.RealPathFileError!usize {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     var path_buffer: [PATH_MAX]u8 = undefined;
@@ -2364,6 +2584,7 @@ fn dirRealPathFile(
 }
 
 fn dirDeleteFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8) Dir.DeleteFileError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     var path_buffer: [PATH_MAX]u8 = undefined;
@@ -2399,6 +2620,7 @@ fn dirDeleteFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8) Dir.Dele
 }
 
 fn dirDeleteDir(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8) Dir.DeleteDirError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     var path_buffer: [PATH_MAX]u8 = undefined;
@@ -2440,6 +2662,7 @@ fn dirRename(
     new_dir: Dir,
     new_sub_path: []const u8,
 ) Dir.RenameError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     var old_path_buffer: [PATH_MAX]u8 = undefined;
@@ -2470,6 +2693,7 @@ fn dirRenamePreserve(
     new_dir: Dir,
     new_sub_path: []const u8,
 ) Dir.RenamePreserveError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     var old_path_buffer: [PATH_MAX]u8 = undefined;
@@ -2497,6 +2721,7 @@ fn dirSymLink(
     sym_link_path: []const u8,
     flags: Dir.SymLinkFlags,
 ) Dir.SymLinkError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = flags;
 
@@ -2539,6 +2764,7 @@ fn dirReadLink(
     sub_path: []const u8,
     buffer: []u8,
 ) Dir.ReadLinkError!usize {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     var sub_path_buffer: [PATH_MAX]u8 = undefined;
@@ -2573,6 +2799,7 @@ fn dirSetOwner(
     owner: ?File.Uid,
     group: ?File.Gid,
 ) Dir.SetOwnerError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
@@ -2594,6 +2821,7 @@ fn dirSetFileOwner(
     group: ?File.Gid,
     options: Dir.SetFileOwnerOptions,
 ) Dir.SetFileOwnerError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var path_buffer: [PATH_MAX]u8 = undefined;
     const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
@@ -2614,6 +2842,7 @@ fn dirSetPermissions(
     dir: Dir,
     permissions: Dir.Permissions,
 ) Dir.SetPermissionsError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
@@ -2640,6 +2869,7 @@ fn dirSetFilePermissions(
     permissions: Dir.Permissions,
     options: Dir.SetFilePermissionsOptions,
 ) Dir.SetFilePermissionsError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var path_buffer: [PATH_MAX]u8 = undefined;
     const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
@@ -2660,6 +2890,7 @@ fn dirSetTimestamps(
     sub_path: []const u8,
     options: Dir.SetTimestampsOptions,
 ) Dir.SetTimestampsError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var path_buffer: [PATH_MAX]u8 = undefined;
     const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
@@ -2685,6 +2916,7 @@ fn dirHardLink(
     new_sub_path: []const u8,
     options: Dir.HardLinkOptions,
 ) Dir.HardLinkError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     var old_path_buffer: [PATH_MAX]u8 = undefined;
@@ -2706,6 +2938,7 @@ fn dirHardLink(
 }
 
 fn fileStat(userdata: ?*anyopaque, file: File) File.StatError!File.Stat {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
@@ -2713,6 +2946,7 @@ fn fileStat(userdata: ?*anyopaque, file: File) File.StatError!File.Stat {
 }
 
 fn fileLength(userdata: ?*anyopaque, file: File) File.LengthError!u64 {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
@@ -2740,6 +2974,7 @@ fn fileLength(userdata: ?*anyopaque, file: File) File.LengthError!u64 {
 }
 
 fn fileClose(userdata: ?*anyopaque, files: []const File) void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var cancel_region: CancelRegion = .init();
     defer cancel_region.deinit();
@@ -2754,6 +2989,7 @@ fn fileWritePositional(
     splat: usize,
     offset: u64,
 ) File.WritePositionalError!usize {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     var iovecs: [max_iovecs_len]iovec_const = undefined;
@@ -2815,6 +3051,7 @@ fn fileWriteFileStreaming(
     file_reader: *File.Reader,
     limit: Io.Limit,
 ) File.Writer.WriteFileError!usize {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     const reader_buffered = file_reader.interface.buffered();
     if (header.len != 0 or reader_buffered.len != 0) {
@@ -2838,6 +3075,7 @@ fn fileWriteFilePositional(
     limit: Io.Limit,
     offset: u64,
 ) File.WriteFilePositionalError!usize {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     const reader_buffered = file_reader.interface.buffered();
     if (header.len != 0 or reader_buffered.len != 0) {
@@ -2917,6 +3155,7 @@ fn fileReadPositional(
     data: []const []u8,
     offset: u64,
 ) File.ReadPositionalError!usize {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     var iovecs_buffer: [max_iovecs_len]iovec = undefined;
@@ -2942,6 +3181,7 @@ fn fileReadPositional(
 }
 
 fn fileSeekBy(userdata: ?*anyopaque, file: File, offset: i64) File.SeekError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
@@ -2949,6 +3189,7 @@ fn fileSeekBy(userdata: ?*anyopaque, file: File, offset: i64) File.SeekError!voi
 }
 
 fn fileSeekTo(userdata: ?*anyopaque, file: File, offset: u64) File.SeekError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
@@ -2956,6 +3197,7 @@ fn fileSeekTo(userdata: ?*anyopaque, file: File, offset: u64) File.SeekError!voi
 }
 
 fn fileSync(userdata: ?*anyopaque, file: File) File.SyncError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var cancel_region: CancelRegion = .init();
     defer cancel_region.deinit();
@@ -2993,6 +3235,7 @@ fn fileSync(userdata: ?*anyopaque, file: File) File.SyncError!void {
 }
 
 fn fileIsTty(userdata: ?*anyopaque, file: File) Io.Cancelable!bool {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
@@ -3009,11 +3252,13 @@ fn fileIsTty(userdata: ?*anyopaque, file: File) Io.Cancelable!bool {
 }
 
 fn fileEnableAnsiEscapeCodes(userdata: ?*anyopaque, file: File) File.EnableAnsiEscapeCodesError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     if (!try fileIsTty(ev, file)) return error.NotTerminalDevice;
 }
 
 fn fileSetLength(userdata: ?*anyopaque, file: File, length: u64) File.SetLengthError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
@@ -3039,6 +3284,7 @@ fn fileSetOwner(
     owner: ?File.Uid,
     group: ?File.Gid,
 ) File.SetOwnerError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
@@ -3057,6 +3303,7 @@ fn fileSetPermissions(
     file: File,
     permissions: File.Permissions,
 ) File.SetPermissionsError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
@@ -3081,6 +3328,7 @@ fn fileSetTimestamps(
     file: File,
     options: File.SetTimestampsOptions,
 ) File.SetTimestampsError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
@@ -3097,6 +3345,7 @@ fn fileSetTimestamps(
 }
 
 fn fileLock(userdata: ?*anyopaque, file: File, lock: File.Lock) File.LockError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
@@ -3107,6 +3356,7 @@ fn fileLock(userdata: ?*anyopaque, file: File, lock: File.Lock) File.LockError!v
 }
 
 fn fileTryLock(userdata: ?*anyopaque, file: File, lock: File.Lock) File.LockError!bool {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
@@ -3121,6 +3371,7 @@ fn fileTryLock(userdata: ?*anyopaque, file: File, lock: File.Lock) File.LockErro
 }
 
 fn fileUnlock(userdata: ?*anyopaque, file: File) void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = .initBlocked(ev);
     defer sync.deinit(ev);
@@ -3134,6 +3385,7 @@ fn fileUnlock(userdata: ?*anyopaque, file: File) void {
 }
 
 fn fileDowngradeLock(userdata: ?*anyopaque, file: File) File.DowngradeLockError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
@@ -3146,6 +3398,7 @@ fn fileDowngradeLock(userdata: ?*anyopaque, file: File) File.DowngradeLockError!
 }
 
 fn fileRealPath(userdata: ?*anyopaque, file: File, out_buffer: []u8) File.RealPathError!usize {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
@@ -3159,6 +3412,7 @@ fn fileHardLink(
     new_sub_path: []const u8,
     options: File.HardLinkOptions,
 ) File.HardLinkError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     var new_path_buffer: [PATH_MAX]u8 = undefined;
@@ -3181,6 +3435,7 @@ fn fileMemoryMapCreate(
     file: File,
     options: File.MemoryMap.CreateOptions,
 ) File.MemoryMap.CreateError!File.MemoryMap {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     const prot: linux.PROT = .{
@@ -3226,6 +3481,7 @@ fn fileMemoryMapCreate(
 }
 
 fn fileMemoryMapDestroy(userdata: ?*anyopaque, mm: *File.MemoryMap) void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = ev;
     const memory = mm.memory;
@@ -3243,6 +3499,7 @@ fn fileMemoryMapSetLength(
     mm: *File.MemoryMap,
     new_len: usize,
 ) File.MemoryMap.SetLengthError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     const page_size = std.heap.pageSize();
@@ -3275,12 +3532,14 @@ fn fileMemoryMapSetLength(
 }
 
 fn fileMemoryMapRead(userdata: ?*anyopaque, mm: *File.MemoryMap) File.ReadPositionalError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = ev;
     _ = mm;
 }
 
 fn fileMemoryMapWrite(userdata: ?*anyopaque, mm: *File.MemoryMap) File.WritePositionalError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = ev;
     _ = mm;
@@ -3290,11 +3549,13 @@ fn processExecutableOpen(
     userdata: ?*anyopaque,
     flags: Dir.OpenFileOptions,
 ) process.OpenExecutableError!File {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     return dirOpenFile(ev, .{ .handle = linux.AT.FDCWD }, "/proc/self/exe", flags);
 }
 
 fn processExecutablePath(userdata: ?*anyopaque, out_buffer: []u8) process.ExecutablePathError!usize {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     return dirReadLink(ev, .cwd(), "/proc/self/exe", out_buffer) catch |err| switch (err) {
         error.UnsupportedReparsePointType => unreachable, // Windows-only
@@ -3305,6 +3566,7 @@ fn processExecutablePath(userdata: ?*anyopaque, out_buffer: []u8) process.Execut
 }
 
 fn lockStderr(userdata: ?*anyopaque, terminal_mode: ?Io.Terminal.Mode) Io.Cancelable!Io.LockedStderr {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     const ev_io = ev.io();
     ev.stderr_mutex.lockUncancelable(ev_io);
@@ -3316,6 +3578,7 @@ fn tryLockStderr(
     userdata: ?*anyopaque,
     terminal_mode: ?Io.Terminal.Mode,
 ) Io.Cancelable!?Io.LockedStderr {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     const ev_io = ev.io();
     if (!ev.stderr_mutex.tryLock()) return null;
@@ -3350,6 +3613,7 @@ fn initLockedStderr(ev: *Evented, terminal_mode: ?Io.Terminal.Mode) Io.Cancelabl
 }
 
 fn unlockStderr(userdata: ?*anyopaque) void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     if (ev.stderr_writer.err == null) ev.stderr_writer.interface.flush() catch {};
     if (ev.stderr_writer.err) |err| {
@@ -3365,6 +3629,7 @@ fn unlockStderr(userdata: ?*anyopaque) void {
 }
 
 fn processCurrentPath(userdata: ?*anyopaque, buffer: []u8) process.CurrentPathError!usize {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var sync: CancelRegion.Sync = try .init(ev);
     defer sync.deinit(ev);
@@ -3383,6 +3648,7 @@ fn processCurrentPath(userdata: ?*anyopaque, buffer: []u8) process.CurrentPathEr
 }
 
 fn processSetCurrentDir(userdata: ?*anyopaque, dir: Dir) process.SetCurrentDirError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     if (dir.handle == linux.AT.FDCWD) return;
     var sync: CancelRegion.Sync = try .init(ev);
@@ -3391,6 +3657,7 @@ fn processSetCurrentDir(userdata: ?*anyopaque, dir: Dir) process.SetCurrentDirEr
 }
 
 fn processSetCurrentPath(userdata: ?*anyopaque, dir_path: []const u8) process.SetCurrentPathError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var path_buffer: [PATH_MAX]u8 = undefined;
     const dir_path_posix = try pathToPosix(dir_path, &path_buffer);
@@ -3400,6 +3667,7 @@ fn processSetCurrentPath(userdata: ?*anyopaque, dir_path: []const u8) process.Se
 }
 
 fn processReplace(userdata: ?*anyopaque, options: process.ReplaceOptions) process.ReplaceError {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     try ev.scanEnviron(); // for PATH
@@ -3432,6 +3700,7 @@ fn processReplacePath(
     dir: Dir,
     options: process.ReplaceOptions,
 ) process.ReplaceError {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     try ev.scanEnviron(); // for the child environment
@@ -3495,6 +3764,7 @@ fn execvAt(
 }
 
 fn processSpawn(userdata: ?*anyopaque, options: process.SpawnOptions) process.SpawnError!process.Child {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     const spawned = try ev.spawn(null, options);
     var cancel_region: CancelRegion = .initBlocked();
@@ -3533,6 +3803,7 @@ fn processSpawnPath(
     dir: Dir,
     options: process.SpawnOptions,
 ) process.SpawnError!process.Child {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     const spawned = try ev.spawn(dir, options);
     var cancel_region: CancelRegion = .initBlocked();
@@ -3959,6 +4230,7 @@ pub fn execvPath(
 }
 
 fn childWait(userdata: ?*anyopaque, child: *process.Child) process.Child.WaitError!process.Child.Term {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
@@ -4028,6 +4300,7 @@ fn childWait(userdata: ?*anyopaque, child: *process.Child) process.Child.WaitErr
 }
 
 fn childKill(userdata: ?*anyopaque, child: *process.Child) void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .sync = .initBlocked(ev) };
@@ -4093,6 +4366,7 @@ fn childCleanup(ev: *Evented, child: *process.Child) void {
 }
 
 fn progressParentFile(userdata: ?*anyopaque) std.Progress.ParentFileError!File {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     const cancel_protection = Scheduler.swapCancelProtection(ev, .blocked);
     defer assert(Scheduler.swapCancelProtection(ev, cancel_protection) == .blocked);
@@ -4112,6 +4386,7 @@ fn scanEnviron(ev: *Evented) Io.Cancelable!void {
 }
 
 fn clockResolution(userdata: ?*anyopaque, clock: Io.Clock) Io.Clock.ResolutionError!Io.Duration {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = ev;
     const clock_id = clockToPosix(clock);
@@ -4124,6 +4399,7 @@ fn clockResolution(userdata: ?*anyopaque, clock: Io.Clock) Io.Clock.ResolutionEr
 }
 
 fn now(userdata: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = ev;
     var tp: linux.timespec = undefined;
@@ -4134,6 +4410,7 @@ fn now(userdata: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
 }
 
 fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
 
     const timespec: linux.kernel_timespec, const clock: Io.Clock, const timeout_flags: u32 = timespec: switch (timeout) {
@@ -4199,6 +4476,7 @@ fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
 }
 
 fn random(userdata: ?*anyopaque, buffer: []u8) void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var thread: *Thread = .current();
     if (!thread.csprng.isInitialized()) {
@@ -4230,6 +4508,7 @@ fn random(userdata: ?*anyopaque, buffer: []u8) void {
 }
 
 fn randomSecure(userdata: ?*anyopaque, buffer: []u8) Io.RandomSecureError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     if (buffer.len == 0) return;
     var cancel_region: CancelRegion = .init();
@@ -4245,6 +4524,7 @@ fn netListenIp(
     address: *const net.IpAddress,
     options: net.IpAddress.ListenOptions,
 ) net.IpAddress.ListenError!net.Socket {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
     defer maybe_sync.deinit(ev);
@@ -4292,6 +4572,7 @@ fn netAccept(
     listen_handle: net.Socket.Handle,
     options: net.Server.AcceptOptions,
 ) net.Server.AcceptError!net.Socket {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = options; // AcceptOptions is void on POSIX
     var cancel_region: CancelRegion = .init();
@@ -4347,6 +4628,7 @@ fn netBindIp(
     address: *const net.IpAddress,
     options: net.IpAddress.BindOptions,
 ) net.IpAddress.BindError!net.Socket {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     const family = posixAddressFamily(address);
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
@@ -4366,6 +4648,7 @@ fn netConnectIp(
     address: *const net.IpAddress,
     options: net.IpAddress.ConnectOptions,
 ) net.IpAddress.ConnectError!net.Socket {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
     defer maybe_sync.deinit(ev);
@@ -4477,6 +4760,7 @@ fn netListenUnix(
     address: *const net.UnixAddress,
     options: net.UnixAddress.ListenOptions,
 ) net.UnixAddress.ListenError!net.Socket.Handle {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
     defer maybe_sync.deinit(ev);
@@ -4551,6 +4835,7 @@ fn netConnectUnix(
     userdata: ?*anyopaque,
     address: *const net.UnixAddress,
 ) net.UnixAddress.ConnectError!net.Socket.Handle {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
     defer maybe_sync.deinit(ev);
@@ -4621,6 +4906,7 @@ fn netSocketCreatePair(
     userdata: ?*anyopaque,
     options: net.Socket.CreatePairOptions,
 ) net.Socket.CreatePairError![2]net.Socket {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     const family: linux.sa_family_t = switch (options.family) {
         .ip4 => linux.AF.INET,
@@ -5334,6 +5620,7 @@ fn netWriteFile(
     file_reader: *File.Reader,
     limit: Io.Limit,
 ) net.Stream.Writer.WriteFileError!usize {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var cancel_region: CancelRegion = .init();
     defer cancel_region.deinit();
@@ -5502,6 +5789,7 @@ fn spliceErrno(err: linux.E) net.Stream.Writer.WriteFileError {
 }
 
 fn netClose(userdata: ?*anyopaque, sockets: []const net.Socket) void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     for (sockets) |sock| ev.close(sock.handle);
 }
@@ -5511,6 +5799,7 @@ fn netShutdown(
     handle: net.Socket.Handle,
     how: net.ShutdownHow,
 ) net.ShutdownError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var cancel_region: CancelRegion = .init();
     defer cancel_region.deinit();
@@ -5552,6 +5841,7 @@ fn netInterfaceNameResolve(
     userdata: ?*anyopaque,
     name: *const net.Interface.Name,
 ) net.Interface.Name.ResolveError!net.Interface {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
     defer maybe_sync.deinit(ev);
@@ -5583,6 +5873,7 @@ fn netInterfaceName(
     userdata: ?*anyopaque,
     interface: net.Interface,
 ) net.Interface.NameError!net.Interface.Name {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
     defer maybe_sync.deinit(ev);
@@ -5639,6 +5930,7 @@ fn netLookup(
     resolved: *Io.Queue(net.HostName.LookupResult),
     options: net.HostName.LookupOptions,
 ) net.HostName.LookupError!void {
+    charge(userdata);
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     defer resolved.close(ev.io());
     netLookupFallible(ev, host_name, resolved, options) catch |err| switch (err) {
@@ -6728,4 +7020,185 @@ test "Ring: one pinned owner at a time" {
     try testing.expectError(error.NotPinned, sticky.await(testing.io));
     var pinned = try ev.concurrentWith(.{ .affinity = .{ .pinned = 0 } }, Acquire.twice, .{ev});
     try pinned.await(testing.io);
+}
+
+/// Nanoseconds on the monotonic clock, read without making an `Io` call: a task in these tests
+/// has to keep its worker, and an `Io` call would charge the budget and switch it out.
+fn testNow() u64 {
+    var tp: linux.timespec = undefined;
+    assert(linux.errno(linux.clock_gettime(linux.CLOCK.MONOTONIC, &tp)) == .SUCCESS);
+    return @as(u64, @intCast(tp.sec)) * std.time.ns_per_s + @as(u64, @intCast(tp.nsec));
+}
+
+/// A task the tests below queue behind one that will not let its worker go. It makes an `Io`
+/// call that parks, so finishing it needs a worker of its own.
+fn testQueuedTask(done: *std.atomic.Value(u32)) void {
+    std.testing.io.sleep(.fromMicroseconds(200), .awake) catch {};
+    _ = done.fetchAdd(1, .monotonic);
+}
+
+/// Runs `hostile` as a task pinned to worker 1, with the `queued` tasks it makes of its own, and
+/// checks what the watchdog does about it: the tasks behind it finish while it still holds the
+/// worker, the stuck counter moves, and the report names the task and the function it runs.
+fn testWatchdog(
+    ev: *Evented,
+    comptime hostile: anytype,
+    extra: anytype,
+    queued: usize,
+    limit_ns: u64,
+    comptime expected_name: []const u8,
+) !void {
+    const testing = std.testing;
+    if (workerLimit(ev) < 2) return error.SkipZigTest; // a worker to stick, and one to run elsewhere
+
+    var done: std.atomic.Value(u32) = .init(0);
+    var started: std.atomic.Value(bool) = .init(false);
+    var group: Io.Group = .init;
+    const args = .{ testing.io, &group, &started, &done, queued } ++ extra;
+    var future = try ev.concurrentWith(.{ .affinity = .{ .pinned = 1 } }, hostile, args);
+    defer future.cancel(testing.io);
+    defer group.cancel(testing.io);
+
+    const before = ev.stats().stuck_episodes;
+    while (!started.load(.acquire)) try testing.io.sleep(.fromMicroseconds(50), .awake);
+    const start = testNow();
+    while (done.load(.acquire) != queued) {
+        try testing.expect(testNow() - start < limit_ns);
+        try testing.io.sleep(.fromMicroseconds(200), .awake);
+    }
+    try testing.expect(testNow() - start < limit_ns);
+    const snapshot = ev.stats();
+    try testing.expect(snapshot.stuck_episodes > before);
+    const stuck = snapshot.last_stuck orelse return error.TestUnexpectedResult;
+    // The same task and name are what the watchdog names in its log line.
+    try testing.expectEqualStrings(expected_name, stuck.name);
+    try testing.expect(stuck.ms >= stuck_after_ms);
+    try testing.expect(stuck.id != 0);
+    try testing.expectEqual(@as(u32, 1), stuck.worker);
+    future.await(testing.io);
+    try group.await(testing.io);
+}
+
+/// `Scheduler.stuck_after`, in milliseconds.
+const stuck_after_ms = 100;
+
+test "watchdog: a spinning task costs one worker, and nothing else waits" {
+    const testing = std.testing;
+    const ev = fromIo(testing.io) orelse return error.SkipZigTest;
+    const S = struct {
+        /// Spins for 500 ms without making an `Io` call: the worker has nothing to switch to, and
+        /// the tasks this one queued behind itself wait for another worker to take them.
+        fn spin(inner_io: Io, group: *Io.Group, started: *std.atomic.Value(bool), done: *std.atomic.Value(u32), queued: usize, spin_ns: u64) void {
+            for (0..queued) |_| group.async(inner_io, testQueuedTask, .{done});
+            started.store(true, .release);
+            const until = testNow() + spin_ns;
+            var x: u64 = 0;
+            while (testNow() < until) {
+                inline for (0..8) |i| x +%= i;
+                std.mem.doNotOptimizeAway(x);
+            }
+        }
+    };
+    try testWatchdog(ev, S.spin, .{500 * std.time.ns_per_ms}, 32, 150 * std.time.ns_per_ms, "spin");
+}
+
+test "watchdog: a blocking syscall is reported like a spin" {
+    const testing = std.testing;
+    const ev = fromIo(testing.io) orelse return error.SkipZigTest;
+    const S = struct {
+        /// A raw nanosleep in a task that forgot `io.blocking`: the kernel holds the worker, and
+        /// nothing of Threadz's runs on it until it returns.
+        fn sleepRaw(inner_io: Io, group: *Io.Group, started: *std.atomic.Value(bool), done: *std.atomic.Value(u32), queued: usize, sleep_ns: u64) void {
+            _ = inner_io;
+            for (0..queued) |_| group.async(testing.io, testQueuedTask, .{done});
+            started.store(true, .release);
+            const ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(sleep_ns) };
+            _ = linux.nanosleep(&ts, null);
+        }
+    };
+    try testWatchdog(ev, S.sleepRaw, .{300 * std.time.ns_per_ms}, 4, 150 * std.time.ns_per_ms, "sleepRaw");
+}
+
+test "io.blocking: 16 blocking calls run at once, holding no worker" {
+    const testing = std.testing;
+    const ev = fromIo(testing.io) orelse return error.SkipZigTest;
+    const S = struct {
+        /// A raw 200 ms nanosleep, the kind of call `io.blocking` is for.
+        fn sleepRaw(ms: u64) void {
+            const ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(ms * std.time.ns_per_ms) };
+            _ = linux.nanosleep(&ts, null);
+        }
+
+        fn blockingCall(done: *std.atomic.Value(u32)) void {
+            testing.io.blocking(sleepRaw, .{@as(u64, 200)});
+            _ = done.fetchAdd(1, .monotonic);
+        }
+
+        /// The progress of another task, to show that the workers run tasks while the calls
+        /// block.
+        fn progress(stop: *std.atomic.Value(bool), steps: *std.atomic.Value(u32)) void {
+            while (!stop.load(.acquire)) {
+                testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+                _ = steps.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+
+    var done: std.atomic.Value(u32) = .init(0);
+    var group: Io.Group = .init;
+    const calls = 16;
+    for (0..calls) |_| group.async(testing.io, S.blockingCall, .{&done});
+    var stop: std.atomic.Value(bool) = .init(false);
+    var steps: std.atomic.Value(u32) = .init(0);
+    var progress_future = try ev.concurrentWith(.{}, S.progress, .{ &stop, &steps });
+    defer {
+        stop.store(true, .release);
+        progress_future.cancel(testing.io);
+    }
+
+    const start = testNow();
+    while (done.load(.acquire) != calls) {
+        try testing.expect(testNow() - start < 4 * calls * 200 * std.time.ns_per_ms);
+        try testing.io.sleep(.fromMicroseconds(200), .awake);
+    }
+    const elapsed = testNow() - start;
+    // `calls` calls of 200 ms each, in a fraction of the time they would take one after another.
+    try testing.expect(elapsed < 1000 * std.time.ns_per_ms);
+    // And a task made progress throughout: no worker was held by a blocking call.
+    try testing.expect(steps.load(.monotonic) >= 20);
+    stop.store(true, .release);
+    progress_future.await(testing.io);
+    try group.await(testing.io);
+}
+
+test "budget: a task that loops on Io without parking yields to its worker's queue" {
+    const testing = std.testing;
+    const ev = fromIo(testing.io) orelse return error.SkipZigTest;
+    if (workerLimit(ev) < 2) return error.SkipZigTest;
+    const S = struct {
+        /// 10,000 `Io` operations that complete without parking. Every `Scheduler.budget` of
+        /// them the task is switched out, so the other task on this worker runs first.
+        fn loop(word: *std.atomic.Value(u32), finished: *std.atomic.Value(bool)) void {
+            for (0..10_000) |_| testing.io.futexWake(u32, &word.raw, 1);
+            finished.store(true, .release);
+        }
+
+        /// The other task on the worker: it runs only while the looper is switched out.
+        fn other(inner_io: Io, finished: *std.atomic.Value(bool), before_finish: *std.atomic.Value(bool)) void {
+            _ = inner_io;
+            before_finish.store(!finished.load(.acquire), .release);
+        }
+    };
+    var word: std.atomic.Value(u32) = .init(0);
+    var finished: std.atomic.Value(bool) = .init(false);
+    var before_finish: std.atomic.Value(bool) = .init(false);
+    const options: SpawnOptions = .{ .affinity = .{ .pinned = 1 } };
+    var looper = try ev.concurrentWith(options, S.loop, .{ &word, &finished });
+    var other = try ev.concurrentWith(options, S.other, .{ testing.io, &finished, &before_finish });
+    looper.await(testing.io);
+    other.await(testing.io);
+    try testing.expect(finished.load(.acquire));
+    // The other task ran while the looper had not finished: it was switched out on the way.
+    try testing.expect(before_finish.load(.acquire));
+    try testing.expect(ev.stats().stuck_episodes == 0); // the budget, not the watchdog, yielded it
 }
