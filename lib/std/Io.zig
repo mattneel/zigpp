@@ -31,7 +31,10 @@ pub const fiber = @import("Io/fiber.zig");
 /// Tasks on their own stacks, parked at every Io call and scheduled across a pool of OS
 /// workers: io_uring on Linux, kqueue on the BSDs, libdispatch on Darwin.
 pub const Threadz = if (fiber.supported) switch (builtin.os.tag) {
-    .linux => Uring,
+    // The io_uring core keeps a socket handle and a length in one word of an operation's
+    // storage, and a pointer in each completion's user data: it needs 64-bit pointers, so
+    // x32 and ILP32 targets have no Threadz yet.
+    .linux => if (@sizeOf(usize) == 8) Uring else void,
     .dragonfly, .freebsd, .netbsd, .openbsd => Kqueue,
     .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => Dispatch,
     else => void,
