@@ -139,8 +139,10 @@ pub const failing: Reader = .{
     .end = 0,
 };
 
-/// This is generally safe to `@constCast` because it has an empty buffer, so
-/// there is not really a way to accidentally attempt mutation of these fields.
+/// A reader at the end of its stream. It is a constant, which may be in read-only memory, so it
+/// must not be handed to code that consumes a reader: `discard`, `discardRemaining` and
+/// `tossBuffered`, among others, store to the reader they are given even when there is nothing
+/// to consume, and fault on this one there.
 pub const ending_instance: Reader = .fixed(&.{});
 pub const ending: *Reader = @constCast(&ending_instance);
 

@@ -1334,3 +1334,50 @@ test "a request on a pooled connection the server closed is sent again" {
     try expectEqual(.ok, response.status);
     try expectEqual(4, global.connections.load(.monotonic));
 }
+
+test "the body reader of a message without a body can be discarded" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    // A HEAD request has no body, and neither does the response to it: the server discards the
+    // one and the client the other, each through the reader the connection hands out for it.
+    const test_server = try createTestServer(io, struct {
+        fn run(ts: *TestServer) anyerror!void {
+            const net_server = &ts.net_server;
+            var recv_buffer: [500]u8 = undefined;
+            var send_buffer: [500]u8 = undefined;
+            var body_buffer: [64]u8 = undefined;
+
+            while (!ts.shutting_down) {
+                var stream = try net_server.accept(io);
+                defer stream.close(io);
+                if (ts.shutting_down) break;
+
+                var connection_br = stream.reader(io, &recv_buffer);
+                var connection_bw = stream.writer(io, &send_buffer);
+                var server = http.Server.init(&connection_br.interface, &connection_bw.interface);
+                var request = try server.receiveHead();
+                try expectEqual(0, try request.readerExpectNone(&body_buffer).discardRemaining());
+                try request.respond("hello", .{ .keep_alive = false });
+            }
+        }
+    });
+    defer test_server.destroy();
+
+    var client: http.Client = .{
+        .allocator = gpa,
+        .io = io,
+    };
+    defer client.deinit();
+
+    var loc_buf: [100]u8 = undefined;
+    const location = try std.mem.print(&loc_buf, "http://127.0.0.1:{d}/", .{test_server.port()});
+    const uri = try std.Uri.parse(location);
+
+    var req = try client.request(.HEAD, uri, .{});
+    defer req.deinit();
+    try req.sendBodiless();
+    var response = try req.receiveHead(&.{});
+    try expectEqual(.ok, response.head.status);
+    try expectEqual(0, try response.reader(&.{}).discardRemaining());
+}

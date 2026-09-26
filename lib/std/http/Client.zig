@@ -736,7 +736,9 @@ pub const Response = struct {
     pub fn reader(response: *Response, transfer_buffer: []u8) *Reader {
         response.head.invalidateStrings();
         const req = response.request;
-        if (!req.method.responseHasBody()) return .ending;
+        // The connection's own reader with an empty body, not `Reader.ending`: the caller may
+        // call anything on the reader it gets, and `discardRemaining`, for one, stores to it.
+        if (!req.method.responseHasBody()) return req.reader.bodyReader(transfer_buffer, .none, 0);
         const head = &response.head;
         return req.reader.bodyReader(transfer_buffer, head.transfer_encoding, head.content_length);
     }
