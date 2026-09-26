@@ -2120,6 +2120,15 @@ pub fn Scheduler(comptime Backend: type) type {
                 .sticky => {},
                 .free => unreachable,
             }
+            if (w.stranded.load(.monotonic)) {
+                // The watchdog has found this worker stuck and it will not take anything soon, so
+                // its slot is the wrong place for this task: a slot has one taker, and that taker
+                // is the worker itself, which is what `takeStuckSlot` exists to work around. The
+                // shared queue is where every worker looks, and one of them is woken for this.
+                s.shared.push(&.{task});
+                s.notify(null);
+                return;
+            }
             switch (when) {
                 .next => {
                     task.status = .{ .queue_next = null };
