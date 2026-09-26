@@ -592,7 +592,9 @@ pub const Request = struct {
         assert(request.server.reader.state == .received_head);
         assert(request.head.expect == null);
         request.head.invalidateStrings();
-        if (!request.head.method.requestHasBody()) return .ending;
+        // The connection's own reader with an empty body, not `Reader.ending`: the caller may
+        // call anything on the reader it gets, and `discardRemaining`, for one, stores to it.
+        if (!request.head.method.requestHasBody()) return request.server.reader.bodyReader(buffer, .none, 0);
         return request.server.reader.bodyReader(buffer, request.head.transfer_encoding, request.head.content_length);
     }
 
