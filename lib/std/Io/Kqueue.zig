@@ -514,12 +514,15 @@ fn park(
     const w = Scheduler.Worker.current();
     const task = w.currentTask();
     const completion = task.resultPointer(Completion);
-    if (completion.state.load(.monotonic) != .idle) {
-        std.debug.panic("park: task {d} state {t} outcome {t} count {d}", .{
+    const raw_state: u8 = @as(*const u8, @ptrCast(&completion.state)).*;
+    if (raw_state != 0) {
+        std.debug.panic("park: task {d} {s} raw_state {d} raw_outcome {d} count {d} fd {d}", .{
             task.id,
-            completion.state.load(.monotonic),
-            completion.outcome,
+            task.name,
+            raw_state,
+            @as(*const u8, @ptrCast(&completion.outcome)).*,
             completion.count,
+            completion.kq_fd,
         });
     }
     assert(registrations.len <= max_registrations);
