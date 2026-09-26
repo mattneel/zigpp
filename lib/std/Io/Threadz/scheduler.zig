@@ -252,8 +252,12 @@ pub fn Scheduler(comptime Backend: type) type {
             name: [:0]const u8,
             tsan_fiber: tsan.Fiber,
 
-            /// The number the next task is given. See `Task.id`.
+            /// The first id of the next block of ids a worker takes. See `Task.id` and
+            /// `Worker.nextTaskId`.
             var next_id: std.atomic.Value(u64) = .init(1);
+
+            /// How many ids a worker takes from `next_id` at once.
+            const id_block = 1024;
 
             pub const finished: ?*Task = @ptrFromInt(@alignOf(Task));
 
@@ -400,6 +404,10 @@ pub fn Scheduler(comptime Backend: type) type {
             /// Tasks spawned here minus tasks that ended here. The sum over all workers counts
             /// the tasks alive.
             live: isize,
+            /// The ids this worker gives the tasks it spawns: `ids.next` up to `ids.end`, a block
+            /// taken from `Task.next_id`, so that a spawn takes an id without a locked instruction
+            /// on a word every worker writes.
+            ids: struct { next: u64 = 0, end: u64 = 0 } = .{},
             /// The task this worker is running, or `null` while it runs no task. This worker
             /// publishes it with a release store at every switch; the watchdog reads it to tell
             /// a running task from a worker that is looking for work, and to name a stuck task.
@@ -428,6 +436,18 @@ pub fn Scheduler(comptime Backend: type) type {
             pub fn currentTask(w: *Worker) *Task {
                 assert(w.current_context != &w.idle_context);
                 return @alignCast(@fieldParentPtr("context", w.current_context));
+            }
+
+            /// An id for a task this worker spawns, from the block in `ids`, taking the next
+            /// block from `Task.next_id` when this one runs out. Ids are unique in the program.
+            fn nextTaskId(w: *Worker) u64 {
+                if (w.ids.next == w.ids.end) {
+                    @branchHint(.unlikely);
+                    w.ids.next = Task.next_id.fetchAdd(Task.id_block, .monotonic);
+                    w.ids.end = w.ids.next + Task.id_block;
+                }
+                defer w.ids.next += 1;
+                return w.ids.next;
             }
 
             fn tsanFiberOf(w: *Worker, context: *Io.fiber.Context) *anyopaque {
@@ -1922,7 +1942,7 @@ pub fn Scheduler(comptime Backend: type) type {
                 .ops = 0,
                 .context_bytes = context_bytes,
                 .mapping = mapping,
-                .id = Task.next_id.fetchAdd(1, .monotonic),
+                .id = w.nextTaskId(),
                 // The name has to be a comptime string: a task reports it long after the memory
                 // of whoever spawned it is gone. `Io.spawnedName` is one.
                 .name = if (name.len == 0) "unnamed" else name,
