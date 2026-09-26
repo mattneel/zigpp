@@ -207,6 +207,14 @@ before and runs its other tasks while the loop is parked. `fromIo` finds the
 Threadz behind an `Io`, and `workerLimit` says how many workers a program may
 pin tasks to.
 
+[zix](https://github.com/mattneel/zix)'s io_uring servers for HTTP/1 and
+WebSocket, HTTP/2, gRPC and HTTP/3 run on Threadz this way, each loop a task
+pinned to its own worker, and keep their multishot receives, buffer rings and
+batched submissions. On a 32-thread laptop, across the 45 load tiers of their
+HttpArena profiles, they served at a geometric mean of 1.01 times the
+throughput of the same servers on threads of their own, with single tiers from
+0.83 to 1.23 times, inside the laptop's own run-to-run spread.
+
 `zig build test-threadz` runs the `Io` tests on Threadz, and the test runner's
 `--io=threadz` runs any test on it. The design, and the steps still to come (a
 cooperative budget, a pool for blocking calls, a watchdog, and the kqueue and
