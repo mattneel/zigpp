@@ -2442,8 +2442,16 @@ pub fn Scheduler(comptime Backend: type) type {
                 .nothing => {},
                 .group => {
                     // The awaiter received a cancelation request while awaiting a group, so
-                    // propagate the cancelation to the group.
-                    if (task.status.awaiting_group.cancel(s, null)) {
+                    // propagate the cancelation to the group - unless the awaiter is
+                    // cancel-protected. A protected awaiter cannot be woken by its own
+                    // cancelation: the request is kept for its next cancelation point after it
+                    // unblocks, and the group's bookkeeping, which readies the awaiter itself, is
+                    // not entered from here (it would read `task.status` after the group had
+                    // already reset it). The awaiter is parked, so its protection is stable to
+                    // read from this thread.
+                    if (task.cancel_protection.check() == .unblocked and
+                        task.status.awaiting_group.cancel(s, null))
+                    {
                         task.status = .{ .queue_next = null };
                         s.ready(.current(), task);
                     }
@@ -2706,7 +2714,14 @@ pub fn Scheduler(comptime Backend: type) type {
                         .tasks = .pack(new_head),
                     }, .monotonic);
                 } else if (@atomicLoad(Awaiter, group.awaiterPtr(), .monotonic).awaiter.unpack()) |awaiter| {
-                    if (!awaiter.cancel_status.changeAwaiting(.group, .nothing) or list.cancel_requested) {
+                    // A cancel-protected awaiter cannot be readied by its own request - there is no
+                    // propagation from `requestCancel` for it, and nothing else readies it - so it
+                    // is readied here, keeping the request for its next cancelation point after it
+                    // unblocks.
+                    const requested = awaiter.cancel_status.changeAwaiting(.group, .nothing);
+                    if (!requested or list.cancel_requested or
+                        awaiter.cancel_protection.check() == .blocked)
+                    {
                         @atomicStore(List, list_ptr, .{
                             .cancel_requested = false,
                             .awaiter_delayed = false,
