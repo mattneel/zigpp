@@ -139,6 +139,45 @@ pub const VTable = struct {
         start: *const fn (context: *const anyopaque, result: *anyopaque) void,
     ) void,
 
+    /// The arena of the task this thread runs, or of the thread itself when it runs none. The
+    /// memory comes from the implementation's own allocator and is released when the task
+    /// returns; a task that makes no call to `arena` pays nothing for it. See `Io.arena`.
+    ///
+    /// Thread-safe.
+    taskArena: *const fn (
+        /// Corresponds to `Io.userdata`.
+        userdata: ?*anyopaque,
+    ) Allocator,
+
+    /// Returns a pointer to the value bound to `key` in the calling task's scope chain, or `null`
+    /// when it is bound nowhere. See `Scoped`.
+    ///
+    /// Thread-safe.
+    scopedGet: *const fn (
+        /// Corresponds to `Io.userdata`.
+        userdata: ?*anyopaque,
+        /// The key to look for. See `Scoped`.
+        key: *const anyopaque,
+    ) ?*const anyopaque,
+    /// Binds `frame` for the calling task and for the tasks it spawns from then on, each of which
+    /// inherits a copy. `frame` must stay valid until the matching `scopedPop`, and the caller
+    /// owns it. See `Scoped`.
+    ///
+    /// Thread-safe.
+    scopedPush: *const fn (
+        /// Corresponds to `Io.userdata`.
+        userdata: ?*anyopaque,
+        frame: *Scopes,
+    ) void,
+    /// Unbinds `frame`, which must be the innermost binding of the calling task. See `Scoped`.
+    ///
+    /// Thread-safe.
+    scopedPop: *const fn (
+        /// Corresponds to `Io.userdata`.
+        userdata: ?*anyopaque,
+        frame: *Scopes,
+    ) void,
+
     /// Thread-safe.
     groupAsync: *const fn (
         /// Corresponds to `Io.userdata`.
@@ -1502,6 +1541,161 @@ pub const Group = struct {
     }
 };
 
+/// Returns an allocator whose memory is owned by the calling task: it is all released when the
+/// task returns, whether the task freed it or not. This is the BEAM's per-process heap without a
+/// collector, and where data a task builds up and throws away belongs, such as one request's
+/// parsed headers.
+///
+/// The arena is created at the first call to this function, or at the first task spawned inside a
+/// `Scoped.run`, and it comes from the implementation's own allocator. A task that never uses one
+/// pays only the fields that say so.
+///
+/// A value that outlives the task must not point into the arena: the arena is gone by the time the
+/// task's future is complete. Move what crosses a task boundary with an `owned` transfer, into
+/// another allocator, or by copying it.
+///
+/// `Io.Threaded` and `Io.Threadz` own an arena per task, and per thread for a thread that runs no
+/// task, such as the one that called `init`. `io.blocking` runs on a thread of its own in
+/// `Io.Threadz`, an `Io.Threaded` instance of its own: the call sees neither the calling task's
+/// arena nor its scopes.
+pub fn arena(io: Io) Allocator {
+    return io.vtable.taskArena(io.userdata);
+}
+
+/// One binding of a task-local value: what `Scoped(T).run` links into the calling task's chain,
+/// and what a task copies for itself when it is spawned inside a `run`. See `Scoped`.
+pub const Scopes = struct {
+    /// The key this value is bound to: the address of one `var` per `T`, so two keys are never
+    /// equal. See `Scoped(T).Key.tag`.
+    key: *const anyopaque,
+    /// The value, `value_len` bytes aligned to `value_alignment`.
+    value: *const anyopaque,
+    value_len: usize,
+    value_alignment: Alignment,
+    /// The binding this one shadows, or `null` when it is the outermost.
+    next: ?*const Scopes,
+
+    /// The bytes `copyInto` needs for the whole chain starting at `head`.
+    pub fn copySize(head: ?*const Scopes) usize {
+        var total: usize = 0;
+        var it = head;
+        while (it) |frame| : (it = frame.next) {
+            const value_align = @max(frame.value_alignment.toByteUnits(), 1);
+            total += @sizeOf(Scopes) + @alignOf(Scopes) +
+                std.mem.alignForward(usize, frame.value_len, value_align) + value_align;
+        }
+        return total;
+    }
+
+    /// Copies the chain starting at `head` into `dest`, which must have room for `copySize(head)`
+    /// bytes, and returns the innermost binding of the copy. The values are copied along with the
+    /// frames, so the copy outlives the bindings it came from.
+    pub fn copyInto(head: ?*const Scopes, dest: [*]u8) ?*Scopes {
+        var write = @intFromPtr(dest);
+        var new_head: ?*Scopes = null;
+        var outer_next: ?*?*const Scopes = null;
+        var it = head;
+        while (it) |frame| : (it = frame.next) {
+            const frame_addr = std.mem.alignForward(usize, write, @alignOf(Scopes));
+            const value_align = @max(frame.value_alignment.toByteUnits(), 1);
+            const value_addr = std.mem.alignForward(usize, frame_addr + @sizeOf(Scopes), value_align);
+            const value: *anyopaque = @ptrFromInt(value_addr);
+            @memcpy(
+                @as([*]u8, @ptrCast(value))[0..frame.value_len],
+                @as([*]const u8, @ptrCast(frame.value))[0..frame.value_len],
+            );
+            const new_frame: *Scopes = @ptrFromInt(frame_addr);
+            new_frame.* = .{
+                .key = frame.key,
+                .value = value,
+                .value_len = frame.value_len,
+                .value_alignment = frame.value_alignment,
+                .next = null,
+            };
+            if (outer_next) |slot| slot.* = new_frame else new_head = new_frame;
+            outer_next = &new_frame.next;
+            write = value_addr + frame.value_len;
+        }
+        return new_head;
+    }
+};
+
+/// Calls `function` with `io` first and then the values of `args`: what `Scoped(T).Key.run` and
+/// `Supervisor`'s children say the functions they take look like.
+fn callWithIo(io: Io, function: anytype, args: anytype) @typeInfo(@TypeOf(function)).@"fn".return_type.? {
+    const Function = @TypeOf(function);
+    const param_types = @typeInfo(Function).@"fn".param_types;
+    comptime assert(@typeInfo(@TypeOf(args)).@"struct".field_types.len + 1 == param_types.len);
+    comptime assert(param_types[0].? == Io);
+    const Full = std.meta.ArgsTuple(Function);
+    var full: Full = undefined;
+    full[0] = io;
+    inline for (args, 0..) |arg, i| full[i + 1] = arg;
+    return @call(.auto, function, full);
+}
+
+/// A task-local value, bound for the duration of a call and inherited, copied, by every task
+/// spawned inside it: the BEAM's process dictionary with a lexical lifetime, which is what the
+/// compiler's per-thread ids, a request id, or a logger's context want. `threadlocal` cannot serve
+/// them under `Io.Threadz`, where a task moves between worker threads and the fiber switch does not
+/// move the thread's TLS base: on Threadz `threadlocal` is worker-local, not task-local.
+///
+/// The key is one `Scoped(T)`, declared at container level as a `const`:
+///
+///     const Request = struct {
+///         const current = std.Io.Scoped(*@This());
+///
+///         fn handle(io: std.Io, args: Args) void {
+///             if (current.get(io)) |request| request.name();
+///         }
+///     };
+///
+/// and the value is bound around a call with `run`:
+///
+///     try Request.current.run(io, &request, Request.handle, .{args});
+///
+/// Every task spawned inside that call - a child of a child as much as a child - sees the same
+/// value through `get`, by its own copy, until it returns; a task spawned outside the call sees
+/// `null`. A binding cannot change in place: a nested call to `run` binds a new value for the
+/// inner call, and the outer one is back when it returns.
+///
+/// `T` is the value type, so one `T` is one key: two subsystems that both want a `u32` use two
+/// distinct wrapper types. `T` is a value copied in and out - a pointer, a handle, an id - never a
+/// buffer the task must own; `Io.arena` is for that.
+pub fn Scoped(comptime T: type) type {
+    return struct {
+        /// Nothing reads this; its address is the key, and it is one per `Scoped(T)`.
+        var tag_storage: u8 = 0;
+
+        /// The value bound to this key for the calling task, or `null` when none is bound.
+        pub fn get(io: Io) ?T {
+            const ptr = io.vtable.scopedGet(io.userdata, &tag_storage) orelse return null;
+            return @as(*const T, @ptrCast(@alignCast(ptr))).*;
+        }
+
+        /// Binds `value` to this key for the call to `function`, which is called with `io` and
+        /// `args`, and for every task spawned inside that call; the binding is gone when the call
+        /// returns. A task inherits its own copy, so it keeps the value however long it runs.
+        pub fn run(
+            io: Io,
+            value: T,
+            function: anytype,
+            args: anytype,
+        ) @typeInfo(@TypeOf(function)).@"fn".return_type.? {
+            var frame: Scopes = .{
+                .key = &tag_storage,
+                .value = &value,
+                .value_len = @sizeOf(T),
+                .value_alignment = .of(T),
+                .next = null,
+            };
+            io.vtable.scopedPush(io.userdata, &frame);
+            defer io.vtable.scopedPop(io.userdata, &frame);
+            return callWithIo(io, function, args);
+        }
+    };
+}
+
 /// Asserts that `error.Canceled` was returned from a prior cancelation point, and "re-arms" the
 /// cancelation request, so that `error.Canceled` will be returned again from the next cancelation
 /// point.
@@ -1670,6 +1864,7 @@ pub fn Select(comptime U: type) type {
         pub fn await(s: *S) Cancelable!U {
             return s.queue.getOne(s.io) catch |err| switch (err) {
                 error.Canceled => |e| return e,
+                error.Resync => unreachable, // the select's queue blocks: `init`, not `initWithOptions`
                 error.Closed => unreachable,
             };
         }
@@ -1685,6 +1880,7 @@ pub fn Select(comptime U: type) type {
         pub fn awaitMany(s: *S, buffer: []U, min: usize) Cancelable!usize {
             return s.queue.get(s.io, buffer, min) catch |err| switch (err) {
                 error.Canceled => |e| return e,
+                error.Resync => unreachable, // the select's queue blocks: `init`, not `initWithOptions`
                 error.Closed => unreachable,
             };
         }
@@ -1712,6 +1908,7 @@ pub fn Select(comptime U: type) type {
             s.queue.close(io);
             return s.queue.getOneUncancelable(io) catch |err| switch (err) {
                 error.Closed => return null,
+                error.Resync => unreachable, // the select's queue blocks: `init`, not `initWithOptions`
             };
         }
 
@@ -1736,6 +1933,308 @@ pub fn Select(comptime U: type) type {
         }
     };
 }
+
+/// A group of tasks with a restart policy: the BEAM's supervisor, in `Io`'s vocabulary. Children
+/// are added with `add` before the first `run`, each with the function it runs and its arguments,
+/// which are copied. `run` starts them all and waits: a child that returns an error is restarted
+/// according to the supervisor's strategy, and a child that returns normally is not restarted,
+/// which is OTP's `transient` and the only restart type of this cut. Panics stay fatal.
+///
+/// A supervisor that restarts more often than `Options.intensity` within `Options.period` gives up
+/// the way OTP does: it cancels every child, awaits them, and `run` returns
+/// `error.RestartIntensityExceeded` with the last child error kept in `lastChildError`. `run`
+/// returns when every child has returned normally.
+/// ```
+/// var supervisor: std.Io.Supervisor = .init(io, gpa, .{ .strategy = .one_for_all });
+/// defer supervisor.deinit();
+/// try supervisor.add(acceptLoop, .{listener});
+/// try supervisor.add(expire, .{cache});
+/// try supervisor.run();
+/// ```
+pub const Supervisor = struct {
+    pub const Strategy = enum {
+        /// Restart the child that failed, and leave the others alone.
+        one_for_one,
+        /// Cancel and restart every child when one fails.
+        one_for_all,
+        /// Cancel and restart the child that failed and the children added after it.
+        rest_for_one,
+    };
+
+    pub const Options = struct {
+        strategy: Strategy = .one_for_one,
+        /// The most restarts allowed within `period`, OTP's intensity.
+        intensity: u32 = 3,
+        /// The window `intensity` counts over.
+        period: Duration = .fromSeconds(5),
+    };
+
+    /// `run`'s errors: an intensity exceeded, the concurrency or the memory a child needs, and the
+    /// cancelation of `run` itself, which cancels the children.
+    pub const RunError = error{RestartIntensityExceeded} || ConcurrentError || Allocator.Error || Cancelable;
+
+    io: Io,
+    gpa: Allocator,
+    options: Options,
+    children: std.ArrayListUnmanaged(Child) = .empty,
+    /// The restarts of the current run, oldest first: the window `exceeded` measures.
+    restarts: std.ArrayListUnmanaged(Timestamp) = .empty,
+    /// The last child error, which `lastChildError` reports.
+    last_error: ?anyerror = null,
+    /// The exit reports of the current run's tasks: one per child, plus room for `drain`.
+    exits: Queue(Exit) = undefined,
+    exits_buffer: []Exit = &.{},
+    running: bool = false,
+
+    /// How a child task ended.
+    const Exit = struct {
+        /// Which child this is about.
+        index: u32,
+        /// Which of that child's tasks: an event from a task an earlier round canceled is stale.
+        epoch: u32,
+        /// The error the child returned, or null when it returned normally.
+        result: ?anyerror,
+    };
+
+    /// The context of one child's task: which child, and which of that child's tasks, so that the
+    /// exit report of a canceled one is not taken for the current one's.
+    const Live = struct {
+        supervisor: *Supervisor,
+        index: u32,
+        epoch: u32,
+    };
+
+    const Child = struct {
+        /// The child's body: `function` with its `io` and its copied arguments.
+        start: *const fn (io: Io, args: *const anyopaque) anyerror!void,
+        args: *anyopaque,
+        /// Frees what `args` points at, which `add` allocated.
+        destroyArgs: *const fn (gpa: Allocator, args: *anyopaque) void,
+        /// The name of the function the child runs, for the task name and a log line.
+        name: [:0]const u8,
+        /// The child's task of this round, one group per child, so that a strategy can cancel and
+        /// await exactly the children it says.
+        group: Group = .init,
+        /// Whether that task is running: started and not yet finished.
+        running: bool = false,
+        /// Up at every spawn: an event that carries an older one is stale.
+        epoch: u32 = 0,
+    };
+
+    pub fn init(io: Io, gpa: Allocator, options: Options) Supervisor {
+        return .{ .io = io, .gpa = gpa, .options = options };
+    }
+
+    /// Frees the children's arguments. Call it once `run` is over, and not before.
+    pub fn deinit(s: *Supervisor) void {
+        assert(!s.running);
+        for (s.children.items) |*child| child.destroyArgs(s.gpa, child.args);
+        s.children.deinit(s.gpa);
+        s.restarts.deinit(s.gpa);
+        s.* = undefined;
+    }
+
+    /// Adds a child: `function` is called with `io` first and then `args`, which are copied, and
+    /// it returns an error to ask for a restart.
+    pub fn add(s: *Supervisor, function: anytype, args: anytype) Allocator.Error!void {
+        assert(!s.running);
+        const Args = @TypeOf(args);
+        const TypeErased = struct {
+            fn start(io: Io, type_erased_args: *const anyopaque) anyerror!void {
+                const call_args: *const Args = @ptrCast(@alignCast(type_erased_args));
+                return callWithIo(io, function, call_args.*);
+            }
+            fn destroy(gpa: Allocator, type_erased_args: *anyopaque) void {
+                gpa.destroy(@as(*Args, @ptrCast(@alignCast(type_erased_args))));
+            }
+        };
+        const copied: *Args = try s.gpa.create(Args);
+        errdefer s.gpa.destroy(copied);
+        copied.* = args;
+        try s.children.append(s.gpa, .{
+            .start = TypeErased.start,
+            .args = copied,
+            .destroyArgs = TypeErased.destroy,
+            .name = spawnedName(function),
+        });
+    }
+
+    /// The error the last child that failed returned, or null when none has. An exceeded intensity
+    /// reports it along with `error.RestartIntensityExceeded`.
+    pub fn lastChildError(s: *const Supervisor) ?anyerror {
+        return s.last_error;
+    }
+
+    /// Starts every child and supervises them until they have all returned normally, restarting
+    /// them as the strategy says. Returns `error.RestartIntensityExceeded` once they have been
+    /// restarted more often than `Options.intensity` within `Options.period`, and
+    /// `error.Canceled` when the calling task is canceled, which cancels the children in turn.
+    pub fn run(s: *Supervisor) RunError!void {
+        assert(!s.running);
+        assert(s.exits_buffer.len == 0); // one run at a time, and the buffer is freed after
+        const count: u32 = @intCast(s.children.items.len);
+        if (count == 0) return;
+
+        s.running = true;
+        defer s.running = false;
+        s.last_error = null;
+
+        s.exits_buffer = try s.gpa.alloc(Exit, count + 1);
+        defer {
+            s.gpa.free(s.exits_buffer);
+            s.exits_buffer = &.{};
+        }
+        s.exits = .init(s.exits_buffer);
+        try s.restarts.ensureTotalCapacity(s.gpa, s.options.intensity);
+        defer s.restarts.clearRetainingCapacity();
+
+        for (0..count) |index| try s.spawn(@intCast(index));
+
+        while (true) {
+            const exit = s.exits.getOne(s.io) catch |err| switch (err) {
+                error.Canceled => {
+                    // Canceled from outside: nothing of the supervisor stays running.
+                    s.stopAll();
+                    return error.Canceled;
+                },
+                // The monitor never closes the queue, and the queue blocks.
+                error.Closed, error.Resync => unreachable,
+            };
+            const child = &s.children.items[exit.index];
+            if (exit.epoch != child.epoch) continue; // an earlier task of this child, canceled
+            child.running = false;
+            // Its task has finished; the group is empty now, which is what releases the group.
+            s.awaitGroup(child);
+            if (exit.result == null) {
+                if (!s.anyRunning()) return;
+                continue;
+            }
+            s.last_error = exit.result;
+            if (s.exceeded()) {
+                s.stopAll();
+                return error.RestartIntensityExceeded;
+            }
+            switch (s.options.strategy) {
+                .one_for_one => try s.spawn(exit.index),
+                .one_for_all => {
+                    s.stopAll();
+                    s.drain();
+                    for (0..count) |index| try s.spawn(@intCast(index));
+                },
+                .rest_for_one => {
+                    s.stopFrom(exit.index + 1);
+                    s.drain();
+                    for (exit.index..count) |index| try s.spawn(@intCast(index));
+                },
+            }
+        }
+    }
+
+    /// Whether any child of the current round is running.
+    fn anyRunning(s: *const Supervisor) bool {
+        for (s.children.items) |child| if (child.running) return true;
+        return false;
+    }
+
+    /// Starts `index`'s child for a new round. Its group was awaited, so this makes a new one.
+    fn spawn(s: *Supervisor, index: u32) RunError!void {
+        const child = &s.children.items[index];
+        assert(!child.running);
+        assert(child.group.token.raw == null);
+        child.group = .init;
+        child.epoch +%= 1;
+        var live: Live = .{ .supervisor = s, .index = index, .epoch = child.epoch };
+        try s.io.vtable.groupConcurrent(
+            s.io.userdata,
+            &child.group,
+            @ptrCast(&live),
+            .of(Live),
+            child.name,
+            childEntry,
+        );
+        child.running = true;
+    }
+
+    /// One child task: runs the child's function and reports how it ended to the monitor, which is
+    /// waiting for the report. The report is uncancelable: a canceled task reports too.
+    fn childEntry(context: *const anyopaque) void {
+        const live: *const Live = @ptrCast(@alignCast(context));
+        const s = live.supervisor;
+        const child = &s.children.items[live.index];
+        const result: anyerror!void = child.start(s.io, child.args);
+        s.exits.putOneUncancelable(s.io, .{
+            .index = live.index,
+            .epoch = live.epoch,
+            .result = if (result) |_| null else |err| err,
+        }) catch |err| switch (err) {
+            // The monitor never closes the queue.
+            error.Closed => unreachable,
+        };
+    }
+
+    /// Cancels and awaits every child that is running: what a strategy that takes the siblings of
+    /// a failed child does before it restarts them, and what an exceeded intensity does before it
+    /// gives up.
+    fn stopAll(s: *Supervisor) void {
+        for (s.children.items) |*child| s.stopChild(child);
+    }
+
+    /// The same, for the children added at `index` and after: what `rest_for_one` does.
+    fn stopFrom(s: *Supervisor, index: u32) void {
+        for (s.children.items[index..]) |*child| s.stopChild(child);
+    }
+
+    fn stopChild(s: *Supervisor, child: *Child) void {
+        if (!child.running) return;
+        // Its report from now on is stale: the epoch tells the monitor. The canceled child
+        // reports error.Canceled, which would otherwise read as a failure and restart it.
+        child.epoch +%= 1;
+        child.group.cancel(s.io);
+        s.awaitGroup(child);
+        child.running = false;
+    }
+
+    /// Waits for a child's task to finish and its group to be empty, which is also what releases
+    /// the group's own resources. Cancelation is blocked for the wait: the caller may itself have
+    /// been canceled, and the children still have to be collected.
+    fn awaitGroup(s: *Supervisor, child: *Child) void {
+        const old = s.io.swapCancelProtection(.blocked);
+        defer _ = s.io.swapCancelProtection(old);
+        child.group.await(s.io) catch |err| switch (err) {
+            error.Canceled => unreachable, // cancelation is blocked for the wait
+        };
+    }
+
+    /// Throws away the reports of the tasks a strategy just canceled. Their epochs are past, so
+    /// the monitor would ignore them; this keeps the queue from filling up with them.
+    fn drain(s: *Supervisor) void {
+        const old = s.io.swapCancelProtection(.blocked);
+        defer _ = s.io.swapCancelProtection(old);
+        while (true) {
+            const n = s.exits.get(s.io, s.exits_buffer, 0) catch |err| switch (err) {
+                // Cancelation is blocked, the monitor never closes the queue, and it blocks.
+                error.Canceled, error.Closed, error.Resync => unreachable,
+            };
+            if (n == 0) return;
+        }
+    }
+
+    /// Records that a child is about to be restarted, and says whether that is one restart too
+    /// many: more than `intensity` within `period`, which is where OTP stops the supervisor.
+    fn exceeded(s: *Supervisor) bool {
+        const intensity = s.options.intensity;
+        if (intensity == 0) return true;
+        const now = Clock.awake.now(s.io);
+        if (s.restarts.items.len == intensity) {
+            const oldest = s.restarts.items[0];
+            const elapsed = now.toNanoseconds() - oldest.toNanoseconds();
+            if (elapsed <= s.options.period.toNanoseconds()) return true;
+            _ = s.restarts.orderedRemove(0);
+        }
+        s.restarts.appendAssumeCapacity(now);
+        return false;
+    }
+};
 
 /// Atomically checks if the value at `ptr` equals `expected`, and if so, blocks until either:
 ///
@@ -2142,9 +2641,44 @@ pub const Event = enum(u32) {
 
 pub const QueueClosedError = error{Closed};
 
+/// Returned once by a `get` on a `drop_and_resync` queue whose puts have dropped elements since
+/// the last report: the consumer's view of the queue is stale, and what it gets next is not the
+/// continuation of what it got last. See `QueueOverflow`.
+pub const QueueResyncError = error{Resync};
+
+/// What a queue does when a `put` finds it full: the receiver's mailbox policy. See
+/// `Queue.Options`.
+pub const QueueOverflow = union(enum) {
+    /// The put waits until there is room, which is what a queue does by default.
+    block,
+    /// The put drops the elements that do not fit and counts them as dropped; it never waits.
+    /// The put returns how many it accepted, and 0 for a full queue, so a caller that must not
+    /// lose elements uses `.block` or checks the returned count. A getter never waits for
+    /// dropped elements.
+    ///
+    /// A mailbox policy like the BEAM's: a bounded pubsub or telemetry queue wants the freshest
+    /// sample, so it is the newest element that is dropped - that is, the one the put brought -
+    /// and not the oldest one queued.
+    drop,
+    /// Like `drop`, and the next `get` returns `error.Resync` once, before it returns anything
+    /// else, so that a consumer can throw away what it has and start over. Later gets resume with
+    /// what is queued. A consumer that must notice a drop rather than act on stale data, such as
+    /// one reassembling a stream, wants this; one that only sends the newest samples on wants
+    /// `.drop`.
+    drop_and_resync,
+};
+
 pub const TypeErasedQueue = struct {
     mutex: Mutex,
     closed: bool,
+
+    /// What a `put` does when the queue is full. See `QueueOverflow`, and `Options`.
+    overflow: QueueOverflow,
+    /// The elements that `drop` and `drop_and_resync` puts dropped. See `droppedElements`.
+    dropped: u64,
+    /// Set by a dropped put of a `drop_and_resync` queue, and cleared by the `get` that returns
+    /// `error.Resync`.
+    resync: bool,
 
     /// Ring buffer. This data is logically *after* queued getters.
     buffer: []u8,
@@ -2168,10 +2702,23 @@ pub const TypeErasedQueue = struct {
         node: std.DoublyLinkedList.Node,
     };
 
+    /// See `QueueOverflow`.
+    pub const Options = struct {
+        overflow: QueueOverflow = .block,
+    };
+
     pub fn init(buffer: []u8) TypeErasedQueue {
+        return initWithOptions(buffer, .{});
+    }
+
+    /// `init`, with the queue's overflow policy. See `QueueOverflow`.
+    pub fn initWithOptions(buffer: []u8, options: Options) TypeErasedQueue {
         return .{
             .mutex = .init,
             .closed = false,
+            .overflow = options.overflow,
+            .dropped = 0,
+            .resync = false,
             .buffer = buffer,
             .start = 0,
             .len = 0,
@@ -2179,6 +2726,16 @@ pub const TypeErasedQueue = struct {
             .getters = .{},
         };
     }
+
+    /// The bytes puts dropped over the queue's lifetime: a `drop` or `drop_and_resync` queue that
+    /// never met a full buffer reads 0. `Queue(Elem).droppedElements` counts elements. See
+    /// `QueueOverflow`.
+    ///
+    /// Threadsafe.
+    pub fn droppedBytes(q: *const TypeErasedQueue) u64 {
+        return @atomicLoad(u64, &q.dropped, .monotonic);
+    }
+
 
     /// After this is called, the queue enters a "closed" state. A closed
     /// queue always returns `error.Closed` for put attempts even when
@@ -2274,6 +2831,14 @@ pub const TypeErasedQueue = struct {
             if (n == elements.len) return elements.len;
         }
 
+        // Nothing on a queue that drops waits: what did not fit, which can be all of it, is
+        // dropped and counted, and the put returns how much it took.
+        if (q.overflow != .block) {
+            _ = @atomicRmw(u64, &q.dropped, .Add, elements.len - n, .monotonic);
+            if (q.overflow == .drop_and_resync) q.resync = true;
+            return n;
+        }
+
         // Don't block if we hit the min.
         if (n >= min) return n;
 
@@ -2310,7 +2875,7 @@ pub const TypeErasedQueue = struct {
         return elements.len - pending.remaining.len;
     }
 
-    pub fn get(q: *TypeErasedQueue, io: Io, buffer: []u8, min: usize) (QueueClosedError || Cancelable)!usize {
+    pub fn get(q: *TypeErasedQueue, io: Io, buffer: []u8, min: usize) (QueueClosedError || QueueResyncError || Cancelable)!usize {
         assert(buffer.len >= min);
         if (buffer.len == 0) return 0;
         try q.mutex.lock(io);
@@ -2321,14 +2886,14 @@ pub const TypeErasedQueue = struct {
     /// Same as `get`, except does not introduce a cancelation point.
     ///
     /// For a description of cancelation and cancelation points, see `Future.cancel`.
-    pub fn getUncancelable(q: *TypeErasedQueue, io: Io, buffer: []u8, min: usize) QueueClosedError!usize {
+    pub fn getUncancelable(q: *TypeErasedQueue, io: Io, buffer: []u8, min: usize) (QueueClosedError || QueueResyncError)!usize {
         assert(buffer.len >= min);
         if (buffer.len == 0) return 0;
         q.mutex.lockUncancelable(io);
         defer q.mutex.unlock(io);
         return q.getLocked(io, buffer, min, true) catch |err| switch (err) {
             error.Canceled => unreachable,
-            error.Closed => |e| return e,
+            error.Closed, error.Resync => |e| return e,
         };
     }
 
@@ -2338,10 +2903,17 @@ pub const TypeErasedQueue = struct {
         return if (slice.len > 0) slice else null;
     }
 
-    fn getLocked(q: *TypeErasedQueue, io: Io, buffer: []u8, min: usize, uncancelable: bool) (QueueClosedError || Cancelable)!usize {
+    fn getLocked(q: *TypeErasedQueue, io: Io, buffer: []u8, min: usize, uncancelable: bool) (QueueClosedError || QueueResyncError || Cancelable)!usize {
         // The ring buffer gets first priority, then data should come from any
         // queued putters, then finally the ring buffer should be filled with
         // data from putters so they can be resumed.
+
+        // Nothing is taken from a queue whose puts dropped elements since the last get: the
+        // consumer hears so once, and resumes with what is queued afterwards.
+        if (q.resync) {
+            q.resync = false;
+            return error.Resync;
+        }
 
         // The number of elements we received immediately, before possibly blocking.
         var n: usize = 0;
@@ -2451,13 +3023,31 @@ pub const TypeErasedQueue = struct {
 
 /// Many producer, many consumer, thread-safe, runtime configurable buffer size.
 /// When buffer is empty, consumers suspend and are resumed by producers.
-/// When buffer is full, producers suspend and are resumed by consumers.
+/// When buffer is full, producers suspend and are resumed by consumers, unless the queue's
+/// `QueueOverflow` policy drops instead: see `Options` and `initWithOptions`.
 pub fn Queue(Elem: type) type {
     return struct {
         type_erased: TypeErasedQueue,
 
+        /// See `TypeErasedQueue.Options`.
+        pub const Options = TypeErasedQueue.Options;
+
         pub fn init(buffer: []Elem) @This() {
             return .{ .type_erased = .init(@ptrCast(buffer)) };
+        }
+
+        /// `init`, with the queue's overflow policy: what a `put` does when the queue is full.
+        /// See `QueueOverflow`.
+        pub fn initWithOptions(buffer: []Elem, options: Options) @This() {
+            return .{ .type_erased = .initWithOptions(@ptrCast(buffer), options) };
+        }
+
+        /// The elements puts dropped over the queue's lifetime: a `drop` or `drop_and_resync`
+        /// queue that never met a full buffer reads 0. See `QueueOverflow`.
+        ///
+        /// Threadsafe.
+        pub fn droppedElements(q: *const @This()) u64 {
+            return @divExact(q.type_erased.droppedBytes(), @sizeOf(Elem));
         }
 
         /// After this is called, the queue enters a "closed" state. A closed
@@ -2486,11 +3076,12 @@ pub fn Queue(Elem: type) type {
         /// return a number lower than `min`, in which case future calls are
         /// guaranteed to return `error.Canceled` or `error.Closed`.
         ///
-        /// A return value of 0 is only possible if `min` is 0, in which case
-        /// the call is guaranteed to queue as many of `elements` as is possible
-        /// *without* blocking.
+        /// A return value of 0 is only possible if `min` is 0, or if the queue's overflow policy
+        /// drops and the put found the queue full - or, for `min` 0, as many elements as fit.
         ///
         /// Asserts that `elements.len >= min`.
+        ///
+        /// See `QueueOverflow` for what a queue that drops does instead of blocking.
         pub fn put(q: *@This(), io: Io, elements: []const Elem, min: usize) (QueueClosedError || Cancelable)!usize {
             return @divExact(try q.type_erased.put(io, @ptrCast(elements), min * @sizeOf(Elem)), @sizeOf(Elem));
         }
@@ -2547,20 +3138,23 @@ pub fn Queue(Elem: type) type {
         /// the call is guaranteed to fill as much of `buffer` as is possible
         /// *without* blocking.
         ///
+        /// A `drop_and_resync` queue returns `error.Resync` once after its puts dropped elements,
+        /// before it returns anything: see `QueueOverflow`. The elements it dropped are gone.
+        ///
         /// Asserts that `buffer.len >= min`.
-        pub fn get(q: *@This(), io: Io, buffer: []Elem, min: usize) (QueueClosedError || Cancelable)!usize {
+        pub fn get(q: *@This(), io: Io, buffer: []Elem, min: usize) (QueueClosedError || QueueResyncError || Cancelable)!usize {
             return @divExact(try q.type_erased.get(io, @ptrCast(buffer), min * @sizeOf(Elem)), @sizeOf(Elem));
         }
 
         /// Same as `get`, except does not introduce a cancelation point.
         ///
         /// For a description of cancelation and cancelation points, see `Future.cancel`.
-        pub fn getUncancelable(q: *@This(), io: Io, buffer: []Elem, min: usize) QueueClosedError!usize {
+        pub fn getUncancelable(q: *@This(), io: Io, buffer: []Elem, min: usize) (QueueClosedError || QueueResyncError)!usize {
             return @divExact(try q.type_erased.getUncancelable(io, @ptrCast(buffer), min * @sizeOf(Elem)), @sizeOf(Elem));
         }
 
         /// Receives one element from the beginning of the queue, blocking if the queue is empty.
-        pub fn getOne(q: *@This(), io: Io) (QueueClosedError || Cancelable)!Elem {
+        pub fn getOne(q: *@This(), io: Io) (QueueClosedError || QueueResyncError || Cancelable)!Elem {
             var buf: [1]Elem = undefined;
             assert(try q.get(io, &buf, 1) == 1);
             return buf[0];
@@ -2569,7 +3163,7 @@ pub fn Queue(Elem: type) type {
         /// Same as `getOne`, except does not introduce a cancelation point.
         ///
         /// For a description of cancelation and cancelation points, see `Future.cancel`.
-        pub fn getOneUncancelable(q: *@This(), io: Io) QueueClosedError!Elem {
+        pub fn getOneUncancelable(q: *@This(), io: Io) (QueueClosedError || QueueResyncError)!Elem {
             var buf: [1]Elem = undefined;
             assert(try q.getUncancelable(io, &buf, 1) == 1);
             return buf[0];
@@ -2840,6 +3434,11 @@ pub const failing: std.Io = .{
         .cancel = unreachableCancel,
         .blocking = failingBlocking,
 
+        .taskArena = failingTaskArena,
+        .scopedGet = noScopedGet,
+        .scopedPush = noScopedPush,
+        .scopedPop = noScopedPop,
+
         .groupAsync = noGroupAsync,
         .groupConcurrent = failingGroupConcurrent,
         .groupAwait = unreachableGroupAwait,
@@ -3003,6 +3602,33 @@ pub fn failingBlocking(
     _ = context_alignment;
     _ = name;
     start(context.ptr, result.ptr);
+}
+
+/// There is no task to own an arena, so the arena of this system is the one that always fails:
+/// see `Allocator.failing`.
+pub fn failingTaskArena(userdata: ?*anyopaque) Allocator {
+    _ = userdata;
+    return .failing;
+}
+
+/// Nothing of this system is scoped: no task can be spawned to inherit a binding. See
+/// `Io.Scoped`.
+pub fn noScopedGet(userdata: ?*anyopaque, key: *const anyopaque) ?*const anyopaque {
+    _ = userdata;
+    _ = key;
+    return null;
+}
+
+/// See `noScopedGet`.
+pub fn noScopedPush(userdata: ?*anyopaque, frame: *Scopes) void {
+    _ = userdata;
+    _ = frame;
+}
+
+/// See `noScopedGet`.
+pub fn noScopedPop(userdata: ?*anyopaque, frame: *Scopes) void {
+    _ = userdata;
+    _ = frame;
 }
 
 pub fn unreachableAwait(

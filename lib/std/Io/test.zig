@@ -1106,3 +1106,312 @@ test "Condition.waitUncancelable" {
 
     try future.await(io);
 }
+
+test "arena" {
+    const io = testing.io;
+
+    const Context = struct {
+        /// What the task's arena handed out: gone once the task has returned.
+        small: []u8 = &.{},
+        big: []u8 = &.{},
+        /// The task's arena, to tell it from the main task's.
+        arena: ?*anyopaque = null,
+        /// Whether the task always got the same arena, and fresh memory out of it.
+        stable: bool = false,
+
+        fn task(ctx: *@This(), main: *anyopaque) void {
+            const arena = Io.arena(io);
+            ctx.arena = arena.ptr;
+            ctx.small = arena.alloc(u8, 64) catch unreachable;
+            @memset(ctx.small, 0xAA);
+            ctx.big = arena.alloc(u8, 512) catch unreachable;
+            @memset(ctx.big, 0xBB);
+            const again = Io.arena(io);
+            const small_again = arena.alloc(u8, 64) catch unreachable;
+            ctx.stable = again.ptr == arena.ptr and main != arena.ptr and small_again.ptr != ctx.small.ptr;
+        }
+    };
+    var ctx: Context = .{};
+
+    // The main task has an arena as well, and it is the same one every time it asks.
+    const main_arena = Io.arena(io);
+    try expectEqual(main_arena.ptr, Io.arena(io).ptr);
+
+    var future = io.concurrent(Context.task, .{ &ctx, main_arena.ptr }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return error.SkipZigTest,
+    };
+    future.await(io);
+
+    try expect(ctx.stable);
+
+    // The task's memory went with the task: `std.testing.allocator` overwrites what it frees with
+    // 0x55, so a buffer the arena had not released would still hold the pattern the task wrote.
+    // (Both buffers are small enough for the testing allocator to keep their pages mapped once
+    // they are freed.)
+    for (ctx.small) |byte| try expect(byte != 0xAA);
+    for (ctx.big) |byte| try expect(byte != 0xBB);
+}
+
+test "Scoped" {
+    const io = testing.io;
+
+    const Request = struct {
+        /// A key at container level, which is how `Io.Scoped` is declared.
+        const current = Io.Scoped(u32);
+    };
+
+    const Global = struct {
+        fn grandchild(io_: Io, seen: *[3]?u32) void {
+            seen[1] = Request.current.get(io_);
+        }
+
+        fn child(io_: Io, seen: *[3]?u32) void {
+            seen[0] = Request.current.get(io_);
+            // A grandchild, spawned inside the child, inherits the binding too.
+            var group: Io.Group = .init;
+            group.async(io_, grandchild, .{ io_, seen });
+            group.await(io_) catch {};
+        }
+
+        fn outsider(io_: Io, seen: *[3]?u32) void {
+            seen[2] = Request.current.get(io_);
+        }
+
+        fn spawnChild(io_: Io, seen: *[3]?u32) void {
+            var future = io_.concurrent(child, .{ io_, seen }) catch unreachable;
+            future.await(io_);
+        }
+
+        fn inner(io_: Io, seen: *[3]?u32) void {
+            seen[2] = Request.current.get(io_);
+        }
+
+        fn outer(io_: Io, seen: *[3]?u32) void {
+            seen[0] = Request.current.get(io_);
+            // A nested binding is the one the inner call sees, and only the inner call.
+            Request.current.run(io_, 7, inner, .{seen});
+            seen[1] = Request.current.get(io_);
+        }
+    };
+
+    var seen: [3]?u32 = .{ null, null, null };
+
+    // A task spawned outside any binding sees nothing.
+    var outside = io.concurrent(Global.outsider, .{ io, &seen }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return error.SkipZigTest,
+    };
+    outside.await(io);
+    try expectEqual(null, seen[2]);
+
+    // A binding is seen by the task that made it, by a task spawned inside the call, and by that
+    // task's own child; and it is gone when the call returns.
+    try expectEqual(null, Request.current.get(io));
+    Request.current.run(io, 42, Global.spawnChild, .{&seen});
+    try expectEqual(42, seen[0].?);
+    try expectEqual(42, seen[1].?);
+    try expectEqual(null, Request.current.get(io));
+
+    // The nested binding binds a new value for the inner call, and the outer one is back after it.
+    seen = .{ null, null, null };
+    Request.current.run(io, 42, Global.outer, .{&seen});
+    try expectEqual(42, seen[0].?);
+    try expectEqual(42, seen[1].?);
+    try expectEqual(7, seen[2].?);
+}
+
+test "Supervisor restarts per strategy" {
+    const io = testing.io;
+
+    const Child = struct {
+        /// How many times each child has been started, and how many failures it has left.
+        starts: [3]u32 = .{ 0, 0, 0 },
+        failures_left: [3]u32 = .{ 0, 0, 0 },
+
+        fn run(io_: Io, ctx: *@This(), index: u32) anyerror!void {
+            _ = io_;
+            ctx.starts[index] += 1;
+            if (ctx.failures_left[index] > 0) {
+                ctx.failures_left[index] -= 1;
+                return error.ChildFailed;
+            }
+        }
+    };
+
+    const strategies = [_]Io.Supervisor.Strategy{ .one_for_one, .one_for_all, .rest_for_one };
+    for (strategies) |strategy| {
+        var ctx: Child = .{};
+        ctx.failures_left = .{ 0, 1, 0 };
+        var supervisor: Io.Supervisor = .init(io, testing.allocator, .{ .strategy = strategy });
+        defer supervisor.deinit();
+        try supervisor.add(Child.run, .{ &ctx, 0 });
+        try supervisor.add(Child.run, .{ &ctx, 1 });
+        try supervisor.add(Child.run, .{ &ctx, 2 });
+        supervisor.run() catch |err| switch (err) {
+            error.ConcurrencyUnavailable => return error.SkipZigTest,
+            else => |e| return e,
+        };
+        // The supervisor recovered, and the error it recovered from is still recorded.
+        try expectEqual(error.ChildFailed, supervisor.lastChildError().?);
+
+        switch (strategy) {
+            // Only the child that failed is started again.
+            .one_for_one => try testing.expectEqualSlices(u32, &.{ 1, 2, 1 }, &ctx.starts),
+            // Every child is canceled when one fails, and every child is started again.
+            .one_for_all => try testing.expectEqualSlices(u32, &.{ 2, 2, 2 }, &ctx.starts),
+            // The child that failed and the ones added after it are started again; the ones
+            // before it are left alone.
+            .rest_for_one => try testing.expectEqualSlices(u32, &.{ 1, 2, 2 }, &ctx.starts),
+        }
+    }
+}
+
+test "Supervisor intensity" {
+    const io = testing.io;
+
+    const Child = struct {
+        starts: u32 = 0,
+
+        fn run(io_: Io, ctx: *@This()) anyerror!void {
+            _ = io_;
+            ctx.starts += 1;
+            return error.ChildFailed;
+        }
+    };
+
+    var ctx: Child = .{};
+    var supervisor: Io.Supervisor = .init(io, testing.allocator, .{
+        .strategy = .one_for_one,
+        .intensity = 2,
+        .period = .fromSeconds(5),
+    });
+    defer supervisor.deinit();
+    try supervisor.add(Child.run, .{&ctx});
+
+    try expectError(error.RestartIntensityExceeded, supervisor.run());
+    // Two restarts were allowed; the failure after them exceeded the intensity.
+    try expectEqual(3, ctx.starts);
+    try expectEqual(error.ChildFailed, supervisor.lastChildError().?);
+}
+
+test "Supervisor canceled" {
+    const io = testing.io;
+
+    const Child = struct {
+        running: std.atomic.Value(u32) = .init(0),
+        both_started: Io.Event = .unset,
+        canceled: std.atomic.Value(u32) = .init(0),
+
+        fn run(io_: Io, ctx: *@This()) anyerror!void {
+            var buffer: [1]u8 = .{0};
+            var queue: Io.Queue(u8) = .init(&buffer);
+            if (ctx.running.fetchAdd(1, .monotonic) + 1 == 2) ctx.both_started.set(io_);
+            defer _ = ctx.running.fetchSub(1, .monotonic);
+            // Nothing ever puts into the queue: only cancelation wakes this.
+            _ = queue.getOne(io_) catch |err| switch (err) {
+                error.Canceled => {
+                    _ = ctx.canceled.fetchAdd(1, .monotonic);
+                    return error.Canceled;
+                },
+                error.Closed, error.Resync => unreachable,
+            };
+            unreachable;
+        }
+    };
+
+    const Session = struct {
+        supervisor: *Io.Supervisor,
+        result: Result = .running,
+
+        const Result = enum { running, canceled, failed };
+
+        fn monitor(session: *@This()) void {
+            session.supervisor.run() catch |err| switch (err) {
+                error.Canceled => session.result = .canceled,
+                else => session.result = .failed,
+            };
+        }
+    };
+
+    var ctx: Child = .{};
+    var supervisor: Io.Supervisor = .init(io, testing.allocator, .{});
+    defer supervisor.deinit();
+    try supervisor.add(Child.run, .{&ctx});
+    try supervisor.add(Child.run, .{&ctx});
+
+    var session: Session = .{ .supervisor = &supervisor };
+    var monitor = try io.concurrent(Session.monitor, .{&session});
+
+    // Both children are waiting; canceling the supervisor cancels them, through the monitor.
+    try ctx.both_started.wait(io);
+    _ = monitor.cancel(io);
+
+    try expectEqual(Session.Result.canceled, session.result);
+    try expectEqual(2, ctx.canceled.load(.monotonic));
+    try expectEqual(0, ctx.running.load(.monotonic));
+}
+
+test "Queue overflow policy" {
+    const io = testing.io;
+    var buffer: [4]u32 = undefined;
+    var got: [8]u32 = undefined;
+
+    // `.drop`: what does not fit is dropped and counted, and the put does not wait for a getter.
+    {
+        var queue: Io.Queue(u32) = .initWithOptions(&buffer, .{ .overflow = .drop });
+        const Producer = struct {
+            fn put(io_: Io, q: *Io.Queue(u32), put_count: *usize) void {
+                put_count.* = q.put(io_, &.{ 1, 2, 3, 4, 5, 6 }, 0) catch 0;
+            }
+        };
+        var put_count: usize = 0;
+        var future = io.concurrent(Producer.put, .{ io, &queue, &put_count }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => return error.SkipZigTest,
+        };
+        future.await(io);
+        try expectEqual(4, put_count);
+        try expectEqual(2, queue.droppedElements());
+        try expectEqual(4, try queue.get(io, &got, 4));
+        try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, got[0..4]);
+    }
+
+    // `.drop_and_resync`: same, and the next get reports that the consumer is out of date, once;
+    // gets resume with what is queued.
+    {
+        var queue: Io.Queue(u32) = .initWithOptions(&buffer, .{ .overflow = .drop_and_resync });
+        const Producer = struct {
+            fn put(io_: Io, q: *Io.Queue(u32), put_count: *usize) void {
+                put_count.* = q.put(io_, &.{ 1, 2, 3, 4, 5, 6 }, 0) catch 0;
+            }
+        };
+        var put_count: usize = 0;
+        var future = try io.concurrent(Producer.put, .{ io, &queue, &put_count });
+        future.await(io);
+        try expectEqual(4, put_count);
+        try expectEqual(2, queue.droppedElements());
+        try expectError(error.Resync, queue.getOne(io));
+        try expectEqual(4, try queue.get(io, &got, 4));
+        try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, got[0..4]);
+        // The report is given once.
+        try expectEqual(0, try queue.get(io, &got, 0));
+    }
+
+    // `.block`, the default: a put of a full queue waits for a getter instead of dropping.
+    {
+        var queue: Io.Queue(u32) = .init(&buffer);
+        const Producer = struct {
+            fn put(io_: Io, q: *Io.Queue(u32), done: *bool) void {
+                q.putOne(io_, 5) catch {};
+                done.* = true;
+            }
+        };
+        var done = false;
+        var future = try io.concurrent(Producer.put, .{ io, &queue, &done });
+        // The producer is waiting on the full queue; this get is what lets it finish.
+        try expectEqual(4, try queue.get(io, &got, 4));
+        future.await(io);
+        try expect(done);
+        try expectEqual(0, queue.droppedElements());
+        try expectEqual(1, try queue.get(io, &got, 1));
+        try expectEqual(5, got[0]);
+    }
+}

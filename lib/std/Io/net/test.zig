@@ -153,6 +153,7 @@ test "resolve DNS" {
             .canonical_name => found_canonical_name = true,
         } else |err| switch (err) {
             error.Closed => {},
+            error.Resync => unreachable, // the queue blocks: `init`, not `initWithOptions`
             error.Canceled => |e| return e,
         }
 
@@ -181,6 +182,7 @@ test "resolve DNS" {
             .canonical_name => {},
         } else |err| switch (err) {
             error.Closed => {},
+            error.Resync => unreachable, // the queue blocks: `init`, not `initWithOptions`
             error.Canceled => |e| return e,
         }
     }

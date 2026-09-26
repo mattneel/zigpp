@@ -96,6 +96,28 @@ const Thread = struct {
     };
 };
 
+/// An arena a fiber's `Io` calls allocate from: buffers from the instance's allocator, released in
+/// one step when the fiber returns. See `Io.arena`.
+const Arena = struct {
+    /// The arena itself, created at its first use.
+    allocator: std.heap.ArenaAllocator = undefined,
+    created: bool = false,
+
+    fn get(arena: *Arena, child: Allocator) Allocator {
+        if (!arena.created) {
+            arena.allocator = .init(child);
+            arena.created = true;
+        }
+        return arena.allocator.allocator();
+    }
+
+    fn free(arena: *Arena) void {
+        if (!arena.created) return;
+        arena.allocator.deinit();
+        arena.created = false;
+    }
+};
+
 const Fiber = struct {
     required_align: void align(4),
     evented: *Evented,
@@ -107,6 +129,12 @@ const Fiber = struct {
     awaiting_group: Group,
     cancel_status: CancelStatus,
     cancel_protection: CancelProtection,
+    /// The fiber's arena, created at its first use and freed when the fiber returns. See
+    /// `Io.arena`. The main fiber's is freed by `deinit`, since nothing else ends it.
+    arena: Arena = .{},
+    /// The scope bindings this fiber inherited from the one that spawned it, copied into its own
+    /// arena at spawn. See `Io.Scoped`.
+    scopes: ?*const Io.Scopes = null,
 
     var next_name: u64 = 0;
 
@@ -208,6 +236,19 @@ const Fiber = struct {
 
     fn create(ev: *Evented) error{OutOfMemory}!*Fiber {
         return @ptrCast(try ev.allocator().alignedAlloc(u8, .of(Fiber), allocation_size));
+    }
+
+    /// Copies the bindings of the fiber that is spawning this one into the new fiber's own arena,
+    /// which frees them when it returns. See `Io.Scoped`.
+    fn inheritScopes(fiber: *Fiber, parent: ?*const Io.Scopes) error{OutOfMemory}!void {
+        const bytes = Io.Scopes.copySize(parent);
+        if (bytes == 0) return;
+        const storage = try fiber.arena.get(fiber.evented.allocator()).alignedAlloc(
+            u8,
+            Alignment.of(Io.Scopes),
+            bytes,
+        );
+        fiber.scopes = Io.Scopes.copyInto(parent, storage.ptr);
     }
 
     fn destroy(fiber: *Fiber, ev: *Evented) void {
@@ -352,6 +393,11 @@ pub fn io(ev: *Evented) Io {
             .await = await,
             .cancel = cancel,
             .blocking = blocking,
+
+            .taskArena = taskArena,
+            .scopedGet = scopedGet,
+            .scopedPush = scopedPush,
+            .scopedPop = scopedPop,
 
             .groupAsync = groupAsync,
             .groupConcurrent = groupConcurrent,
@@ -574,6 +620,8 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
 pub fn deinit(ev: *Evented) void {
     assert(Thread.current().currentFiber() == &ev.main_fiber);
     ev.yield(.exit);
+    // The main fiber runs no more Io calls, so its arena goes the way every fiber's does.
+    Arena.free(&ev.main_fiber.arena);
     ev.csprng_mutex.deinit();
     if (ev.dev_null_file) |file| fileClose(ev, &.{file}) else |_| {}
     ev.stderr_mutex.deinit();
@@ -1025,6 +1073,9 @@ const AsyncClosure = struct {
         const fiber = closure.fiber;
         message.handle(ev);
         closure.start(closure.contextPointer(), fiber.resultBytes(closure.result_align));
+        // The fiber's arena goes with it, before its result is published: nothing that outlives
+        // the fiber may point into it. See `Io.arena`.
+        Arena.free(&fiber.arena);
         if (@atomicRmw(?*Fiber, &fiber.link.awaiter, .Xchg, Fiber.finished, .acq_rel)) |awaiter|
             ev.queue.async(awaiter, &Fiber.@"resume");
         ev.yield(.nothing);
@@ -1095,6 +1146,12 @@ fn concurrent(
         .fiber = fiber,
         .start = start,
         .result_align = result_alignment,
+    };
+    fiber.inheritScopes(Thread.current().currentFiber().scopes) catch |err| switch (err) {
+        error.OutOfMemory => {
+            Fiber.destroy(fiber, ev);
+            return error.ConcurrencyUnavailable;
+        },
     };
     @memcpy(closure.contextPointer(), context);
 
@@ -1439,6 +1496,12 @@ fn groupConcurrent(
         .fiber = fiber,
         .start = start,
     };
+    fiber.inheritScopes(Thread.current().currentFiber().scopes) catch |err| switch (err) {
+        error.OutOfMemory => {
+            Fiber.destroy(fiber, ev);
+            return error.ConcurrencyUnavailable;
+        },
+    };
     @memcpy(closure.contextPointer(), context);
     group.addFiber(ev, fiber);
     ev.queue.async(fiber, &Fiber.@"resume");
@@ -1460,6 +1523,42 @@ fn blocking(
     _ = context_alignment;
     _ = name;
     start(context.ptr, result.ptr);
+}
+
+/// `Io.arena`: the arena of the fiber this thread runs, which is freed when it returns. See
+/// `Io.arena`.
+fn taskArena(userdata: ?*anyopaque) Allocator {
+    const ev: *Evented = @ptrCast(@alignCast(userdata));
+    return Arena.get(&Thread.current().currentFiber().arena, ev.allocator());
+}
+
+/// `Io.Scoped`: the value bound to `key` for the fiber this thread runs, or `null`. See
+/// `Io.Scoped`.
+fn scopedGet(userdata: ?*anyopaque, key: *const anyopaque) ?*const anyopaque {
+    _ = userdata;
+    var frame = Thread.current().currentFiber().scopes;
+    while (frame) |f| : (frame = f.next) {
+        if (f.key == key) return f.value;
+    }
+    return null;
+}
+
+/// `Io.Scoped`: binds `frame` for the fiber this thread runs, and for what it spawns while it is
+/// bound, which inherits a copy. See `Io.Scoped`.
+fn scopedPush(userdata: ?*anyopaque, frame: *Io.Scopes) void {
+    _ = userdata;
+    const fiber = Thread.current().currentFiber();
+    frame.next = fiber.scopes;
+    fiber.scopes = frame;
+}
+
+/// `Io.Scoped`: unbinds `frame`, the innermost binding of the fiber this thread runs. See
+/// `Io.Scoped`.
+fn scopedPop(userdata: ?*anyopaque, frame: *Io.Scopes) void {
+    _ = userdata;
+    const fiber = Thread.current().currentFiber();
+    assert(fiber.scopes == frame);
+    fiber.scopes = frame.next;
 }
 
 fn groupAwait(

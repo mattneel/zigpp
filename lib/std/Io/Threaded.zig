@@ -30,6 +30,10 @@ const ws2_32 = windows.ws2_32;
 /// * memory-mapping when mmap or equivalent is not available
 allocator: Allocator,
 mutex: Io.Mutex = .init,
+/// The arenas of the threads that run no task and have used one: they belong to no task, so
+/// `deinit` frees them. See `Io.arena` and `taskArena`.
+arena_mutex: Io.Mutex = .init,
+own_arenas: ?*Arena = null,
 /// Tasks spawned by threads that are not workers of this pool, and the overflow of the workers'
 /// own queues.
 run_queue: RunQueue = .{},
@@ -457,6 +461,56 @@ const Runnable = struct {
     startFn: *const fn (*Runnable, *Thread, *Threaded) void,
 };
 
+/// An arena a thread's `Io` calls allocate from: the task's while it runs one, and the thread's
+/// own when it runs none. See `Io.arena` and `taskArena`.
+const Arena = struct {
+    /// The instance's list of the arenas of threads that run no task, which `deinit` frees. Null
+    /// for a task's arena, whose storage is where the task runs and which is freed when it returns.
+    next: ?*Arena = null,
+    /// The arena itself, created at its first use.
+    allocator: std.heap.ArenaAllocator = undefined,
+    created: bool = false,
+
+    /// The allocator of this arena, created here if this is its first use.
+    fn get(self: *Arena, child: Allocator) Allocator {
+        if (!self.created) {
+            self.allocator = .init(child);
+            self.created = true;
+        }
+        return self.allocator.allocator();
+    }
+
+    /// Releases everything the arena holds, if it holds anything. Idempotent.
+    fn free(self: *Arena) void {
+        if (!self.created) return;
+        self.allocator.deinit();
+        self.created = false;
+    }
+};
+
+/// The arena of the task this thread runs, or of this thread itself when it runs none: a task's
+/// is a local of the entry point that runs it, and a thread's own is heap storage the instance
+/// keeps until `deinit`. See `Io.arena`.
+threadlocal var current_arena: ?*Arena = null;
+/// The scope bindings of the task this thread runs, or of the thread itself when it runs none:
+/// what `Io.Scoped` pushes, pops and reads. The bindings a task inherited are copies the spawner
+/// made, in storage the task owns. See `Io.Scoped`.
+threadlocal var current_scopes: ?*const Io.Scopes = null;
+
+/// Runs a task on the calling thread, as `async` and `groupAsync` do when they cannot give it a
+/// unit of concurrency: the task gets an arena of its own for the call, and it sees the bindings
+/// the caller sees, which are still there because the call is synchronous. See `Io.arena`.
+fn eager(start: *const fn (*const anyopaque) void, context: *const anyopaque) void {
+    var inline_arena: Arena = .{};
+    const saved_arena = current_arena;
+    current_arena = &inline_arena;
+    defer {
+        current_arena = saved_arena;
+        Arena.free(&inline_arena);
+    }
+    start(context);
+}
+
 const Group = struct {
     ptr: *Io.Group,
 
@@ -492,22 +546,30 @@ const Group = struct {
         func: *const fn (context: *const anyopaque) void,
         context_alignment: Alignment,
         alloc_len: usize,
+        /// The scope bindings this task inherited from the task that spawned it, copied into
+        /// storage of its own in the same allocation: the copies, not the originals, which may be
+        /// gone by the time this task runs. See `Io.Scoped`.
+        scopes: ?*const Io.Scopes,
 
         /// `Task.runnable.node` is `undefined` in the created `Task`.
         fn create(
             gpa: Allocator,
             group: Group,
+            parent_scopes: ?*const Io.Scopes,
             context: []const u8,
             context_alignment: Alignment,
             func: *const fn (context: *const anyopaque) void,
         ) Allocator.Error!*Task {
             const max_context_misalignment = context_alignment.toByteUnits() -| @alignOf(Task);
             const worst_case_context_offset = context_alignment.forward(@sizeOf(Task) + max_context_misalignment);
-            const alloc_len = worst_case_context_offset + context.len;
+            const worst_case_scopes_offset = Alignment.of(Io.Scopes).forward(worst_case_context_offset + context.len);
+            const alloc_len = worst_case_scopes_offset + Io.Scopes.copySize(parent_scopes) + @alignOf(Io.Scopes);
 
             const task: *Task = @ptrCast(@alignCast(try gpa.alignedAlloc(u8, .of(Task), alloc_len)));
             errdefer comptime unreachable;
 
+            const base: [*]u8 = @ptrCast(task);
+            const actual_scopes_addr = std.mem.alignForward(usize, @intFromPtr(base) + worst_case_scopes_offset, @alignOf(Io.Scopes));
             task.* = .{
                 .runnable = .{
                     .node = undefined,
@@ -517,6 +579,7 @@ const Group = struct {
                 .func = func,
                 .context_alignment = context_alignment,
                 .alloc_len = alloc_len,
+                .scopes = Io.Scopes.copyInto(parent_scopes, @ptrFromInt(actual_scopes_addr)),
             };
             @memcpy(task.contextPointer()[0..context.len], context);
             return task;
@@ -554,7 +617,22 @@ const Group = struct {
                 }, .monotonic);
             }
 
+            // The task's own arena and the bindings it inherited, for the duration of its work:
+            // the arena is this frame, and the bindings are the copies in the task's own block.
+            var task_arena: Arena = .{};
+            const saved_arena = current_arena;
+            const saved_scopes = current_scopes;
+            current_arena = &task_arena;
+            current_scopes = task.scopes;
+            defer {
+                current_arena = saved_arena;
+                current_scopes = saved_scopes;
+            }
+
             task.func(task.contextPointer());
+
+            // The task's arena goes with it, whether it freed anything or not.
+            Arena.free(&task_arena);
 
             thread.status.store(.{ .cancelation = .none, .awaitable = .null }, .monotonic);
             const old_status = group.status().fetchSub(.{
@@ -643,6 +721,9 @@ const Future = struct {
     context_alignment: Alignment,
     result_offset: usize,
     alloc_len: usize,
+    /// The scope bindings this task inherited from the task that spawned it, copied into storage
+    /// of its own in the same allocation. See `Io.Scoped`.
+    scopes: ?*const Io.Scopes,
 
     const Status = packed struct(usize) {
         /// The values of this enum are chosen so that await/cancel can just OR with 0b01 and 0b11
@@ -667,6 +748,7 @@ const Future = struct {
     /// `Future.runnable.node` is `undefined` in the created `Future`.
     fn create(
         gpa: Allocator,
+        parent_scopes: ?*const Io.Scopes,
         result_len: usize,
         result_alignment: Alignment,
         context: []const u8,
@@ -676,7 +758,8 @@ const Future = struct {
         const max_context_misalignment = context_alignment.toByteUnits() -| @alignOf(Future);
         const worst_case_context_offset = context_alignment.forward(@sizeOf(Future) + max_context_misalignment);
         const worst_case_result_offset = result_alignment.forward(worst_case_context_offset + context.len);
-        const alloc_len = worst_case_result_offset + result_len;
+        const worst_case_scopes_offset = Alignment.of(Io.Scopes).forward(worst_case_result_offset + result_len);
+        const alloc_len = worst_case_scopes_offset + Io.Scopes.copySize(parent_scopes) + @alignOf(Io.Scopes);
 
         const future: *Future = @ptrCast(@alignCast(try gpa.alignedAlloc(u8, .of(Future), alloc_len)));
         errdefer comptime unreachable;
@@ -684,6 +767,7 @@ const Future = struct {
         const actual_context_addr = context_alignment.forward(@intFromPtr(future) + @sizeOf(Future));
         const actual_result_addr = result_alignment.forward(actual_context_addr + context.len);
         const actual_result_offset = actual_result_addr - @intFromPtr(future);
+        const actual_scopes_addr = Alignment.of(Io.Scopes).forward(@intFromPtr(future) + worst_case_scopes_offset);
         future.* = .{
             .runnable = .{
                 .node = undefined,
@@ -698,6 +782,7 @@ const Future = struct {
             .context_alignment = context_alignment,
             .result_offset = actual_result_offset,
             .alloc_len = alloc_len,
+            .scopes = Io.Scopes.copyInto(parent_scopes, @ptrFromInt(actual_scopes_addr)),
         };
         @memcpy(future.contextPointer()[0..context.len], context);
         return future;
@@ -723,6 +808,18 @@ const Future = struct {
         _ = t;
         const future: *Future = @fieldParentPtr("runnable", r);
 
+        // The task's own arena and the bindings it inherited, for the duration of its work: the
+        // arena is this frame, and the bindings are the copies in the task's own block.
+        var task_arena: Arena = .{};
+        const saved_arena = current_arena;
+        const saved_scopes = current_scopes;
+        current_arena = &task_arena;
+        current_scopes = future.scopes;
+        defer {
+            current_arena = saved_arena;
+            current_scopes = saved_scopes;
+        }
+
         thread.status.store(.{
             .cancelation = .none,
             .awaitable = .fromFuture(future),
@@ -744,6 +841,10 @@ const Future = struct {
         }
 
         future.func(future.contextPointer(), future.resultPointer());
+
+        // The task's arena goes with it, before its result is published: nothing that outlives
+        // the task may point into it. See `Io.arena`.
+        Arena.free(&task_arena);
 
         const had_acknowledged_cancel = switch (thread.status.load(.monotonic).cancelation) {
             .none, .canceling => false,
@@ -1731,6 +1832,21 @@ pub fn deinit(t: *Threaded) void {
         if (have_sig_io) posix.sigaction(.IO, &t.old_sig_io, null);
         if (have_sig_pipe) posix.sigaction(.PIPE, &t.old_sig_pipe, null);
     }
+    // The arenas of the threads that ran no task: no task return frees them, so this does. Every
+    // other arena went with the task that made it.
+    {
+        const t_io = io(t);
+        t.arena_mutex.lockUncancelable(t_io);
+        defer t.arena_mutex.unlock(t_io);
+        var it = t.own_arenas;
+        while (it) |own| {
+            it = own.next; // before `own` is freed
+            if (current_arena == own) current_arena = null; // this thread's own: no ties left
+            Arena.free(own);
+            t.allocator.destroy(own);
+        }
+        t.own_arenas = null;
+    }
     t.dl.deinit();
     t.null_file.deinit();
     t.random_file.deinit();
@@ -2158,6 +2274,11 @@ pub fn io(t: *Threaded) Io {
             .concurrent = concurrent,
             .await = await,
             .cancel = cancel,
+
+            .taskArena = taskArena,
+            .scopedGet = scopedGet,
+            .scopedPush = scopedPush,
+            .scopedPop = scopedPop,
             .blocking = blocking,
 
             .groupAsync = groupAsync,
@@ -2422,7 +2543,7 @@ fn async(
     }
 
     const gpa = t.allocator;
-    const future = Future.create(gpa, result.len, result_alignment, context, context_alignment, start) catch |err| switch (err) {
+    const future = Future.create(gpa, current_scopes, result.len, result_alignment, context, context_alignment, start) catch |err| switch (err) {
         error.OutOfMemory => {
             start(context.ptr, result.ptr);
             return null;
@@ -2453,7 +2574,7 @@ fn concurrent(
     const t: *Threaded = @ptrCast(@alignCast(userdata));
 
     const gpa = t.allocator;
-    const future = Future.create(gpa, result_len, result_alignment, context, context_alignment, start) catch |err| switch (err) {
+    const future = Future.create(gpa, current_scopes, result_len, result_alignment, context, context_alignment, start) catch |err| switch (err) {
         error.OutOfMemory => return error.ConcurrencyUnavailable,
     };
 
@@ -2480,7 +2601,7 @@ fn groupAsync(
     if (builtin.single_threaded) return groupAsyncEager(start, context.ptr);
 
     const gpa = t.allocator;
-    const task = Group.Task.create(gpa, g, context, context_alignment, start) catch |err| switch (err) {
+    const task = Group.Task.create(gpa, g, current_scopes, context, context_alignment, start) catch |err| switch (err) {
         error.OutOfMemory => return groupAsyncEager(start, context.ptr),
     };
 
@@ -2498,11 +2619,13 @@ fn groupAsync(
     }, .monotonic);
     t.enqueue(&task.runnable);
 }
+/// The task runs on the calling thread, which is what `async` and `groupAsync` do when there is
+/// no unit of concurrency to give it. It still gets an arena of its own. See `eager`.
 fn groupAsyncEager(
     start: *const fn (context: *const anyopaque) void,
     context: *const anyopaque,
 ) void {
-    start(context);
+    eager(start, context);
 }
 
 fn groupConcurrent(
@@ -2520,7 +2643,7 @@ fn groupConcurrent(
     const g: Group = .{ .ptr = type_erased };
 
     const gpa = t.allocator;
-    const task = Group.Task.create(gpa, g, context, context_alignment, start) catch |err| switch (err) {
+    const task = Group.Task.create(gpa, g, current_scopes, context, context_alignment, start) catch |err| switch (err) {
         error.OutOfMemory => return error.ConcurrencyUnavailable,
     };
 
@@ -2536,6 +2659,51 @@ fn groupConcurrent(
         .canceled = false,
     }, .monotonic);
     t.enqueue(&task.runnable);
+}
+
+/// `Io.arena`: the arena of the task this thread runs, or of the thread itself when it runs none.
+/// A task's arena is a local of the entry point that runs it, freed when the task returns; a
+/// thread's own is made here at its first use, and `deinit` frees it. A thread that runs no task
+/// and cannot make one - an instance whose allocator fails, such as `init_single_threaded` - gets
+/// the allocator that fails every allocation. See `Io.arena`.
+fn taskArena(userdata: ?*anyopaque) Allocator {
+    const t: *Threaded = @ptrCast(@alignCast(userdata));
+    if (current_arena) |held| return Arena.get(held, t.allocator);
+
+    const own = t.allocator.create(Arena) catch return .failing;
+    own.* = .{};
+    const t_io = io(t);
+    t.arena_mutex.lockUncancelable(t_io);
+    own.next = t.own_arenas;
+    t.own_arenas = own;
+    t.arena_mutex.unlock(t_io);
+    current_arena = own;
+    return Arena.get(own, t.allocator);
+}
+
+/// `Io.Scoped`: the value bound to `key` for the task this thread runs, or `null`. See `Io.Scoped`.
+fn scopedGet(userdata: ?*anyopaque, key: *const anyopaque) ?*const anyopaque {
+    _ = userdata;
+    var frame = current_scopes;
+    while (frame) |f| : (frame = f.next) {
+        if (f.key == key) return f.value;
+    }
+    return null;
+}
+
+/// `Io.Scoped`: binds `frame` for the calling task and for the tasks it spawns while it is bound,
+/// which inherit a copy. See `Io.Scoped`.
+fn scopedPush(userdata: ?*anyopaque, frame: *Io.Scopes) void {
+    _ = userdata;
+    frame.next = current_scopes;
+    current_scopes = frame;
+}
+
+/// `Io.Scoped`: unbinds `frame`, the calling task's innermost binding. See `Io.Scoped`.
+fn scopedPop(userdata: ?*anyopaque, frame: *Io.Scopes) void {
+    _ = userdata;
+    assert(current_scopes == frame);
+    current_scopes = frame.next;
 }
 
 /// The calling thread is an OS thread already, so a blocking call is made on it. See

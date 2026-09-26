@@ -630,6 +630,11 @@ pub fn io(ev: *Evented) Io {
             .cancel = Scheduler.cancel,
             .blocking = dirtyBlocking,
 
+            .taskArena = Scheduler.taskArena,
+            .scopedGet = Scheduler.scopedGet,
+            .scopedPush = Scheduler.scopedPush,
+            .scopedPop = Scheduler.scopedPop,
+
             .groupAsync = Scheduler.groupAsync,
             .groupConcurrent = Scheduler.groupConcurrent,
             .groupAwait = Scheduler.groupAwait,

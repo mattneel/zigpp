@@ -260,7 +260,38 @@ pub fn Scheduler(comptime Backend: type) type {
             /// `Io.spawnedName` is where it comes from for a spawn through `Io`. The name of a
             /// task outlives it: it is a comptime string.
             name: [:0]const u8,
+            /// The task's arena, created at its first use and freed when it returns. See
+            /// `Sched.taskArena`.
+            arena: Arena = .{},
+            /// The scope bindings this task sees, innermost first. Its own pushes are frames on
+            /// the stack of whoever called `Scoped.run`; what it inherited was copied into
+            /// `context_bytes`-style storage of its own at spawn, so a binding cannot outlive the
+            /// task that made it. See `Sched.scopedGet` and `Io.Scoped`.
+            scopes: ?*const Io.Scopes = null,
             tsan_fiber: tsan.Fiber,
+
+            /// A task's arena: buffers from the Io's allocator, released in one step when the
+            /// task returns. Created lazily, so a task that never asks for one costs three words.
+            pub const Arena = struct {
+                created: bool = false,
+                allocator: std.heap.ArenaAllocator = undefined,
+
+                /// The arena of `task`, created here if this is its first use.
+                fn get(task: *Task, backend_allocator: Allocator) Allocator {
+                    if (!task.arena.created) {
+                        task.arena.allocator = .init(backend_allocator);
+                        task.arena.created = true;
+                    }
+                    return task.arena.allocator.allocator();
+                }
+
+                /// Releases everything the arena holds, if it holds anything.
+                fn free(task: *Task) void {
+                    if (!task.arena.created) return;
+                    task.arena.allocator.deinit();
+                    task.arena.created = false;
+                }
+            };
 
             /// The first id of the next block of ids a worker takes. See `Task.id` and
             /// `Worker.nextTaskId`.
@@ -895,6 +926,8 @@ pub fn Scheduler(comptime Backend: type) type {
         pub fn deinit(s: *Sched, gpa: Allocator) void {
             assert(Worker.current().currentTask() == s.mainTask());
             s.yield(null, .stop);
+            // The main task runs no more Io calls, so its arena goes the way every task's does.
+            Task.Arena.free(s.mainTask());
             // Worker 0 has switched back to the main task on the thread that called `init`. A
             // worker may have been starting one more meanwhile, which `.stop` did not wake. Once
             // it has, every worker is woken again: each one sees `stopping` and returns.
@@ -2018,7 +2051,13 @@ pub fn Scheduler(comptime Backend: type) type {
         ) Io.ConcurrentError!*Task {
             const page = std.heap.pageSize();
             const result_space = @max(result_len, @sizeOf(Backend.Completion)) + result_alignment.toByteUnits();
-            const header_size = @sizeOf(Task) + result_space + context.len + context_alignment.toByteUnits() + 64;
+            // The caller is the task spawning this one, so what it sees is what this one
+            // inherits: a copy of its whole scope chain, in storage of this task's own, taken
+            // below the task in the mapping. See `Io.Scoped`.
+            const parent_scopes = w.currentTask().scopes;
+            const scopes_bytes = Io.Scopes.copySize(parent_scopes) + @alignOf(Io.Scopes);
+            const header_size = @sizeOf(Task) + result_space + context.len + context_alignment.toByteUnits() +
+                scopes_bytes + 64;
             const mapping = if (options.stack_size == null and header_size <= default_header_size)
                 s.takeMapping(w) catch return error.ConcurrencyUnavailable
             else
@@ -2037,6 +2076,9 @@ pub fn Scheduler(comptime Backend: type) type {
             const end = @intFromPtr(mapping.ptr) + mapping.len;
             const task: *Task = @ptrFromInt(std.mem.alignBackward(usize, end - result_space - @sizeOf(Task), @alignOf(Task)));
             const context_bytes: [*]u8 = @ptrFromInt(context_alignment.backward(@intFromPtr(task) - context.len));
+            const scopes_base: [*]align(@alignOf(Io.Scopes)) u8 = @ptrFromInt(Alignment.of(Io.Scopes).backward(
+                @intFromPtr(context_bytes) - scopes_bytes,
+            ));
             const sp = std.mem.alignBackward(usize, @intFromPtr(context_bytes), 16);
             task.* = .{
                 .context = switch (builtin.cpu.arch) {
@@ -2063,6 +2105,7 @@ pub fn Scheduler(comptime Backend: type) type {
                 // The name has to be a comptime string: a task reports it long after the memory
                 // of whoever spawned it is gone. `Io.spawnedName` is one.
                 .name = if (name.len == 0) "unnamed" else name,
+                .scopes = Io.Scopes.copyInto(parent_scopes, scopes_base),
                 .tsan_fiber = if (tsan.enable) tsan.__tsan_create_fiber(0),
             };
             if (builtin.cpu.arch == .x86_64) @as(*usize, @ptrFromInt(sp - 8)).* = 0; // no return address
@@ -2121,6 +2164,9 @@ pub fn Scheduler(comptime Backend: type) type {
                 .main => unreachable,
                 .future => |start| {
                     start(task.context_bytes, task.resultBytes(task.result_align));
+                    // The task's arena goes with it, before its result is published: nothing that
+                    // outlives the task may point into it. See `Io.arena`.
+                    Task.Arena.free(task);
                     // An awaiter parked already runs next here, if it may. Otherwise it is made
                     // runnable once this task is saved, by `.finished`.
                     const next = if (@atomicLoad(?*Task, &task.link.awaiter, .acquire)) |awaiter|
@@ -2131,6 +2177,7 @@ pub fn Scheduler(comptime Backend: type) type {
                 },
                 .group => |member| {
                     member.start(task.context_bytes);
+                    Task.Arena.free(task);
                     const w: *Worker = .current();
                     const next = if (member.group.removeTask(task)) |awaiter| next: {
                         if (runsHere(w, awaiter)) break :next awaiter;
@@ -2254,6 +2301,46 @@ pub fn Scheduler(comptime Backend: type) type {
         /// `charge`, from a vtable entry point's `userdata`.
         pub inline fn charged(userdata: ?*anyopaque) void {
             charge(fromUserdata(userdata));
+        }
+
+        /// `Io.arena`: the calling task's arena, created here at its first use from the backend's
+        /// allocator. `taskMain` frees it when the task returns, and `deinit` frees the main
+        /// task's. See `Task.Arena`.
+        pub fn taskArena(userdata: ?*anyopaque) Allocator {
+            const s = fromUserdata(userdata);
+            const w = s.chargeFetch() orelse Worker.current();
+            return Task.Arena.get(w.currentTask(), Backend.allocator(s.backendOf()));
+        }
+
+        /// `Io.Scoped`: the value bound to `key` in the calling task's chain, or `null`.
+        pub fn scopedGet(userdata: ?*anyopaque, key: *const anyopaque) ?*const anyopaque {
+            const s = fromUserdata(userdata);
+            const w = s.chargeFetch() orelse Worker.current();
+            var frame = w.currentTask().scopes;
+            while (frame) |f| : (frame = f.next) {
+                if (f.key == key) return f.value;
+            }
+            return null;
+        }
+
+        /// `Io.Scoped`: binds `frame` in front of what the calling task already sees. The frame is
+        /// the caller's, on its stack, and outlives the binding; the tasks the task spawns while
+        /// it is bound inherit a copy of it. See `Io.Scoped`.
+        pub fn scopedPush(userdata: ?*anyopaque, frame: *Io.Scopes) void {
+            const s = fromUserdata(userdata);
+            const w = s.chargeFetch() orelse Worker.current();
+            const task = w.currentTask();
+            frame.next = task.scopes;
+            task.scopes = frame;
+        }
+
+        /// `Io.Scoped`: unbinds `frame`, the calling task's innermost binding.
+        pub fn scopedPop(userdata: ?*anyopaque, frame: *Io.Scopes) void {
+            const s = fromUserdata(userdata);
+            const w = s.chargeFetch() orelse Worker.current();
+            const task = w.currentTask();
+            assert(task.scopes == frame);
+            task.scopes = frame.next;
         }
 
         pub fn async(
@@ -2763,6 +2850,10 @@ const TestBackend = struct {
         v.swapCancelProtection = Sched.swapCancelProtection;
         v.checkCancel = Sched.checkCancel;
         v.blocking = Sched.blockingDirect;
+        v.taskArena = Sched.taskArena;
+        v.scopedGet = Sched.scopedGet;
+        v.scopedPush = Sched.scopedPush;
+        v.scopedPop = Sched.scopedPop;
         v.now = now;
         v.futexWait = futexWait;
         v.futexWaitUncancelable = futexWaitUncancelable;
