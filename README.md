@@ -33,6 +33,8 @@ the compiler was written by upstream Zig contributors.
   exact compiler version it is built with, and `zig` runs that version instead
   of itself, downloading it on first use. See
   [Any Zig Version](#any-zig-version).
+- **No versions.** Every push to master is a release, every release is kept
+  forever, and you pin the build you use. See [Live at Head](#live-at-head).
 - **A BDFL and one rule: talk about code.** See [Governance](#governance).
 
 **Does Zig++ compile to Zig, the way TypeScript compiles to JavaScript?** No.
@@ -41,6 +43,15 @@ Metal libraries.
 
 **Is Zig++ stable?** Zig++ follows semantic versioning exactly as closely as
 TypeScript does.
+
+**What version is Zig++?** None. Every push to master is a release, and every
+release is kept forever: you pin the build you use. A build is named for the
+upstream version it tracks, its commit height, and its commit, as in
+`0.17.0-dev.2469+zigpp.04926fc36`. See [Live at Head](#live-at-head).
+
+**When is 1.0?** 1.0 is a milestone, not a version. The milestone closes when
+Zig++ gets its borrow checker, and the build that closes it ships like every
+other build. There is no Zig++ 1.0.
 
 **Can upstream Zig build Zig++?** No. Zig++ changed `std.lang.Type`, and an
 upstream Zig binary cannot compile against it. Use the CMake build,
@@ -146,6 +157,46 @@ The suite runs a vector add, a reduction, and a kernel with scalar arguments on
 the GPU of a Mac, which CI's M4 provides.
 
 Still to come: MLIR lowering for tensor cores and kernel fusion.
+
+## Live at Head
+
+Live at Head. Zig++ has no versions. Every push to master is a release, and
+every release is kept forever. You pin the build you use, the way you pin every
+dependency, and you upgrade when you are ready. Zig++ does not number its
+releases; upstream does it for us.
+
+1. **Every push to master is a release.**
+2. **Builds are forever.** Every published build stays downloadable at a stable
+   URL with its checksums, never deleted and never replaced.
+3. **Master is append-only.** No force pushes, no rewritten history, no
+   retagging. A pin is a commit, and commits do not move.
+4. **Version identity comes from upstream tags.** Zig++ does not create bare
+   semantic-version tags such as `1.0.0`. `zigpp-*` tags identify individual
+   Zig++ builds and releases. They are immutable artifact locators and are
+   excluded from version derivation. `zigpp-*` tags never move and never
+   disappear.
+5. **The root project's pin wins.** Dependencies state minimums, and a pin
+   older than a dependency's minimum is an error that names the dependency and
+   the build to move to. *The minimum check is tooling: planned.*
+6. **Breakage is announced at the upgrade, not by a number.** Every commit that
+   breaks existing code carries a `Breaking:` trailer saying what breaks and
+   what to write instead, and a merge of upstream Zig carries one for each of
+   upstream's breaking changes in the merged range. *Collecting them for an
+   upgrade is tooling: planned.*
+7. **There are no LTS branches.** Security fixes land on head, and advisories
+   name the affected range of builds. *Advisories are tooling: planned.*
+8. **Docs travel with the pin.** Every build carries its own std docs and
+   language reference, and `zig std` serves them (the language reference from
+   0.17.0-dev.2476 on).
+9. **Upstream Zig and every vendored dependency are tracked continuously and
+   pinned the same way.**
+10. **1.0 is a milestone, not a version.** The build that closes it ships like
+    every other build. There is no Zig++ 1.0.
+
+"Live at Head" is Abseil's phrase, from Titus Winters' CppCon 2017 talk
+["C++ as a 'Live at Head' Language"](https://www.youtube.com/watch?v=tISy7EJQPzI).
+[Live at Head](https://zigpp.lol/live-at-head.html) in the book says how to pin
+a build and how to upgrade, and where each piece of tooling stands.
 
 ## AI Policy
 
@@ -773,6 +824,19 @@ The most highly regarded argument in such a discussion is a real world use case.
 
 Language proposals are not accepted. Please do not open an issue proposing to
 change the Zig language or syntax.
+
+### Breaking Changes
+
+Zig++ has no version numbers to warn people with, so the commit does. A commit
+that breaks existing code carries a `Breaking:` trailer for each thing it
+breaks, saying what breaks and what to write instead:
+
+```text
+Breaking: std.zig.Server.serveErrorBundle takes the message tag first. Write serveErrorBundle(.error_bundle, bundle).
+```
+
+A merge of upstream Zig carries a `Breaking:` trailer for each of upstream's
+breaking changes in the merged range. See [Live at Head](#live-at-head).
 
 ### Editing Source Code
 
