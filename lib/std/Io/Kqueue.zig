@@ -3809,10 +3809,13 @@ fn fileWriteFilePositional(
         }
         var sent: usize = 0;
         while (sent != read_bytes) {
-            sent += try fileWritePositional(userdata, file, &.{}, &.{buffer[sent..read_bytes]}, 1, offset + copied);
+            // After everything this call has already written at `offset`: the header and the
+            // bytes the reader had buffered are in front of the file's own bytes.
+            const n = try fileWritePositional(userdata, file, &.{}, &.{buffer[sent..read_bytes]}, 1, offset + written);
+            sent += n;
+            written += n;
         }
         file_reader.pos += read_bytes;
-        written += read_bytes;
         copied += read_bytes;
     }
     if (written == 0) return error.EndOfStream;
@@ -5667,7 +5670,28 @@ fn dirRenamePreserve(
     new_sub_path: []const u8,
 ) Dir.RenamePreserveError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    // Make a hard link then delete the original.
+    // A rename that does not overwrite: an existing target, whatever it is, is what the caller
+    // is told about before anything moves. A target that is a directory cannot be hard-linked
+    // over — Darwin answers `EPERM` there, where Linux answers `EEXIST` — and a preserved rename
+    // means the same thing on both.
+    if (dirStatFile(ev, new_dir, new_sub_path, .{ .follow_symlinks = false })) |_| {
+        return error.PathAlreadyExists;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        error.AccessDenied,
+        error.BadPathName,
+        error.NameTooLong,
+        error.NetworkNotFound,
+        error.NoDevice,
+        error.NotDir,
+        error.SymLinkLoop,
+        error.SystemResources,
+        => |e| return e,
+        // Anything else the stat can report is not a reason this rename cannot be made: the
+        // hard link below reports it if it is.
+        else => {},
+    }
+    // Make a hard link then delete the original, so that a failure part way leaves the original.
     try dirHardLink(ev, old_dir, old_sub_path, new_dir, new_sub_path, .{ .follow_symlinks = false });
     const prev = Scheduler.swapCancelProtection(ev, .blocked);
     defer _ = Scheduler.swapCancelProtection(ev, prev);
