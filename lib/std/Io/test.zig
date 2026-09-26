@@ -1410,11 +1410,16 @@ test "Queue overflow policy" {
         var done: std.atomic.Value(bool) = .init(false);
         var future = try io.concurrent(Producer.put, .{ io, &queue, &done });
         try expect(!done.load(.acquire));
-        try expectEqual(4, try queue.get(io, &got, 4));
+
+        // A get takes as much of what is queued as its buffer holds, so whether the first get
+        // also picks up the element the producer is putting depends on whether that put has
+        // registered itself yet. This waits for the state it checks instead: elements until the
+        // five the two of them made are in hand, in order, and then the producer is done.
+        var total: usize = 0;
+        while (total < 5) total += try queue.get(io, got[total..], 1);
+        try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5 }, got[0..5]);
         future.await(io);
         try expect(done.load(.acquire));
         try expectEqual(0, queue.droppedElements());
-        try expectEqual(1, try queue.get(io, &got, 1));
-        try expectEqual(5, got[0]);
     }
 }

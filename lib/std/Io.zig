@@ -2199,6 +2199,11 @@ pub const Supervisor = struct {
         // Its report from now on is stale: the epoch tells the monitor. The canceled child
         // reports error.Canceled, which would otherwise read as a failure and restart it.
         child.epoch +%= 1;
+        // Cancelation is blocked for the whole of it: the cancel and the wait are cleanup, and a
+        // cancel request arriving in the middle of the scheduler's awaiter handoff is what trips
+        // its own state machine (`changeAwaiting`).
+        const old = s.io.swapCancelProtection(.blocked);
+        defer _ = s.io.swapCancelProtection(old);
         child.group.cancel(s.io);
         s.awaitGroup(child);
         child.running = false;
