@@ -1,24 +1,11 @@
 name: Release
 
-# Every push to master that changes what the archives hold publishes a release
-# of that commit for each target, with a download index in the format of
-# ziglang.org's. A pull request that changes the release machinery builds and
-# checks the archives without publishing them.
+# Every push to master publishes a release of that commit for each target, with
+# a download index in the format of ziglang.org's. A pull request that changes
+# the release machinery builds and checks the archives without publishing them.
 on:
   push:
     branches: [master]
-    # The book, the proposals, ppup, and the other workflows are not in the
-    # archives. README.md and the language reference are, so they still release.
-    paths-ignore:
-      - "doc/assets/**"
-      - "doc/book/**"
-      - "doc/proposals/**"
-      - "ppup/**"
-      - ".github/scripts/downloads.py"
-      - ".github/workflows/ci.yml"
-      - ".github/workflows/ci-host.yml"
-      - ".github/workflows/ppup.yml"
-      - ".github/workflows/site.yml"
   pull_request:
     paths:
       - ".github/workflows/release.yml"
@@ -28,13 +15,14 @@ on:
 permissions:
   contents: read
 
-# A newer push cancels the release run of an older one, which the newer release
-# supersedes. This also keeps an old run from publishing after master has moved
-# on: GitHub refuses a workflow token's release at a commit behind master when
-# the newer commits change a workflow.
+# Every push is a release, so no push's run cancels or displaces another's:
+# each commit is a group of its own. A group holds one running and one pending
+# run, and GitHub cancels a pending run when another queues in its group, so a
+# group shared by every push would lose releases to a burst of pushes. The run
+# of a pull request, which publishes nothing, still gives way to the next one.
 concurrency:
-  group: release-${{ github.event.pull_request.number || 'master' }}
-  cancel-in-progress: true
+  group: release-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   bootstrap:
@@ -202,6 +190,11 @@ jobs:
     env:
       VERSION: ${{ needs.bootstrap.outputs.version }}
       GH_TOKEN: ${{ github.token }}
+      # The private key of the repository's release deploy key, which pushes
+      # the release's tag. The workflow token cannot create a tag at a commit
+      # whose workflow files differ from master's, which is every commit behind
+      # a master that changed a workflow since.
+      RELEASE_TAG_KEY: ${{ secrets.RELEASE_TAG_KEY }}
     steps:
       - uses: actions/checkout@v7
 
@@ -213,22 +206,7 @@ jobs:
 
       # The tag names the base version without the build metadata: `+` is legal
       # in a tag, but awkward in URLs. build.zig and CMake ignore zigpp-* tags
-      # when they derive the version. A re-run of a run whose release already
-      # exists replaces its assets, so a publish that failed halfway can be
-      # completed.
+      # when they derive the version. A published release is never changed, and
+      # a draft that a failed run left is refilled and published; see publish.sh.
       - name: Publish the release
-        run: |
-          tag="zigpp-${VERSION%%+*}"
-          .github/scripts/index.py dist "$VERSION" "$tag" "${{ github.repository }}"
-          (cd dist && sha256sum zig-* index.json > SHA256SUMS)
-          if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release upload "$tag" --repo "${{ github.repository }}" --clobber \
-              dist/zig-* dist/index.json dist/SHA256SUMS
-          else
-            gh release create "$tag" \
-              --repo "${{ github.repository }}" \
-              --target "${{ github.sha }}" \
-              --title "Zig++ $VERSION" \
-              --generate-notes \
-              dist/zig-* dist/index.json dist/SHA256SUMS
-          fi
+        run: .github/scripts/publish.sh dist "$VERSION" "${{ github.sha }}" "${{ github.repository }}"
