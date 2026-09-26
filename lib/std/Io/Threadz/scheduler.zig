@@ -64,6 +64,7 @@ const assert = std.debug.assert;
 const linux = std.os.linux;
 const posix = std.posix;
 const page_size_min = std.heap.page_size_min;
+const recoverableOsBugDetected = Io.Threaded.recoverableOsBugDetected;
 
 const tracy = if (@hasDecl(@import("root"), "tracy")) @import("root").tracy else struct {
     const enable = false;
@@ -2860,6 +2861,11 @@ pub fn Scheduler(comptime Backend: type) type {
     };
 }
 
+/// Whether this process's Darwin is one whose `__ulock_wait2` exists: the XNU in macOS 11 and
+/// later has it, and the older `__ulock_wait` takes microseconds instead of nanoseconds. The
+/// same test `Io.Threaded` makes.
+const darwin_has_ulock_wait2 = builtin.os.version_range.semver.min.major >= 11;
+
 /// How much CPU time another thread of this process has used, where the platform can say:
 /// Darwin through Mach's `thread_info`, which counts the thread's user and system time, and Linux
 /// through the clock named after a thread id. The BSDs' per-thread clocks can only be read by the
@@ -2959,11 +2965,30 @@ pub const Futex = struct {
             },
             .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => {
                 const c = std.c;
-                // `__ulock_wait` takes microseconds, and zero means no timeout.
-                const us: u32 = if (timeout_ns) |ns| @intCast(
+                // Zero means no timeout in either call. Darwin has two ulock waits: the older one
+                // takes microseconds, and `__ulock_wait2`, XNU 7195.50.7.100.1 and later — macOS
+                // 11 — takes nanoseconds, which is what `Io.Threaded` uses where it can.
+                const flags: c.UL = .{ .op = .COMPARE_AND_WAIT, .NO_ERRNO = true };
+                const status = if (darwin_has_ulock_wait2) c.__ulock_wait2(
+                    flags,
+                    ptr,
+                    expected,
+                    timeout_ns orelse 0,
+                    0,
+                ) else c.__ulock_wait(flags, ptr, expected, if (timeout_ns) |ns| @intCast(
                     std.math.clamp(@divFloor(ns, std.time.ns_per_us), 1, std.math.maxInt(u32)),
-                ) else 0;
-                _ = c.__ulock_wait(.{ .op = .COMPARE_AND_WAIT, .NO_ERRNO = true }, ptr, expected, us);
+                ) else 0);
+                if (status >= 0) return;
+                switch (@as(c.E, @fromBackingInt(@intCast(-status)))) {
+                    .INTR, .TIMEDOUT, .CANCELED, .AGAIN, .NOENT => return, // woken, or the wait is over
+                    // The address was paged out, which darwin's own pthread code survives by
+                    // returning: the caller re-reads the word and waits again.
+                    .FAULT => return,
+                    else => {
+                        recoverableOsBugDetected();
+                        return;
+                    },
+                }
             },
             .freebsd => {
                 const c = std.c;
