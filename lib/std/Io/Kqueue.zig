@@ -476,6 +476,10 @@ pub const Completion = struct {
     /// and a cancellation take it out.
     futex_bucket: ?*FutexBucket = null,
     futex_node: ?*FutexWaiter = null,
+    /// The kqueue the task registered its events on. A wake that does not come from an event —
+    /// a futex table's, which no worker completes — leaves whatever did not fire to the task
+    /// itself, and this is where they are.
+    kq_fd: fd_t = -1,
 
     pub const Outcome = enum(u8) { none, ready, timeout, canceled };
     pub const State = enum(u8) { idle, waiting, parked, canceled };
@@ -517,6 +521,7 @@ fn park(
     @memcpy(completion.registrations[0..registrations.len], registrations);
     completion.futex_bucket = if (futex) |f| f.bucket else null;
     completion.futex_node = if (futex) |f| f.node else null;
+    completion.kq_fd = w.backend.kq_fd;
     {
         // Publishing is one step, under the lock: a cancellation must not be able to take the
         // task out of the list before it is in it, nor leave a kernel event behind.
@@ -536,6 +541,15 @@ fn park(
         return error.Canceled;
     };
     s.yield(null, .{ .custom = .{ .context = completion, .run = markParked } });
+    // Running again. A worker that completed the task took its events out already; a wake that
+    // came through the futex table did not, because no worker is involved in it, so the events
+    // that did not fire come out here, on whichever worker the task resumed on: any thread may
+    // change any kqueue.
+    deleteRegistrations(completion.kq_fd, completion);
+    completion.kq_fd = -1;
+    completion.futex_bucket = null;
+    completion.futex_node = null;
+    completion.state.store(.idle, .monotonic);
     switch (completion.outcome) {
         .ready => return .ready,
         .timeout => return .timeout,
