@@ -510,26 +510,42 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(test_modules_step);
 
     // The `Io` contract, networking and scheduler tests again, with `std.testing.io` an
-    // `Io.Threadz`. Threadz runs the tests on Linux; elsewhere the step has nothing to do.
+    // `Io.Threadz`. Threadz has a core on Linux (io_uring) and on Darwin and the BSDs (kqueue);
+    // elsewhere the step has nothing to do.
     const test_threadz_step = b.step("test-threadz", "Run the Io tests on Io.Threadz");
     test_step.dependOn(test_threadz_step);
-    if (b.graph.host.result.os.tag == .linux) {
-        const threadz_tests = b.addTest(.{
-            .name = "std-threadz",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("lib/std/std.zig"),
-                .target = b.graph.host,
-                .optimize = .debug,
-            }),
-            .filters = if (test_filters.len != 0)
-                test_filters
-            else
-                &.{ "Io.test.test.", "Io.net.test.test.", "Io.Threadz", "Io.Uring.test." },
-            .zig_lib_dir = b.path("lib"),
-        });
-        const run_threadz_tests = b.addRunArtifact(threadz_tests);
-        run_threadz_tests.addArg("--io=threadz");
-        test_threadz_step.dependOn(&run_threadz_tests.step);
+    switch (b.graph.host.result.os.tag) {
+        .linux,
+        .driverkit,
+        .ios,
+        .maccatalyst,
+        .macos,
+        .tvos,
+        .visionos,
+        .watchos,
+        .dragonfly,
+        .freebsd,
+        .netbsd,
+        .openbsd,
+        => {
+            const threadz_tests = b.addTest(.{
+                .name = "std-threadz",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("lib/std/std.zig"),
+                    .target = b.graph.host,
+                    .optimize = .debug,
+                }),
+                .filters = if (test_filters.len != 0) test_filters else switch (b.graph.host.result.os.tag) {
+                    .linux => &.{ "Io.test.test.", "Io.net.test.test.", "Io.Threadz", "Io.Uring.test." },
+                    else => &.{ "Io.test.test.", "Io.net.test.test.", "Io.Threadz", "Io.Kqueue.test." },
+                },
+                .zig_lib_dir = b.path("lib"),
+            });
+            const run_threadz_tests = b.addRunArtifact(threadz_tests);
+            run_threadz_tests.addArg("--io=threadz");
+            test_threadz_step.dependOn(&run_threadz_tests.step);
+        },
+        else => {},
     }
 
     test_modules_step.dependOn(tests.addModuleTests(b, .{

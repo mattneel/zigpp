@@ -29,14 +29,13 @@ pub const Threaded = @import("Io/Threaded.zig");
 
 pub const fiber = @import("Io/fiber.zig");
 /// Tasks on their own stacks, parked at every Io call and scheduled across a pool of OS
-/// workers: io_uring on Linux, kqueue on the BSDs, libdispatch on Darwin.
+/// workers: io_uring on Linux, kqueue on Darwin and the BSDs.
 pub const Threadz = if (fiber.supported) switch (builtin.os.tag) {
     // The io_uring core keeps a socket handle and a length in one word of an operation's
     // storage, and a pointer in each completion's user data: it needs 64-bit pointers, so
     // x32 and ILP32 targets have no Threadz yet.
     .linux => if (@sizeOf(usize) == 8) Uring else void,
-    .dragonfly, .freebsd, .netbsd, .openbsd => Kqueue,
-    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => Dispatch,
+    .dragonfly, .freebsd, .netbsd, .openbsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => Kqueue,
     else => void,
 } else void; // context-switching code not implemented yet
 /// The upstream name for `Threadz`.
@@ -2809,10 +2808,10 @@ test {
     _ = Reader;
     _ = Writer;
     _ = Threadz;
-    // The shared scheduler runs under `Uring` and nowhere else yet, and its own tests use Linux
-    // futexes and Linux's mmap flags; the other cores bring it to their systems. The OS test
-    // comes first so that no other system analyzes `Threadz` against Linux's cores.
-    if (builtin.os.tag == .linux and Threadz != void) _ = @import("Io/Threadz/scheduler.zig");
+    // The shared scheduler runs under every core, and its own tests run on the OSes it maps
+    // stacks, waits and reads thread CPU times on. The OS test comes first so that no other
+    // system analyzes it against those.
+    if (Threadz != void) _ = @import("Io/Threadz/scheduler.zig");
     _ = Threaded;
     _ = RwLock;
     _ = Semaphore;

@@ -41,9 +41,9 @@ pub const IoInstance = struct {
         threaded,
         threadz,
 
-        /// Threadz runs the tests on Linux. The other cores join when they are rewritten on
-        /// the shared scheduler.
-        pub const threadz_available = builtin.os.tag == .linux and Io.Threadz != void;
+        /// Threadz runs the tests on every OS with a core: io_uring on Linux, kqueue on Darwin
+        /// and the BSDs. See `Io.Threadz`.
+        pub const threadz_available = Io.Threadz != void;
     };
 
     pub const Options = struct {
