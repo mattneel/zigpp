@@ -819,7 +819,6 @@ fn blocking(
 }
 
 fn groupAwait(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *anyopaque) Io.Cancelable!void {
-
     const k: *Kqueue = @ptrCast(@alignCast(userdata));
     _ = k;
     _ = type_erased;

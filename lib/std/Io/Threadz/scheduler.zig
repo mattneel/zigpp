@@ -1457,7 +1457,6 @@ pub fn Scheduler(comptime Backend: type) type {
             }
         }
 
-
         // The watchdog
 
         /// What a program can read about this instance. See `Stats`.
@@ -1939,7 +1938,6 @@ pub fn Scheduler(comptime Backend: type) type {
             return task;
         }
 
-
         /// Queues a task that was just spawned.
         fn enqueueSpawned(s: *Sched, w: *Worker, task: *Task) void {
             switch (task.affinity) {
@@ -2120,7 +2118,6 @@ pub fn Scheduler(comptime Backend: type) type {
         pub fn charged(userdata: ?*anyopaque) void {
             charge(fromUserdata(userdata));
         }
-
 
         pub fn async(
             userdata: ?*anyopaque,
