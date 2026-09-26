@@ -4,7 +4,9 @@
 #   .github/scripts/publish.sh <dist directory> <version> <commit> <owner/repo>
 #
 # The dist directory holds the build's archives, zig-<arch>-<os>-<version>.tar.xz or .zip.
-# GH_TOKEN may write the repository's contents.
+# GH_TOKEN may write the repository's contents. RELEASE_TAG_KEY is the private key of the
+# repository's release deploy key, which may push tags. Run it from a clone that has the
+# commit.
 #
 # Builds are forever: a published release is never changed, and its tag,
 # zigpp-<version without build metadata>, names that one build and never moves. So:
@@ -12,9 +14,14 @@
 #   - a release that is published already is left as it is;
 #   - a draft was never released: a run that failed before publishing left it, and its
 #     assets are replaced with this run's before it is published;
-#   - otherwise a draft is created at the commit, the assets are uploaded to the draft, and
-#     the draft is published, which creates the tag. The assets go up first because a
+#   - otherwise the tag is pushed at the commit, a draft is created on it, the assets are
+#     uploaded to the draft, and the draft is published. The assets go up first because a
 #     published release takes no more of them once releases are immutable.
+#
+# The tag is pushed with the deploy key rather than created by the release API with the
+# workflow token: GitHub refuses the workflow token a ref at a commit whose workflow files
+# differ from master's, which is every commit behind a master that has changed a workflow
+# since.
 #
 # The latest release only moves forward. A release becomes the latest when its version is
 # newer than the latest's, by the ordering of the download index, and at the end the newest
@@ -29,6 +36,7 @@ fi
 dist=$1 version=$2 commit=$3 repo=$4
 here=$(cd "$(dirname "$0")" && pwd)
 tag="zigpp-${version%%+*}"
+: "${RELEASE_TAG_KEY:?is not set: the release deploy key pushes the tag}"
 
 # newest <tag>...: the tag of the newest version among the zigpp-* tags given, ordered as the
 # download index orders its releases.
@@ -62,18 +70,29 @@ latest_tag() {
     fi
 }
 
+# The deploy key, and GitHub's own host keys, for every git command below.
+ssh_dir=$(mktemp -d)
+trap 'rm -rf "$ssh_dir"' EXIT
+printf '%s\n' "$RELEASE_TAG_KEY" > "$ssh_dir/key"
+chmod 600 "$ssh_dir/key"
+gh api meta --jq '.ssh_keys[] | "github.com " + .' > "$ssh_dir/known_hosts"
+export GIT_SSH_COMMAND="ssh -i $ssh_dir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$ssh_dir/known_hosts -o StrictHostKeyChecking=yes"
+remote="git@github.com:$repo.git"
+
 # The download index and the checksums the release carries.
 "$here/index.py" "$dist" "$version" "$tag" "$repo"
 (cd "$dist" && sha256sum zig-* index.json > SHA256SUMS)
 assets=("$dist"/zig-* "$dist/index.json" "$dist/SHA256SUMS")
 
-# A tag that names another commit is another build.
-tagged=$(git ls-remote "https://github.com/$repo.git" "refs/tags/$tag" "refs/tags/$tag^{}" |
+# The tag: pushed once, at this commit. A tag that names another commit is another build.
+tagged=$(git ls-remote "$remote" "refs/tags/$tag" "refs/tags/$tag^{}" |
     awk -v ref="refs/tags/$tag" '
         $2 == ref "^{}" { peeled = $1 }
         $2 == ref { plain = $1 }
         END { print (peeled != "" ? peeled : plain) }')
-if [ -n "$tagged" ] && [ "$tagged" != "$commit" ]; then
+if [ -z "$tagged" ]; then
+    git push "$remote" "$commit:refs/tags/$tag"
+elif [ "$tagged" != "$commit" ]; then
     echo "error: $tag names $tagged already, and this build is $commit" >&2
     exit 1
 fi
@@ -92,7 +111,7 @@ case ${draft:-none} in
                 gh api -X DELETE "repos/$repo/releases/assets/$asset"
             done
         else
-            id=$(gh api -X POST "repos/$repo/releases" -f tag_name="$tag" -f target_commitish="$commit" \
+            id=$(gh api -X POST "repos/$repo/releases" -f tag_name="$tag" \
                 -f name="Zig++ $version" -F draft=true -F generate_release_notes=true --jq .id)
         fi
         for file in "${assets[@]}"; do

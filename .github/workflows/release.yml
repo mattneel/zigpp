@@ -190,6 +190,11 @@ jobs:
     env:
       VERSION: ${{ needs.bootstrap.outputs.version }}
       GH_TOKEN: ${{ github.token }}
+      # The private key of the repository's release deploy key, which pushes
+      # the release's tag. The workflow token cannot create a tag at a commit
+      # whose workflow files differ from master's, which is every commit behind
+      # a master that changed a workflow since.
+      RELEASE_TAG_KEY: ${{ secrets.RELEASE_TAG_KEY }}
     steps:
       - uses: actions/checkout@v7
 
