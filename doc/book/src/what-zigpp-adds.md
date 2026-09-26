@@ -247,6 +247,37 @@ operations io_uring can only finish on a kernel thread of its own, such as
 writes to a file, `statx`, and creating a file, are made on the worker instead,
 because the trip to that thread and back costs more than the call.
 
+On Darwin and the BSDs, Threadz runs on kqueue, with one kqueue per worker.
+Sockets, pipes and terminals are nonblocking, and an operation that would block
+registers an `EVFILT.READ` or `EVFILT.WRITE` event, oneshot, with the task in
+the event's `udata`; when it arrives the operation retries the call it wanted
+to make. A connect returns `EINPROGRESS`, waits for `EVFILT.WRITE`, and reads
+`SO_ERROR`. `sleep` and every timeout are `EVFILT.TIMER` events, in
+nanoseconds where the platform has a flag for them and in milliseconds on
+OpenBSD and DragonFly, which do not, so an operation with a deadline waits on
+two events and whichever fires first ends it. `childWait` is `EVFILT.PROC` and
+a `wait4`. A wake is a trigger on the worker's own `EVFILT.USER` event, which
+any thread may set on any kqueue, which is what a replacement worker and the
+pool start with. `futexWait` is a table in the process that parks the task and
+is woken by whoever changes the word; a thread that is not one of the workers
+waits in the kernel instead, on the futex `scheduler.Futex` names for each
+system, and a wake reaches both. Regular files, directories, `stat`, locks,
+mappings and process spawn and exec are made on the worker itself, as Linux
+makes the calls io_uring has no opcode for, and a regular file's `fsync` goes
+to the pool because it can take long enough to matter.
+
+Every core runs the same scheduler, so the tasks, the stacks, the watchdog and
+the budget behave the same on both, and each core says what its system adds:
+Darwin and the BSDs map a task's stack with their own flags and protect the
+guard page with `mprotect`, and Linux guards it with `MADV_GUARD_INSTALL` where
+the kernel has it. Darwin and FreeBSD report a thread's CPU time, which the
+watchdog needs to tell a blocked worker from a computing one, through Mach's
+`thread_info` and the thread clock `pthread_getcpuclockid` hands out; the other
+BSDs can only read their own thread's, so there a stuck worker is always taken
+to be blocked. And no BSD has an equivalent of Linux's `membarrier`, so every
+taker of a stuck worker's slot pays a compare-exchange and the watchdog takes
+none.
+
 A task that drives io_uring itself, such as a server's event loop, can borrow
 its worker's ring instead of making one of its own. `acquireRing` lends it to a
 task pinned to that worker. The task queues SQEs on the ring with
@@ -266,7 +297,7 @@ throughput of the same servers on threads of their own, with single tiers from
 
 `zig build test-threadz` runs the `Io` tests on Threadz, and the test runner's
 `--io=threadz` runs any test on it. The design, and the steps still to come
-(the kqueue and IOCP cores, arenas and supervisors, the task dump and the
+(the IOCP core for Windows, arenas and supervisors, the task dump and the
 scheduler gauges, and the `async`/`await` keywords), are in
 [the Threadz proposal](https://github.com/mattneel/zigpp/blob/master/doc/proposals/threadz.md).
 
