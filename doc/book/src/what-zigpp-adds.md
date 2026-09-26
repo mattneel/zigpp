@@ -189,13 +189,18 @@ const io = threadz.io();
   resources. `.free` lets whichever worker is idle take it. `concurrentWith`
   and `groupConcurrentWith` take the affinity and the stack size of one task.
 - Threads outside the pool can use the synchronization primitives, whose
-  futexes they wait on in the kernel.
+  futexes they wait on in the kernel. Other `Io` calls from those threads are
+  not supported yet.
 
-On Linux, Threadz runs on io_uring: files, sockets, DNS, processes, timers, and
-futexes are ring operations, with a ring per worker. `zig build test-threadz`
-runs the `Io` tests on it, and the test runner's `--io=threadz` runs any test on
-it. The design, and the steps still to come (a cooperative budget, a pool for
-blocking calls, a watchdog, and the kqueue and IOCP cores), are in
+On Linux, Threadz runs on io_uring, with a ring per worker: sockets, DNS,
+processes, timers, futexes, and file reads are ring operations. The file
+operations io_uring can only finish on a kernel thread of its own, such as
+writes to a file, `statx`, and creating a file, are made on the worker instead,
+because the trip to that thread and back costs more than the call.
+`zig build test-threadz` runs the `Io` tests on Threadz, and the test runner's
+`--io=threadz` runs any test on it. The design, and the steps still to come (a
+cooperative budget, a pool for blocking calls, a watchdog, and the kqueue and
+IOCP cores), are in
 [the Threadz proposal](https://github.com/mattneel/zigpp/blob/master/doc/proposals/threadz.md).
 
 ## AI in the toolchain

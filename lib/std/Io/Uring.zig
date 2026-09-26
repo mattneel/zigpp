@@ -170,6 +170,13 @@ const CancelRegion = struct {
         return cancel_region.completion().errno();
     }
 
+    /// A system call made on the worker itself, which runs no other task until the call returns.
+    /// Operations io_uring has no opcode for are made this way. So are the ones it can only
+    /// complete on one of its kernel worker threads and that are quick in themselves: positional
+    /// writes, `ftruncate`, `statx`, opens that create or truncate, `mkdirat`, `unlinkat`,
+    /// `renameat`, `symlinkat` and `linkat`. Handing one of those to a kernel thread and back
+    /// costs more than the call. `fsync` stays on the ring: it is slow in itself, and the worker
+    /// runs other tasks meanwhile.
     const Sync = struct {
         cancel_region: CancelRegion,
         fn init(ev: *Evented) Io.Cancelable!Sync {
@@ -1134,7 +1141,7 @@ fn fileWriteStreaming(
             },
         },
     };
-    return ev.pwritev(cancel_region, file.handle, iovecs[0..iovlen], null);
+    return ev.writev(cancel_region, file.handle, iovecs[0..iovlen]);
 }
 
 fn deviceIoControl(
@@ -1624,30 +1631,13 @@ fn dirCreateDir(
     var path_buffer: [PATH_MAX]u8 = undefined;
     const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
 
-    var cancel_region: CancelRegion = .init();
-    defer cancel_region.deinit();
+    var sync: CancelRegion.Sync = try .init(ev);
+    defer sync.deinit(ev);
     while (true) {
-        const thread = try cancel_region.awaitIoUring();
-        thread.enqueue().* = .{
-            .opcode = .MKDIRAT,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = dir.handle,
-            .off = 0,
-            .addr = @intFromPtr(sub_path_posix.ptr),
-            .len = permissions.toMode(),
-            .rw_flags = 0,
-            .user_data = @intFromPtr(cancel_region.fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
-        ev.sched.park();
-        switch (cancel_region.errno()) {
+        try sync.cancel_region.await(.nothing);
+        switch (linux.errno(linux.mkdirat(dir.handle, sub_path_posix, permissions.toMode()))) {
             .SUCCESS => return,
-            .INTR, .CANCELED => {},
+            .INTR => {},
             .ACCES => return error.AccessDenied,
             .BADF => |err| return errnoBug(err), // File descriptor used after closed.
             .PERM => return error.PermissionDenied,
@@ -1703,34 +1693,23 @@ fn dirCreateDirPath(
 fn filePathKind(ev: *Evented, dir: Dir, sub_path: []const u8) !File.Kind {
     var path_buffer: [PATH_MAX]u8 = undefined;
     const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
-    var cancel_region: CancelRegion = .init();
-    defer cancel_region.deinit();
+    var sync: CancelRegion.Sync = try .init(ev);
+    defer sync.deinit(ev);
     while (true) {
+        try sync.cancel_region.await(.nothing);
         var statx_buf = std.mem.zeroes(linux.Statx);
-        const thread = try cancel_region.awaitIoUring();
-        thread.enqueue().* = .{
-            .opcode = .STATX,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = dir.handle,
-            .off = @intFromPtr(&statx_buf),
-            .addr = @intFromPtr(sub_path_posix.ptr),
-            .len = @bitCast(linux.STATX{ .TYPE = true }),
-            .rw_flags = linux.AT.NO_AUTOMOUNT | linux.AT.SYMLINK_NOFOLLOW,
-            .user_data = @intFromPtr(cancel_region.fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
-        ev.sched.park();
-        switch (cancel_region.errno()) {
+        switch (linux.errno(linux.statx(
+            dir.handle,
+            sub_path_posix,
+            linux.AT.NO_AUTOMOUNT | linux.AT.SYMLINK_NOFOLLOW,
+            .{ .TYPE = true },
+            &statx_buf,
+        ))) {
             .SUCCESS => {
                 if (!statx_buf.mask.TYPE) return error.Unexpected;
                 return statxKind(statx_buf.mode);
             },
-            .INTR, .CANCELED => {},
+            .INTR => {},
             .ACCES => |err| return errnoBug(err),
             .BADF => |err| return errnoBug(err), // File descriptor used after closed.
             .FAULT => |err| return errnoBug(err),
@@ -1799,9 +1778,9 @@ fn dirOpenDir(
 
 fn dirStat(userdata: ?*anyopaque, dir: Dir) Dir.StatError!Dir.Stat {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    var cancel_region: CancelRegion = .init();
-    defer cancel_region.deinit();
-    return ev.stat(&cancel_region, dir.handle);
+    var sync: CancelRegion.Sync = try .init(ev);
+    defer sync.deinit(ev);
+    return ev.stat(&sync, dir.handle);
 }
 
 fn dirStatFile(
@@ -1813,9 +1792,9 @@ fn dirStatFile(
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     var path_buffer: [PATH_MAX]u8 = undefined;
     const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
-    var cancel_region: CancelRegion = .init();
-    defer cancel_region.deinit();
-    return ev.statx(&cancel_region, dir.handle, sub_path_posix, linux.AT.NO_AUTOMOUNT |
+    var sync: CancelRegion.Sync = try .init(ev);
+    defer sync.deinit(ev);
+    return ev.statx(&sync, dir.handle, sub_path_posix, linux.AT.NO_AUTOMOUNT |
         @as(u32, if (options.follow_symlinks) 0 else linux.AT.SYMLINK_NOFOLLOW));
 }
 
@@ -1874,7 +1853,7 @@ fn dirCreateFile(
 
     var maybe_sync: CancelRegion.Sync.Maybe = .{ .cancel_region = .init() };
     defer maybe_sync.deinit(ev);
-    const fd = ev.openat(&maybe_sync.cancel_region, dir.handle, sub_path_posix, .{
+    const fd = ev.openatSync(try maybe_sync.enterSync(ev), dir.handle, sub_path_posix, .{
         .ACCMODE = if (flags.read) .RDWR else .WRONLY,
         .CREAT = true,
         .TRUNC = flags.truncate,
@@ -1948,12 +1927,12 @@ fn dirCreateFileAtomic(
         var path_buffer: [PATH_MAX]u8 = undefined;
         const sub_path_posix = try pathToPosix(dest_dirname orelse ".", &path_buffer);
 
-        var cancel_region: CancelRegion = .init();
-        defer cancel_region.deinit();
+        var sync: CancelRegion.Sync = try .init(ev);
+        defer sync.deinit(ev);
         return .{
             .file = .{
-                .handle = ev.openat(
-                    &cancel_region,
+                .handle = ev.openatSync(
+                    &sync,
                     dir.handle,
                     sub_path_posix,
                     flags,
@@ -2076,7 +2055,7 @@ fn dirOpenFile(
 
     if (!flags.allow_directory) {
         const is_dir = is_dir: {
-            const s = ev.stat(&maybe_sync.cancel_region, fd) catch |err| switch (err) {
+            const s = ev.stat(try maybe_sync.enterSync(ev), fd) catch |err| switch (err) {
                 // The directory-ness is either unknown or unknowable
                 error.Streaming => break :is_dir false,
                 else => |e| return e,
@@ -2230,30 +2209,13 @@ fn dirDeleteFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8) Dir.Dele
     var path_buffer: [PATH_MAX]u8 = undefined;
     const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
 
-    var cancel_region: CancelRegion = .init();
-    defer cancel_region.deinit();
+    var sync: CancelRegion.Sync = try .init(ev);
+    defer sync.deinit(ev);
     while (true) {
-        const thread = try cancel_region.awaitIoUring();
-        thread.enqueue().* = .{
-            .opcode = .UNLINKAT,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = dir.handle,
-            .off = 0,
-            .addr = @intFromPtr(sub_path_posix.ptr),
-            .len = 0,
-            .rw_flags = 0,
-            .user_data = @intFromPtr(cancel_region.fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
-        ev.sched.park();
-        switch (cancel_region.errno()) {
+        try sync.cancel_region.await(.nothing);
+        switch (linux.errno(linux.unlinkat(dir.handle, sub_path_posix, 0))) {
             .SUCCESS => return,
-            .INTR, .CANCELED => {},
+            .INTR => {},
             .PERM => return error.PermissionDenied,
             .ACCES => return error.AccessDenied,
             .BUSY => return error.FileBusy,
@@ -2282,30 +2244,13 @@ fn dirDeleteDir(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8) Dir.Delet
     var path_buffer: [PATH_MAX]u8 = undefined;
     const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
 
-    var cancel_region: CancelRegion = .init();
-    defer cancel_region.deinit();
+    var sync: CancelRegion.Sync = try .init(ev);
+    defer sync.deinit(ev);
     while (true) {
-        const thread = try cancel_region.awaitIoUring();
-        thread.enqueue().* = .{
-            .opcode = .UNLINKAT,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = dir.handle,
-            .off = 0,
-            .addr = @intFromPtr(sub_path_posix.ptr),
-            .len = 0,
-            .rw_flags = linux.AT.REMOVEDIR,
-            .user_data = @intFromPtr(cancel_region.fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
-        ev.sched.park();
-        switch (cancel_region.errno()) {
+        try sync.cancel_region.await(.nothing);
+        switch (linux.errno(linux.unlinkat(dir.handle, sub_path_posix, linux.AT.REMOVEDIR))) {
             .SUCCESS => return,
-            .INTR, .CANCELED => {},
+            .INTR => {},
             .ACCES => return error.AccessDenied,
             .PERM => return error.PermissionDenied,
             .BUSY => return error.FileBusy,
@@ -2343,16 +2288,19 @@ fn dirRename(
     const old_sub_path_posix = try pathToPosix(old_sub_path, &old_path_buffer);
     const new_sub_path_posix = try pathToPosix(new_sub_path, &new_path_buffer);
 
-    var cancel_region: CancelRegion = .init();
-    defer cancel_region.deinit();
+    var sync: CancelRegion.Sync = try .init(ev);
+    defer sync.deinit(ev);
     return ev.renameat(
-        &cancel_region,
+        &sync,
         old_dir.handle,
         old_sub_path_posix,
         new_dir.handle,
         new_sub_path_posix,
         .{},
-    );
+    ) catch |err| switch (err) {
+        error.PathAlreadyExists => unreachable, // only with NOREPLACE
+        else => |e| return e,
+    };
 }
 
 fn dirRenamePreserve(
@@ -2370,10 +2318,10 @@ fn dirRenamePreserve(
     const old_sub_path_posix = try pathToPosix(old_sub_path, &old_path_buffer);
     const new_sub_path_posix = try pathToPosix(new_sub_path, &new_path_buffer);
 
-    var cancel_region: CancelRegion = .init();
-    defer cancel_region.deinit();
+    var sync: CancelRegion.Sync = try .init(ev);
+    defer sync.deinit(ev);
     return ev.renameat(
-        &cancel_region,
+        &sync,
         old_dir.handle,
         old_sub_path_posix,
         new_dir.handle,
@@ -2398,30 +2346,13 @@ fn dirSymLink(
     const target_path_posix = try pathToPosix(target_path, &target_path_buffer);
     const sym_link_path_posix = try pathToPosix(sym_link_path, &sym_link_path_buffer);
 
-    var cancel_region: CancelRegion = .init();
-    defer cancel_region.deinit();
+    var sync: CancelRegion.Sync = try .init(ev);
+    defer sync.deinit(ev);
     while (true) {
-        const thread = try cancel_region.awaitIoUring();
-        thread.enqueue().* = .{
-            .opcode = .SYMLINKAT,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = dir.handle,
-            .off = @intFromPtr(sym_link_path_posix.ptr),
-            .addr = @intFromPtr(target_path_posix.ptr),
-            .len = 0,
-            .rw_flags = 0,
-            .user_data = @intFromPtr(cancel_region.fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
-        ev.sched.park();
-        switch (cancel_region.errno()) {
+        try sync.cancel_region.await(.nothing);
+        switch (linux.errno(linux.symlinkat(target_path_posix, dir.handle, sym_link_path_posix))) {
             .SUCCESS => return,
-            .INTR, .CANCELED => {},
+            .INTR => {},
             .FAULT => |err| return errnoBug(err),
             .INVAL => |err| return errnoBug(err),
             .ACCES => return error.AccessDenied,
@@ -2602,10 +2533,10 @@ fn dirHardLink(
     const old_sub_path_posix = try pathToPosix(old_sub_path, &old_path_buffer);
     const new_sub_path_posix = try pathToPosix(new_sub_path, &new_path_buffer);
 
-    var cancel_region: CancelRegion = .init();
-    defer cancel_region.deinit();
+    var sync: CancelRegion.Sync = try .init(ev);
+    defer sync.deinit(ev);
     return ev.linkat(
-        &cancel_region,
+        &sync,
         old_dir.handle,
         old_sub_path_posix,
         new_dir.handle,
@@ -2616,41 +2547,24 @@ fn dirHardLink(
 
 fn fileStat(userdata: ?*anyopaque, file: File) File.StatError!File.Stat {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    var cancel_region: CancelRegion = .init();
-    defer cancel_region.deinit();
-    return ev.stat(&cancel_region, file.handle);
+    var sync: CancelRegion.Sync = try .init(ev);
+    defer sync.deinit(ev);
+    return ev.stat(&sync, file.handle);
 }
 
 fn fileLength(userdata: ?*anyopaque, file: File) File.LengthError!u64 {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    var cancel_region: CancelRegion = .init();
-    defer cancel_region.deinit();
+    var sync: CancelRegion.Sync = try .init(ev);
+    defer sync.deinit(ev);
     while (true) {
+        try sync.cancel_region.await(.nothing);
         var statx_buf = std.mem.zeroes(linux.Statx);
-        const thread = try cancel_region.awaitIoUring();
-        thread.enqueue().* = .{
-            .opcode = .STATX,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = file.handle,
-            .off = @intFromPtr(&statx_buf),
-            .addr = @intFromPtr(""),
-            .len = @bitCast(linux.STATX{ .SIZE = true }),
-            .rw_flags = linux.AT.EMPTY_PATH,
-            .user_data = @intFromPtr(cancel_region.fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
-        ev.sched.park();
-        switch (cancel_region.errno()) {
+        switch (linux.errno(linux.statx(file.handle, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &statx_buf))) {
             .SUCCESS => {
                 if (!statx_buf.mask.SIZE) return error.Unexpected;
                 return statx_buf.size;
             },
-            .INTR, .CANCELED => {},
+            .INTR => {},
             .ACCES => |err| return errnoBug(err),
             .BADF => |err| return errnoBug(err), // File descriptor used after closed.
             .FAULT => |err| return errnoBug(err),
@@ -2713,9 +2627,13 @@ fn fileWritePositional(
         },
     };
 
-    var cancel_region: CancelRegion = .init();
-    defer cancel_region.deinit();
-    return ev.pwritev(&cancel_region, file.handle, iovecs[0..iovlen], offset);
+    // A positional write goes to a regular file or a block device, which io_uring writes on a
+    // kernel worker thread unless the file system can write without blocking. ext4 and tmpfs
+    // cannot: `pwritev2` with `RWF_NOWAIT` fails on both with `EOPNOTSUPP`. See
+    // `CancelRegion.Sync`.
+    var sync: CancelRegion.Sync = try .init(ev);
+    defer sync.deinit(ev);
+    return pwritevSync(&sync, file.handle, iovecs[0..iovlen], offset);
 }
 
 /// This is either usize or u32. Since, either is fine, let's use the same
@@ -2738,12 +2656,18 @@ fn fileWriteFileStreaming(
     limit: Io.Limit,
 ) File.Writer.WriteFileError!usize {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = file;
-    _ = header;
-    _ = file_reader;
-    _ = limit;
-    return error.Unimplemented;
+    const reader_buffered = file_reader.interface.buffered();
+    if (header.len != 0 or reader_buffered.len != 0) {
+        var cancel_region: CancelRegion = .init();
+        defer cancel_region.deinit();
+        const n = try ev.fileWriteStreaming(&cancel_region, file, header, &.{limit.slice(reader_buffered)}, 1);
+        file_reader.interface.toss(n -| header.len);
+        return n;
+    }
+    return copyFileRange(ev, file_reader, file, null, limit) catch |err| switch (err) {
+        error.Unseekable => return error.Unimplemented, // the file is not a regular one
+        else => |e| return e,
+    };
 }
 
 fn fileWriteFilePositional(
@@ -2755,13 +2679,76 @@ fn fileWriteFilePositional(
     offset: u64,
 ) File.WriteFilePositionalError!usize {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    _ = ev;
-    _ = file;
-    _ = header;
-    _ = file_reader;
-    _ = limit;
-    _ = offset;
-    return error.Unimplemented;
+    const reader_buffered = file_reader.interface.buffered();
+    if (header.len != 0 or reader_buffered.len != 0) {
+        const n = try fileWritePositional(ev, file, header, &.{limit.slice(reader_buffered)}, 1, offset);
+        file_reader.interface.toss(n -| header.len);
+        return n;
+    }
+    return copyFileRange(ev, file_reader, file, offset, limit);
+}
+
+/// Copies from `file_reader`, whose buffer is empty, to `file` at `offset`, or at its position if
+/// `offset` is null. io_uring has no `copy_file_range`, so it is a direct call. Returns
+/// `error.Unimplemented` for a pair of files the kernel cannot copy between, so that the caller
+/// reads and writes instead.
+fn copyFileRange(
+    ev: *Evented,
+    file_reader: *File.Reader,
+    file: File,
+    offset: ?u64,
+    limit: Io.Limit,
+) File.WriteFilePositionalError!usize {
+    if (file_reader.size) |size| if (size - file_reader.pos == 0) return error.EndOfStream;
+    var len: usize = @min(@backingInt(limit), std.math.maxInt(i64) - (offset orelse 0));
+    var off_in: i64 = undefined;
+    const off_in_ptr: ?*i64 = switch (file_reader.mode) {
+        .positional_simple, .streaming_simple => return error.Unimplemented,
+        .positional => p: {
+            len = @min(len, std.math.maxInt(i64) - file_reader.pos);
+            off_in = @intCast(file_reader.pos);
+            break :p &off_in;
+        },
+        .streaming => null,
+        .failure => return error.ReadFailed,
+    };
+    var off_out: i64 = if (offset) |o| @intCast(o) else undefined;
+    var sync: CancelRegion.Sync = try .init(ev);
+    defer sync.deinit(ev);
+    const n: usize = while (true) {
+        try sync.cancel_region.await(.nothing);
+        const rc = linux.copy_file_range(
+            file_reader.file.handle,
+            off_in_ptr,
+            file.handle,
+            if (offset != null) &off_out else null,
+            len,
+            0,
+        );
+        switch (linux.errno(rc)) {
+            .SUCCESS => break rc,
+            .INTR => {},
+            // The kernel cannot copy between these two files.
+            .OPNOTSUPP, .INVAL, .NOSYS, .XDEV => return error.Unimplemented,
+            .FBIG => return error.FileTooBig,
+            .IO => return error.InputOutput,
+            .NOMEM => return error.SystemResources,
+            .NOSPC => return error.NoSpaceLeft,
+            .OVERFLOW => |err| return errnoBug(err), // `len` keeps the offsets in range.
+            .NXIO, .SPIPE => return error.Unseekable,
+            .PERM => return error.PermissionDenied,
+            .TXTBSY => return error.FileBusy,
+            .ISDIR => |err| return errnoBug(err),
+            .BADF => |err| return errnoBug(err),
+            else => |err| return unexpectedErrno(err),
+        }
+    };
+    if (n == 0) {
+        file_reader.size = file_reader.pos;
+        return error.EndOfStream;
+    }
+    file_reader.pos += n;
+    return n;
 }
 
 fn fileReadPositional(
@@ -2868,30 +2855,13 @@ fn fileEnableAnsiEscapeCodes(userdata: ?*anyopaque, file: File) File.EnableAnsiE
 
 fn fileSetLength(userdata: ?*anyopaque, file: File, length: u64) File.SetLengthError!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    var cancel_region: CancelRegion = .init();
-    defer cancel_region.deinit();
+    var sync: CancelRegion.Sync = try .init(ev);
+    defer sync.deinit(ev);
     while (true) {
-        const thread = try cancel_region.awaitIoUring();
-        thread.enqueue().* = .{
-            .opcode = .FTRUNCATE,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = file.handle,
-            .off = length,
-            .addr = 0,
-            .len = 0,
-            .rw_flags = 0,
-            .user_data = @intFromPtr(cancel_region.fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
-        ev.sched.park();
-        switch (cancel_region.errno()) {
+        try sync.cancel_region.await(.nothing);
+        switch (linux.errno(linux.ftruncate(file.handle, @bitCast(length)))) {
             .SUCCESS => return,
-            .INTR, .CANCELED => {},
+            .INTR => {},
             .FBIG => return error.FileTooBig,
             .IO => return error.InputOutput,
             .PERM => return error.PermissionDenied,
@@ -3034,10 +3004,10 @@ fn fileHardLink(
     var new_path_buffer: [PATH_MAX]u8 = undefined;
     const new_sub_path_posix = try pathToPosix(new_sub_path, &new_path_buffer);
 
-    var cancel_region: CancelRegion = .init();
-    defer cancel_region.deinit();
+    var sync: CancelRegion.Sync = try .init(ev);
+    defer sync.deinit(ev);
     return ev.linkat(
-        &cancel_region,
+        &sync,
         file.handle,
         "",
         new_dir.handle,
@@ -5843,6 +5813,10 @@ fn flock(
     op: File.Lock,
     blocking: enum { blocking, nonblocking },
 ) (File.LockError || error{WouldBlock})!void {
+    // The lock may be held through another open file description by a task on this worker, so the
+    // worker must not wait for it in the kernel. A blocking lock sleeps and tries again, a
+    // microsecond at first and twice as long each time, up to a millisecond.
+    var retry: linux.kernel_timespec = .{ .sec = 0, .nsec = std.time.ns_per_us };
     while (true) {
         try sync.cancel_region.await(.nothing);
         switch (linux.errno(linux.flock(fd, LOCK.NB | @as(i32, switch (op) {
@@ -5858,13 +5832,22 @@ fn flock(
             .AGAIN => {
                 const thread = try sync.cancel_region.awaitIoUring();
                 thread.enqueue().* = .{
-                    .opcode = .NOP,
+                    .opcode = switch (blocking) {
+                        .blocking => .TIMEOUT,
+                        .nonblocking => .NOP,
+                    },
                     .flags = 0,
                     .ioprio = 0,
                     .fd = 0,
                     .off = 0,
-                    .addr = 0,
-                    .len = 0,
+                    .addr = switch (blocking) {
+                        .blocking => @intFromPtr(&retry),
+                        .nonblocking => 0,
+                    },
+                    .len = switch (blocking) {
+                        .blocking => 1,
+                        .nonblocking => 0,
+                    },
                     .rw_flags = 0,
                     .user_data = @intFromPtr(sync.cancel_region.fiber),
                     .buf_index = 0,
@@ -5875,11 +5858,11 @@ fn flock(
                 };
                 ev.sched.park();
                 switch (sync.cancel_region.errno()) {
-                    .SUCCESS, .INTR, .CANCELED => {},
+                    .SUCCESS, .TIME, .INTR, .CANCELED => {},
                     else => unreachable,
                 }
                 switch (blocking) {
-                    .blocking => continue,
+                    .blocking => retry.nsec = @min(retry.nsec * 2, std.time.ns_per_ms),
                     .nonblocking => return error.WouldBlock,
                 }
             },
@@ -5914,37 +5897,21 @@ fn getsockname(
 
 fn linkat(
     ev: *Evented,
-    cancel_region: *CancelRegion,
+    sync: *CancelRegion.Sync,
     old_dir: fd_t,
     old_path: [*:0]const u8,
     new_dir: fd_t,
     new_path: [*:0]const u8,
     flags: u32,
 ) File.HardLinkError!void {
+    _ = ev;
     // allowed flags: https://man7.org/linux/man-pages/man2/linkat.2.html
     assert(flags & ~(@as(u32, linux.AT.SYMLINK_FOLLOW | linux.AT.EMPTY_PATH)) == 0);
     while (true) {
-        const thread = try cancel_region.awaitIoUring();
-        thread.enqueue().* = .{
-            .opcode = .LINKAT,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = old_dir,
-            .off = @intFromPtr(new_path),
-            .addr = @intFromPtr(old_path),
-            .len = @bitCast(new_dir),
-            .rw_flags = flags,
-            .user_data = @intFromPtr(cancel_region.fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
-        ev.sched.park();
-        switch (cancel_region.errno()) {
+        try sync.cancel_region.await(.nothing);
+        switch (linux.errno(linux.linkat(old_dir, old_path, new_dir, new_path, flags))) {
             .SUCCESS => return,
-            .INTR, .CANCELED => {},
+            .INTR => {},
             .ACCES => return error.AccessDenied,
             .DQUOT => return error.DiskQuota,
             .EXIST => return error.PathAlreadyExists,
@@ -6028,36 +5995,65 @@ fn openat(
         switch (completion.errno()) {
             .SUCCESS => return completion.result,
             .INTR, .CANCELED => {},
-            .FAULT => |err| return errnoBug(err),
-            .INVAL => return error.BadPathName,
-            .BADF => |err| return errnoBug(err), // File descriptor used after closed.
-            .ACCES => return error.AccessDenied,
-            .FBIG => return error.FileTooBig,
-            .OVERFLOW => return error.FileTooBig,
-            .ISDIR => return error.IsDir,
-            .LOOP => return error.SymLinkLoop,
-            .MFILE => return error.ProcessFdQuotaExceeded,
-            .NAMETOOLONG => return error.NameTooLong,
-            .NFILE => return error.SystemFdQuotaExceeded,
-            .NODEV => return error.NoDevice,
-            .NOENT => return error.FileNotFound,
-            .SRCH => return error.FileNotFound, // Linux when opening procfs files.
-            .NOMEM => return error.SystemResources,
-            .NOSPC => return error.NoSpaceLeft,
-            .NOTDIR => return error.NotDir,
-            .PERM => return error.PermissionDenied,
-            .EXIST => return error.PathAlreadyExists,
-            .BUSY => return error.DeviceBusy,
-            // This can be triggered by file locking and TMPFILE, but those
-            // flags are mutually exclusive.
-            .OPNOTSUPP => return error.OperationUnsupported,
-            .AGAIN => return error.WouldBlock,
-            .TXTBSY => return error.FileBusy,
-            .NXIO => return error.NoDevice,
-            .ROFS => return error.ReadOnlyFileSystem,
-            .ILSEQ => return error.BadPathName,
-            else => |err| return unexpectedErrno(err),
+            else => |err| try openatError(err),
         }
+    }
+}
+
+/// For an open that creates or truncates. See `CancelRegion.Sync`.
+fn openatSync(
+    ev: *Evented,
+    sync: *CancelRegion.Sync,
+    dir: fd_t,
+    path: [*:0]const u8,
+    flags: linux.O,
+    mode: linux.mode_t,
+) !fd_t {
+    _ = ev;
+    var mut_flags = flags;
+    if (@hasField(linux.O, "LARGEFILE")) mut_flags.LARGEFILE = true;
+    while (true) {
+        try sync.cancel_region.await(.nothing);
+        const rc = linux.openat(dir, path, mut_flags, mode);
+        switch (linux.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => {},
+            else => |err| try openatError(err),
+        }
+    }
+}
+
+fn openatError(err: linux.E) !noreturn {
+    switch (err) {
+        .FAULT => return errnoBug(err),
+        .INVAL => return error.BadPathName,
+        .BADF => return errnoBug(err), // File descriptor used after closed.
+        .ACCES => return error.AccessDenied,
+        .FBIG => return error.FileTooBig,
+        .OVERFLOW => return error.FileTooBig,
+        .ISDIR => return error.IsDir,
+        .LOOP => return error.SymLinkLoop,
+        .MFILE => return error.ProcessFdQuotaExceeded,
+        .NAMETOOLONG => return error.NameTooLong,
+        .NFILE => return error.SystemFdQuotaExceeded,
+        .NODEV => return error.NoDevice,
+        .NOENT => return error.FileNotFound,
+        .SRCH => return error.FileNotFound, // Linux when opening procfs files.
+        .NOMEM => return error.SystemResources,
+        .NOSPC => return error.NoSpaceLeft,
+        .NOTDIR => return error.NotDir,
+        .PERM => return error.PermissionDenied,
+        .EXIST => return error.PathAlreadyExists,
+        .BUSY => return error.DeviceBusy,
+        // This can be triggered by file locking and TMPFILE, but those
+        // flags are mutually exclusive.
+        .OPNOTSUPP => return error.OperationUnsupported,
+        .AGAIN => return error.WouldBlock,
+        .TXTBSY => return error.FileBusy,
+        .NXIO => return error.NoDevice,
+        .ROFS => return error.ReadOnlyFileSystem,
+        .ILSEQ => return error.BadPathName,
+        else => return unexpectedErrno(err),
     }
 }
 
@@ -6108,12 +6104,13 @@ fn preadv(
     }
 }
 
-fn pwritev(
+/// A write at the file's position, on the ring. Positional writes are made on the worker; see
+/// `CancelRegion.Sync`.
+fn writev(
     ev: *Evented,
     cancel_region: *CancelRegion,
     fd: fd_t,
     iov: []const iovec_const,
-    offset: ?u64,
 ) File.Writer.Error!usize {
     if (iov.len == 0) return 0;
     const scatter = iov.len > 1 or iov[0].len > 0xfffff000;
@@ -6124,7 +6121,7 @@ fn pwritev(
             .flags = 0,
             .ioprio = 0,
             .fd = fd,
-            .off = offset orelse std.math.maxInt(u64),
+            .off = std.math.maxInt(u64),
             .addr = if (scatter) @intFromPtr(iov.ptr) else @intFromPtr(iov[0].base),
             .len = @intCast(if (scatter) iov.len else iov[0].len),
             .rw_flags = 0,
@@ -6206,35 +6203,19 @@ fn realPath(
 
 fn renameat(
     ev: *Evented,
-    cancel_region: *CancelRegion,
+    sync: *CancelRegion.Sync,
     old_dir: fd_t,
     old_path: [*:0]const u8,
     new_dir: fd_t,
     new_path: [*:0]const u8,
     flags: linux.RENAME,
-) Dir.RenameError!void {
+) (Dir.RenameError || error{PathAlreadyExists})!void {
+    _ = ev;
     while (true) {
-        const thread = try cancel_region.awaitIoUring();
-        thread.enqueue().* = .{
-            .opcode = .RENAMEAT,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = old_dir,
-            .off = @intFromPtr(new_path),
-            .addr = @intFromPtr(old_path),
-            .len = @bitCast(new_dir),
-            .rw_flags = @bitCast(flags),
-            .user_data = @intFromPtr(cancel_region.fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
-        ev.sched.park();
-        switch (cancel_region.errno()) {
+        try sync.cancel_region.await(.nothing);
+        switch (linux.errno(linux.renameat2(old_dir, old_path, new_dir, new_path, flags))) {
             .SUCCESS => return,
-            .INTR, .CANCELED => {},
+            .INTR => {},
             .ACCES => return error.AccessDenied,
             .PERM => return error.PermissionDenied,
             .BUSY => return error.FileBusy,
@@ -6248,7 +6229,8 @@ fn renameat(
             .NOTDIR => return error.NotDir,
             .NOMEM => return error.SystemResources,
             .NOSPC => return error.NoSpaceLeft,
-            .EXIST => return error.DirNotEmpty,
+            // With NOREPLACE, the new path exists. Without, it is a directory that is not empty.
+            .EXIST => return if (flags.NOREPLACE) error.PathAlreadyExists else error.DirNotEmpty,
             .NOTEMPTY => return error.DirNotEmpty,
             .ROFS => return error.ReadOnlyFileSystem,
             .XDEV => return error.CrossDevice,
@@ -6373,8 +6355,8 @@ fn socket(
     return socket_fd;
 }
 
-fn stat(ev: *Evented, cancel_region: *CancelRegion, fd: fd_t) Dir.StatError!Dir.Stat {
-    return ev.statx(cancel_region, fd, "", linux.AT.EMPTY_PATH) catch |err| switch (err) {
+fn stat(ev: *Evented, sync: *CancelRegion.Sync, fd: fd_t) Dir.StatError!Dir.Stat {
+    return ev.statx(sync, fd, "", linux.AT.EMPTY_PATH) catch |err| switch (err) {
         error.BadPathName, error.NameTooLong => unreachable, // path is empty
         error.AccessDenied => return errnoBug(.ACCES),
         error.SymLinkLoop => return errnoBug(.LOOP),
@@ -6386,34 +6368,18 @@ fn stat(ev: *Evented, cancel_region: *CancelRegion, fd: fd_t) Dir.StatError!Dir.
 
 fn statx(
     ev: *Evented,
-    cancel_region: *CancelRegion,
+    sync: *CancelRegion.Sync,
     dir: fd_t,
     path: [*:0]const u8,
     flags: u32,
 ) (Dir.StatError || Dir.PathNameError || error{ FileNotFound, NotDir, SymLinkLoop })!Dir.Stat {
+    _ = ev;
     while (true) {
+        try sync.cancel_region.await(.nothing);
         var statx_buf = std.mem.zeroes(linux.Statx);
-        const thread = try cancel_region.awaitIoUring();
-        thread.enqueue().* = .{
-            .opcode = .STATX,
-            .flags = 0,
-            .ioprio = 0,
-            .fd = dir,
-            .off = @intFromPtr(&statx_buf),
-            .addr = @intFromPtr(path),
-            .len = @bitCast(linux_statx_request),
-            .rw_flags = flags,
-            .user_data = @intFromPtr(cancel_region.fiber),
-            .buf_index = 0,
-            .personality = 0,
-            .splice_fd_in = 0,
-            .addr3 = 0,
-            .resv = 0,
-        };
-        ev.sched.park();
-        switch (cancel_region.errno()) {
+        switch (linux.errno(linux.statx(dir, path, flags, linux_statx_request, &statx_buf))) {
             .SUCCESS => return statFromLinux(&statx_buf),
-            .INTR, .CANCELED => {},
+            .INTR => {},
             .ACCES => return error.AccessDenied,
             .BADF => |err| return errnoBug(err), // File descriptor used after closed.
             .FAULT => |err| return errnoBug(err),
@@ -6489,6 +6455,39 @@ fn writeSync(sync: *CancelRegion.Sync, fd: fd_t, buffer: []const u8) File.Writer
             .PIPE => return error.BrokenPipe,
             .CONNRESET => |err| return errnoBug(err), // Not a socket handle.
             .BUSY => return error.DeviceBusy,
+            else => |err| return unexpectedErrno(err),
+        }
+    }
+}
+
+fn pwritevSync(
+    sync: *CancelRegion.Sync,
+    fd: fd_t,
+    iov: []const iovec_const,
+    offset: u64,
+) File.WritePositionalError!usize {
+    if (iov.len == 0) return 0;
+    while (true) {
+        try sync.cancel_region.await(.nothing);
+        const rc = linux.pwritev(fd, iov.ptr, iov.len, @bitCast(offset));
+        switch (linux.errno(rc)) {
+            .SUCCESS => return rc,
+            .INTR => {},
+            .INVAL => |err| return errnoBug(err),
+            .FAULT => |err| return errnoBug(err),
+            .DESTADDRREQ => |err| return errnoBug(err), // `connect` was never called.
+            .CONNRESET => |err| return errnoBug(err), // Not a socket handle.
+            .BADF => return error.NotOpenForWriting, // Can be a race condition.
+            .AGAIN => return error.WouldBlock,
+            .DQUOT => return error.DiskQuota,
+            .FBIG => return error.FileTooBig,
+            .IO => return error.InputOutput,
+            .NOSPC => return error.NoSpaceLeft,
+            .PERM => return error.PermissionDenied,
+            .PIPE => return error.BrokenPipe,
+            .BUSY => return error.DeviceBusy,
+            .TXTBSY => return error.FileBusy,
+            .NXIO, .SPIPE, .OVERFLOW => return error.Unseekable,
             else => |err| return unexpectedErrno(err),
         }
     }
