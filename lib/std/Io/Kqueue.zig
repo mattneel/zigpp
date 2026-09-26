@@ -757,6 +757,7 @@ fn parkFd(
     filter: Filter,
     timeout: Io.Timeout,
 ) ParkError!void {
+    if (timeoutElapsed(ev, timeout)) return error.Timeout;
     var registrations: [max_registrations]Registration = undefined;
     const count = parkRegistrations(ev, @intCast(fd), filter, timeout, &registrations);
     switch (try park(ev, region, registrations[0..count], null)) {
@@ -773,6 +774,7 @@ fn parkChild(
     pid: pid_t,
     timeout: Io.Timeout,
 ) ParkError!void {
+    if (timeoutElapsed(ev, timeout)) return error.Timeout;
     var registrations: [max_registrations]Registration = undefined;
     const count = parkRegistrations(ev, @intCast(pid), filt_proc, timeout, &registrations);
     switch (try park(ev, region, registrations[0..count], null)) {
@@ -784,6 +786,7 @@ fn parkChild(
 
 /// Parks the calling task for `timeout`, which may be a duration or a deadline.
 fn parkTimeout(ev: *Evented, region: *CancelRegion, timeout: Io.Timeout) Io.Cancelable!void {
+    if (timeoutElapsed(ev, timeout)) return;
     var registrations: [max_registrations]Registration = undefined;
     const count = parkRegistrations(ev, 0, 0, timeout, &registrations);
     assert(count == 1); // a timeout has a deadline
@@ -904,6 +907,7 @@ fn futexWait(
         scheduler.Futex.wait(ptr, expected, timeout_ns);
         return;
     }
+    if (timeoutElapsed(ev, timeout)) return; // the wait is over before it starts
     const w = Scheduler.Worker.current();
     const bucket = futexBucket(ev, ptr);
     var waiter: FutexWaiter = .{
@@ -2340,10 +2344,11 @@ fn connectUnixErrno(err: posix.E) net.UnixAddress.ConnectError {
 }
 
 /// Whether `timeout` has already passed, in which case no wait can be made for it: a park with
-/// no time left registers neither the event nor a timer, so it would never be woken.
+/// no time left registers neither the event nor a timer, so it would never be woken. A duration
+/// of zero and a deadline in the past are both over before the wait starts.
 fn timeoutElapsed(ev: *Evented, timeout: Io.Timeout) bool {
     const duration = timeout.toDurationFromNow(ev.io()) orelse return false;
-    return duration.raw.toNanoseconds() == 0;
+    return duration.raw.toNanoseconds() <= 0;
 }
 
 /// Waits for a connection that is being made to end, and returns how it went as the errno the
