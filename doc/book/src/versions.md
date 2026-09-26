@@ -66,8 +66,11 @@ Each release carries:
 - `index.json`, the download index described below;
 - `SHA256SUMS`, the SHA-256 of every archive and of `index.json`.
 
-Publishing the same version twice replaces the assets, so a publish that failed
-halfway can be completed by re-running it.
+A published release is never changed. The assets go up to a draft, and the
+draft is published once they are all there, so a run that fails partway leaves
+a draft that nobody could download: running it again replaces the draft's files
+and publishes it. Running it again after it published changes nothing. The
+newest version is the latest release, whichever run finishes last.
 
 ## The download index
 

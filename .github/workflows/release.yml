@@ -213,22 +213,7 @@ jobs:
 
       # The tag names the base version without the build metadata: `+` is legal
       # in a tag, but awkward in URLs. build.zig and CMake ignore zigpp-* tags
-      # when they derive the version. A re-run of a run whose release already
-      # exists replaces its assets, so a publish that failed halfway can be
-      # completed.
+      # when they derive the version. A published release is never changed, and
+      # a draft that a failed run left is refilled and published; see publish.sh.
       - name: Publish the release
-        run: |
-          tag="zigpp-${VERSION%%+*}"
-          .github/scripts/index.py dist "$VERSION" "$tag" "${{ github.repository }}"
-          (cd dist && sha256sum zig-* index.json > SHA256SUMS)
-          if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release upload "$tag" --repo "${{ github.repository }}" --clobber \
-              dist/zig-* dist/index.json dist/SHA256SUMS
-          else
-            gh release create "$tag" \
-              --repo "${{ github.repository }}" \
-              --target "${{ github.sha }}" \
-              --title "Zig++ $VERSION" \
-              --generate-notes \
-              dist/zig-* dist/index.json dist/SHA256SUMS
-          fi
+        run: .github/scripts/publish.sh dist "$VERSION" "${{ github.sha }}" "${{ github.repository }}"
