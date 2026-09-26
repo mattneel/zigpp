@@ -92,14 +92,21 @@ jobs:
           share=$(( cores / 4 ))
           mkdir -p .suite-logs
 
+          # A suite runs all of its commands and fails if any of them did. The
+          # loop below runs each suite as the condition of an `if`, and bash
+          # ignores `set -e` in everything a condition runs, functions
+          # included: without `|| failed=1`, a suite's status would be its last
+          # command's alone.
           standard_library() {
-            zig build test-fmt -j"$share"
-            zig test lib/std/std.zig -lc -j"$share"
-            zig test test/behavior.zig -j"$share"
-            zig test lib/std/std.zig -lc -fllvm -j"$share"
-            zig test test/behavior.zig -fllvm -j"$share"
+            local failed=0
+            zig build test-fmt -j"$share" || failed=1
+            zig test lib/std/std.zig -lc -j"$share" || failed=1
+            zig test test/behavior.zig -j"$share" || failed=1
+            zig test lib/std/std.zig -lc -fllvm -j"$share" || failed=1
+            zig test test/behavior.zig -fllvm -j"$share" || failed=1
             # The Io tests again on Io.Threadz, where the host has it (Linux).
-            zig build test-threadz -j"$share"
+            zig build test-threadz -j"$share" || failed=1
+            return "$failed"
           }
 
           # Zig++ against C that the Clang in Zig++ compiled.
