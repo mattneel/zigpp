@@ -3602,12 +3602,20 @@ test "watchdog: with one worker, what a blocked task queued still runs" {
     const io = b.io();
 
     const S = struct {
-        /// Queues one task behind itself, then blocks the only worker in a raw futex wait
-        /// until that task has run, for ten seconds at most: with one worker, a computing task
+        /// Queues a task that fills the worker's slot for the next task, then the one this test
+        /// is about in the queue behind it, and then blocks the only worker in a raw futex wait
+        /// until the second has run, for ten seconds at most: with one worker, a computing task
         /// would hold it just as well, but a blocked one is what the replacement worker exists
         /// for, and the replacement is the only way that task runs. Waiting for the task rather
         /// than for a fixed time is what keeps the test true on a loaded machine.
+        ///
+        /// The slot filler is what makes the test true for a backend the watchdog cannot hand a
+        /// slot over for — one whose barrier is missing or answers that it cannot issue one:
+        /// the slot has one taker and it is the worker itself then, while the *queue* is a
+        /// stranded worker's like any other, so a task that is queued runs and one that is not
+        /// waits. The task that matters is queued for that reason.
         fn blocker(inner_io: Io, done: *std.atomic.Value(bool), word: *std.atomic.Value(u32), blocked: *std.atomic.Value(bool), release: *std.atomic.Value(u32), loop_ns: *std.atomic.Value(u64)) void {
+            var slot_filler = inner_io.concurrent(nothing, .{}) catch return;
             var future = inner_io.concurrent(short, .{ inner_io, done, word, blocked, release }) catch return;
             blocked.store(true, .release);
             // How long the loop really took, not how many steps it counted: a wait that returns
@@ -3621,7 +3629,12 @@ test "watchdog: with one worker, what a blocked task queued still runs" {
             loop_ns.store(testNow() -% started, .release);
             blocked.store(false, .release);
             future.await(inner_io);
+            slot_filler.await(inner_io);
         }
+
+        /// Fills the worker's slot for the next task, so that what the blocker queues next goes
+        /// to the queue instead.
+        fn nothing() void {}
 
         /// Records whether the task that holds the only worker was still blocked on it, then
         /// releases it and wakes the main task.
