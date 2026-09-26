@@ -255,6 +255,35 @@ pub fn wakeForeign(ev: *Evented, to: *Scheduler.Worker) void {
     ev.watchdog.wake(to);
 }
 
+/// Whether this process registered for the barrier below, once, and whether it can issue one.
+var barrier_registered: std.atomic.Value(bool) = .init(false);
+var barrier_available: std.atomic.Value(bool) = .init(true);
+
+/// For the scheduler: a barrier that makes this thread's earlier stores visible to every other
+/// thread of the process, after their own barriers. `false` when this process cannot issue one,
+/// on a kernel before 4.14 or under a seccomp filter, and the scheduler then has every taker of a
+/// slot for the next task pay a compare-exchange.
+///
+/// The expedited private command of `membarrier` has to be registered for first, once per
+/// process: registering again is free.
+pub fn heavyBarrier(ev: *Evented) bool {
+    _ = ev;
+    if (!barrier_registered.swap(true, .seq_cst)) {
+        switch (linux.errno(linux.membarrier(linux.MEMBARRIER.REGISTER_PRIVATE_EXPEDITED, 0, 0))) {
+            .SUCCESS => {},
+            else => {
+                barrier_available.store(false, .release);
+                std.log.scoped(.threadz).warn(
+                    "unable to issue a memory barrier for a stuck worker: membarrier is unavailable",
+                    .{},
+                );
+            },
+        }
+    }
+    if (!barrier_available.load(.monotonic)) return false;
+    return linux.errno(linux.membarrier(linux.MEMBARRIER.PRIVATE_EXPEDITED, 0, 0)) == .SUCCESS;
+}
+
 /// A worker's io_uring and the state that goes with it.
 const Thread = struct {
     io_uring: IoUring,

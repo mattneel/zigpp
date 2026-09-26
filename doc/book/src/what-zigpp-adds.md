@@ -192,7 +192,10 @@ const io = threadz.io();
   the next one goes to the back of its worker's queue, with its affinity
   unchanged. A worker takes the task it will run next, and a stuck worker's
   slot for that task is the watchdog's to hand to the shared queue, so that a
-  worker pays no locked instruction for its own. Counting operations without parking bounds what one task can take
+  worker pays no locked instruction for its own: the watchdog has the backend
+  issue a process-wide barrier, re-reads what that worker wrote at its last
+  switch, and takes the slot only when the worker has not switched since.
+  Counting operations without parking bounds what one task can take
   from a worker without ever blocking on it, and the count starts over at every
   park or yield. `scheduler.budget` is the 128.
 - Every task has an id, unique among the tasks the program made, and a name:
