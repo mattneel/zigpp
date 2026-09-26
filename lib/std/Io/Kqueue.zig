@@ -3695,26 +3695,41 @@ fn fileWriteFileStreaming(
             if (written < header.len) return written;
         }
     }
+    // The rest of the file is read through a buffer of this core's own, at the reader's
+    // position: the reader's interface has no say in how much is behind its position, and asking
+    // it to fill more than its own buffer would be a request it cannot grant.
+    var buffer: [16 * 1024]u8 = undefined;
     while (copied < @backingInt(limit)) {
-        if (file_reader.size) |size| if (size - file_reader.pos == 0) break;
-        const chunk = file_reader.interface.peekGreedy(1) catch |err| switch (err) {
-            error.EndOfStream => break,
-            error.ReadFailed => {
-                // A read that was canceled is not a read that failed, and the reader says which
-                // of its errors it was: the caller handles the cancelation on its own.
-                if (file_reader.err) |read_err| switch (read_err) {
-                    error.Canceled => return error.Canceled,
-                    else => {},
-                };
-                return error.ReadFailed;
-            },
+        if (file_reader.mode == .failure) {
+            if (written == 0) return error.ReadFailed;
+            break;
+        }
+        if (file_reader.size) |size| if (size == file_reader.pos) break;
+        const want = @min(buffer.len, @backingInt(limit) - copied);
+        const read_bytes = readFileChunk(
+            ev,
+            &region,
+            file_reader,
+            file_reader.file.handle,
+            buffer[0..want],
+            0,
+        ) catch |err| {
+            // What went out is this call's result; the caller sees the error next time.
+            if (written != 0) break;
+            return readChunkError(err);
         };
-        const data = limit.slice(chunk)[0..@min(chunk.len, @backingInt(limit) - copied)];
-        assert(data.len != 0); // the limit has room and the chunk has bytes, so this writes
-        const n = try fileWriteStreaming(ev, &region, file, &.{}, &.{data}, 1);
-        file_reader.interface.toss(n);
-        written += n;
-        copied += n;
+        if (read_bytes == 0) {
+            if (written != 0) break;
+            file_reader.size = file_reader.pos;
+            return error.EndOfStream;
+        }
+        var sent: usize = 0;
+        while (sent != read_bytes) {
+            sent += try fileWriteStreaming(ev, &region, file, &.{}, &.{buffer[sent..read_bytes]}, 1);
+        }
+        file_reader.pos += read_bytes;
+        written += read_bytes;
+        copied += read_bytes;
     }
     // Nothing to write at all is the end of the stream; anything written is this call's result.
     if (written == 0) return error.EndOfStream;
@@ -3732,6 +3747,7 @@ fn fileWriteFilePositional(
     offset: u64,
 ) File.WriteFilePositionalError!usize {
     charge(userdata);
+    const ev: *Evented = @ptrCast(@alignCast(userdata));
     var written: usize = 0;
     var copied: usize = 0;
     {
@@ -3751,24 +3767,39 @@ fn fileWriteFilePositional(
             if (written < header.len) return written;
         }
     }
+    var region: CancelRegion = .init();
+    defer region.deinit();
+    var buffer: [16 * 1024]u8 = undefined;
     while (copied < @backingInt(limit)) {
-        if (file_reader.size) |size| if (size - file_reader.pos == 0) break;
-        const chunk = file_reader.interface.peekGreedy(1) catch |err| switch (err) {
-            error.EndOfStream => break,
-            error.ReadFailed => {
-                if (file_reader.err) |read_err| switch (read_err) {
-                    error.Canceled => return error.Canceled,
-                    else => {},
-                };
-                return error.ReadFailed;
-            },
+        if (file_reader.mode == .failure) {
+            if (written == 0) return error.ReadFailed;
+            break;
+        }
+        if (file_reader.size) |size| if (size == file_reader.pos) break;
+        const want = @min(buffer.len, @backingInt(limit) - copied);
+        const read_bytes = readFileChunk(
+            ev,
+            &region,
+            file_reader,
+            file_reader.file.handle,
+            buffer[0..want],
+            0,
+        ) catch |err| {
+            if (written != 0) break;
+            return readChunkError(err);
         };
-        const data = limit.slice(chunk)[0..@min(chunk.len, @backingInt(limit) - copied)];
-        assert(data.len != 0); // the limit has room and the chunk has bytes, so this writes
-        const n = try fileWritePositional(userdata, file, &.{}, &.{data}, 1, offset + copied);
-        file_reader.interface.toss(n);
-        written += n;
-        copied += n;
+        if (read_bytes == 0) {
+            if (written != 0) break;
+            file_reader.size = file_reader.pos;
+            return error.EndOfStream;
+        }
+        var sent: usize = 0;
+        while (sent != read_bytes) {
+            sent += try fileWritePositional(userdata, file, &.{}, &.{buffer[sent..read_bytes]}, 1, offset + copied);
+        }
+        file_reader.pos += read_bytes;
+        written += read_bytes;
+        copied += read_bytes;
     }
     if (written == 0) return error.EndOfStream;
     return written;
