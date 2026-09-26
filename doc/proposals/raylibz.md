@@ -14,6 +14,29 @@ It is a thin, 1:1 wrapper over raylib's own translated headers, built with rayli
 script, consumed through the workflow Zig++ blesses for any C library. It adds nothing raylib does
 not have, renames nothing beyond Zig casing, hides nothing, and never forks raylib.
 
+## Status
+
+Accepted on 26 September 2026 and built: [mattneel/raylibz](https://github.com/mattneel/raylibz)
+wraps every function of `raylib.h` and `raymath.h`, its parity check passes, and CI builds it on
+Linux, macOS and Windows. Five decisions changed after this document was written, and the passages
+they touch say so:
+
+- **raylib is forked.** The BDFL chose a fork over upstream pull requests: raylib's and
+  zemscripten's build scripts moved to Zig++'s build API in
+  [mattneel/raylib](https://github.com/mattneel/raylib) and
+  [mattneel/zemscripten](https://github.com/mattneel/zemscripten), on a `zigpp` branch that
+  merges upstream. raylib's own C and its headers are unchanged; the one C change is a bounds
+  fix in minigamepad, the gamepad library raylib vendors with RGFW, which a Zig++ Debug build
+  stopped at.
+- **The fork follows raylib's master**, not the `6.0` tag: raylib 6.1-dev at the pin, whose
+  `raylib.h` has 619 functions, not 600.
+- **Nothing is tagged.** raylibz, the fork and its consumers pin commits, the way a Zig++
+  project pins a Zig++ build; there is no raylibz 6.0.0.
+- **Mirrors cross the boundary with a pointer cast**, `cast.as`, because this compiler rejects
+  `@bitCast` to and from an `extern struct`. The layout asserts are what make it sound.
+- **raylib's core module is three files**, `core.zig`, `files.zig` and `input.zig`, split at
+  `raylib.h`'s own section comments.
+
 ## Thanks
 
 To Ramon Santamaria (raysan) and raylib's contributors: thank you. raylib has taught a great many
@@ -67,7 +90,8 @@ blessed packages will walk through raylibz as that example.
 4. **Put the wrapper on top.** `raylibz` is a Zig module that imports the translation and
    re-exposes it under the rules of the next section.
 
-**Step 2 does not work today.** raylib 6.0's `build.zig` is written for Zig 0.16.0's build API
+**Step 2 did not work when this was written.** *(The fork has since moved both build
+scripts to Zig++'s build API; see Status.)* raylib 6.0's `build.zig` is written for Zig 0.16.0's build API
 (`build.zig.zon`: `minimum_zig_version = "0.16.0"`). Zig++ tracks upstream Zig's master, whose
 build system has moved on, and this tree's `zig build` rejects the script:
 
@@ -111,7 +135,7 @@ from those listed here. The check references each of the others, and compiles:
 | --- | --- | --- |
 | Coverage | 1:1 with `raylib.h`. Every one of its 600 functions is wrapped, re-exported unchanged, or listed in `not_wrapped.zig` with a reason. `tests/parity.zig` walks the translated module's function declarations and fails on any that is in none of the three. | raylib's API is the spec. A wrapper that silently drops a function has changed the spec. |
 | Names | raylib's, in Zig case: `InitWindow` → `initWindow`, `IsKeyPressed` → `isKeyPressed`. Struct names are unchanged: `Vector2`, `Texture2D`, `Camera3D`. | Anyone who knows raylib already knows raylibz. Its cheatsheet stays the documentation. |
-| Structs | `extern struct` mirrors, field for field. A comptime block asserts `@sizeOf`, `@alignOf` and every field's `@offsetOf` against the translated type. They cross the boundary with `@bitCast`. | A mirror can carry methods, which a translated type cannot. The asserts make a layout drift a compile error, not a crash. |
+| Structs | `extern struct` mirrors, field for field. A comptime block asserts `@sizeOf`, `@alignOf` and every field's `@offsetOf` against the translated type. They cross the boundary with `@bitCast`, spelled `cast.as` (a pointer cast) because the compiler rejects `@bitCast` of an `extern struct`. | A mirror can carry methods, which a translated type cannot. The asserts make a layout drift a compile error, not a crash. |
 | Text | Text parameters take `[:0]const u8`, so a string literal passes as is. | raylib wants NUL-terminated strings, and Zig's literals already are. |
 | Buffers | Pointer-and-count pairs become slices, in and out: `loadFileData(path) ?[]u8`, null where raylib returns `NULL`, rather than a pointer plus an `*c_int`. | The count is part of the value. |
 | Loading | A load function that raylib pairs with an `Is*Valid` check returns `error{LoadFailed}!T`, having made that check. raylib 6.0 has 12 such checks, for shaders, images, textures, render textures, fonts, models, materials, model animations, waves, sounds, music and audio streams. `IsFileNameValid` is not one of them. | raylib signals a failed load with a value that fails its `Is*Valid` check. An error union makes the check impossible to forget, and costs exactly the call raylib's examples make anyway. |
@@ -161,8 +185,10 @@ it.
 
 ## Versioning
 
-raylibz's major and minor versions track raylib's: raylibz 6.0.x wraps raylib 6.0. The patch
-version is the wrapper's own. The first release is 6.0.0.
+*(Superseded: raylibz is pinned by commit and never tagged. The version in its
+`build.zig.zon` is metadata, `6.1.0-dev` for raylib 6.1-dev.)* raylibz's major and minor versions
+track raylib's: raylibz 6.0.x wraps raylib 6.0. The patch version is the wrapper's own. The first
+release is 6.0.0.
 
 raylibz's `build.zig.zon` names, as its `minimum_zig_version`, the Zig++ release it is tested with.
 Zig++'s version dispatch runs that release inside raylibz's own tree. Projects that depend on
@@ -180,7 +206,8 @@ raylibz keep their own pin.
 
 ## Non-goals
 
-- **Forking raylib.** raylibz consumes raylib's releases as raysan publishes them. Any C-side fix
+- **Forking raylib.** *(Reversed by the BDFL on 26 September 2026: raylib is forked for its
+  build scripts only; see Status.)* raylibz consumes raylib's releases as raysan publishes them. Any C-side fix
   goes upstream first, and raylibz waits for it rather than carry a patch.
 - **Wrapping rlgl.** It is raylib's low-level GL layer. It is re-exported raw, for the programs
   that need it.
