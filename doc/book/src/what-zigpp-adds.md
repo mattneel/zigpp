@@ -197,6 +197,16 @@ processes, timers, futexes, and file reads are ring operations. The file
 operations io_uring can only finish on a kernel thread of its own, such as
 writes to a file, `statx`, and creating a file, are made on the worker instead,
 because the trip to that thread and back costs more than the call.
+
+A task that drives io_uring itself, such as a server's event loop, can borrow
+its worker's ring instead of making one of its own. `acquireRing` lends it to a
+task pinned to that worker. The task queues SQEs on the ring with
+`ring_owner_bit` set in their `user_data`, and `Ring.waitCqes` parks it until
+one of its completions arrives. The worker handles every other completion as
+before and runs its other tasks while the loop is parked. `fromIo` finds the
+Threadz behind an `Io`, and `workerLimit` says how many workers a program may
+pin tasks to.
+
 `zig build test-threadz` runs the `Io` tests on Threadz, and the test runner's
 `--io=threadz` runs any test on it. The design, and the steps still to come (a
 cooperative budget, a pool for blocking calls, a watchdog, and the kqueue and

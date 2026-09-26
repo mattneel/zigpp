@@ -62,6 +62,7 @@ that cannot be a configuration flag, and it is why they stay two constructors.
 | Runaway tasks | Work stealing contains a spinning task to one worker. A watchdog thread notices a worker that has not yielded in *N* ms, hands its run queue to a replacement worker, records a metric, and names the task. | Most of what preemption buys a server runtime, with nothing from the compiler. |
 | Stacks | Pooled, guarded by one page, lazily committed by the OS, released with `MADV_DONTNEED` beyond the pool size. Reservation is per spawn: 256 KiB default for tasks, large (the current 60 MiB) for the compiler's own Sema work. No growth. | Growable stacks need pointer maps Zig does not have. The compiler's recursion is why `Uring` reserves 60 MiB today; lazy commit makes a big reservation cost only its mapping. One mapping per task meets `vm.max_map_count` near 65k tasks; that is a sysctl, and the docs say so. |
 | Io calls | Sockets, timers, sleeps, futexes and file reads submit to the core and park the task. File operations the core can only finish on a kernel thread of its own (on Linux: positional writes, `statx`, `ftruncate`, opens that create or truncate, and directory changes) are made on the worker instead. | Upstream `Io` semantics; only the mechanism differs. The trip to the kernel thread and back costs more than the call: with every file write taking it, the compiler took 130 s to build itself at `-j8`, against 20-23 s with the writes made on the worker, as on `Threaded`. |
+| Rings | A task pinned to a worker may borrow the worker's io_uring (`acquireRing`) and drive operations of its own on it. The SQEs it queues carry `ring_owner_bit` in `user_data`, and `Ring.waitCqes` parks it until one of their completions arrives. The worker handles every other completion as before. A ring has one owner at a time. | Zix's loops keep their multishot receives, provided buffer rings and batched submissions, which `Io` has no vocabulary for. A loop on a ring of its own would block its worker in the kernel. |
 | Park, never block | Every wait inside Threadz ends at park. `Threaded`'s private helpers, including its own `Future` and `Group` waits, block on the OS futex; Threadz does not copy them. | A thread blocked inside a task is a worker lost. |
 | Blocking | `io.blocking(fn, args)` runs on the dirty pool, which is an `Io.Threaded` instance. | Zix sets threads aside for blocking work; the BEAM calls them dirty schedulers. One implementation. |
 | Extern calls | Not implicitly blocking. Long C calls use `io.blocking`; the watchdog covers the ones that forgot. | Per-call handoff would tax every FFI call for the few that block. |
@@ -101,10 +102,11 @@ pinning. The stealing policy comes from the table above, not from the current co
    stacks with per-spawn size; the affinity rule in `schedule`; networking finished.
    Acceptance: `Io/test.zig` passes on Threadz; the compiler builds on Threadz with `-j` honored.
 3. **Zix on Threadz.** The native loops become pinned tasks, one per worker, each with its
-   `SO_REUSEPORT` listener; buffers pinned with them or moved to arenas. Acceptance: parity with
-   zix's recorded numbers measured on the same host with `localbench-isolate.sh` for
-   `http1-uring`, `http1-ws-uring`, `http2-uring`, `http2-grpc-uring` and `http3-uring`. The
-   recorded results are undated, so the baseline is re-measured first.
+   `SO_REUSEPORT` listener and its worker's ring; buffers pinned with them or moved to arenas.
+   Acceptance: parity with zix's recorded numbers measured on the same host with
+   `localbench-isolate.sh` for `http1-uring`, `http1-ws-uring`, `http2-uring`,
+   `http2-grpc-uring` and `http3-uring`. The recorded results are undated, so the baseline is
+   re-measured first.
 4. **Budget, blocking, watchdog.** Acceptance: a spinning task costs one worker and nothing else
    waits; a blocking C call inside a task is detected and named.
 5. **The other cores.** `Kqueue` rewritten on the shared scheduler for macOS and BSD; `Dispatch`
