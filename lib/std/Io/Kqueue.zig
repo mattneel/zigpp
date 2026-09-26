@@ -950,6 +950,13 @@ fn futexWait(
 
 fn futexWaitUncancelable(userdata: ?*anyopaque, ptr: *const u32, expected: u32) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
+    if (Scheduler.Worker.currentOrNull() == null) {
+        // A thread that is not one of the workers has no task to park, and nothing it does is
+        // cancelable: it waits in the kernel, where a wake of the kernel reaches it. The
+        // watchdog's own mutex is one of these, taken while it allocates its samples.
+        scheduler.Futex.wait(ptr, expected, null);
+        return;
+    }
     const w = Scheduler.Worker.current();
     const bucket = futexBucket(ev, ptr);
     var waiter: FutexWaiter = .{
