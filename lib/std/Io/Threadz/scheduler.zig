@@ -2076,10 +2076,14 @@ pub fn Scheduler(comptime Backend: type) type {
             const end = @intFromPtr(mapping.ptr) + mapping.len;
             const task: *Task = @ptrFromInt(std.mem.alignBackward(usize, end - result_space - @sizeOf(Task), @alignOf(Task)));
             const context_bytes: [*]u8 = @ptrFromInt(context_alignment.backward(@intFromPtr(task) - context.len));
+            // The inherited bindings sit below the arguments, and the stack starts below them:
+            // the stack grows down from its pointer, so anything under it would be grown over.
+            // The layout, from the top of the mapping down, is
+            // `result, task, arguments, inherited bindings, stack, guard page`.
             const scopes_base: [*]align(@alignOf(Io.Scopes)) u8 = @ptrFromInt(Alignment.of(Io.Scopes).backward(
                 @intFromPtr(context_bytes) - scopes_bytes,
             ));
-            const sp = std.mem.alignBackward(usize, @intFromPtr(context_bytes), 16);
+            const sp = std.mem.alignBackward(usize, @intFromPtr(scopes_base), 16);
             task.* = .{
                 .context = switch (builtin.cpu.arch) {
                     .aarch64, .riscv64 => .{ .sp = sp, .fp = @intFromPtr(task), .pc = @intFromPtr(&taskEntry) },

@@ -2736,7 +2736,6 @@ pub const TypeErasedQueue = struct {
         return @atomicLoad(u64, &q.dropped, .monotonic);
     }
 
-
     /// After this is called, the queue enters a "closed" state. A closed
     /// queue always returns `error.Closed` for put attempts even when
     /// there is space in the buffer. However, existing elements of the

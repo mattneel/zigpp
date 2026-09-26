@@ -1398,18 +1398,21 @@ test "Queue overflow policy" {
     // `.block`, the default: a put of a full queue waits for a getter instead of dropping.
     {
         var queue: Io.Queue(u32) = .init(&buffer);
+        // The queue is full before the producer exists, and nothing is waiting on it, so the
+        // producer's put cannot finish until the get below makes room.
+        try expectEqual(4, try queue.put(io, &.{ 1, 2, 3, 4 }, 0));
         const Producer = struct {
-            fn put(io_: Io, q: *Io.Queue(u32), done: *bool) void {
+            fn put(io_: Io, q: *Io.Queue(u32), done: *std.atomic.Value(bool)) void {
                 q.putOne(io_, 5) catch {};
-                done.* = true;
+                done.store(true, .release);
             }
         };
-        var done = false;
+        var done: std.atomic.Value(bool) = .init(false);
         var future = try io.concurrent(Producer.put, .{ io, &queue, &done });
-        // The producer is waiting on the full queue; this get is what lets it finish.
+        try expect(!done.load(.acquire));
         try expectEqual(4, try queue.get(io, &got, 4));
         future.await(io);
-        try expect(done);
+        try expect(done.load(.acquire));
         try expectEqual(0, queue.droppedElements());
         try expectEqual(1, try queue.get(io, &got, 1));
         try expectEqual(5, got[0]);
