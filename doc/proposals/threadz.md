@@ -115,19 +115,20 @@ pinning. The stealing policy comes from the table above, not from the current co
    Threadz runs it on a dirty pool, an `Io.Threaded` instance the instance owns and starts with
    the first such call, parking the calling task with the argument and result slots on its own
    stack; it is not cancelable once started. One watchdog thread per instance, started with the
-   first worker past worker 0, samples every worker every 10 ms: a worker whose current task has
-   not switched out for 100 ms is stuck, its queued tasks become takeable by every other worker
-   whatever their number, one replacement worker is started for it and released when it switches
-   again, `Threadz.stats()` counts the episodes, and one `std.log` line scoped `.threadz` names the
-   task, by id and by the function it was spawned with, which is what tasks are named by now (see
-   below). The watchdog starts with the first task the instance makes or runs, so a worker limit
-   of one still reports and replaces. A stuck worker's slot for the next task is the watchdog's to
-   put in the shared queue, which is what lets a worker take its own slot with a plain load and
-   store: the watchdog sets a flag, has the backend issue a process-wide barrier (`membarrier` on
-   Linux, behind the scheduler's backend contract so that a core for another system can say it
-   cannot), and re-reads the two words the worker stores at every switch; if it sees no change it
-   takes the slot with a compare-exchange, which the worker also uses when it sees the flag or
-   when its backend cannot issue a barrier. Pinned tasks stay put on a stuck worker. Acceptance: a spinning task costs one worker
+   first task the instance makes or runs, samples every worker every 10 ms: a worker whose current
+   task has not switched out for 100 ms is stuck, its queued tasks become takeable by every other
+   worker whatever their number, one replacement worker is started for it and released when it
+   switches again, `Threadz.stats()` counts the episodes, and one `std.log` line scoped `.threadz`
+   names the task, by id and by the function it was spawned with, which is what tasks are named by
+   now (see below). An instance whose worker limit is one still reports and replaces, and with
+   every worker parked the watchdog sleeps until one unparks. A stuck worker's slot for the next
+   task is the watchdog's to put in the shared queue, which is what lets a worker take its own
+   slot with a plain load and store: the watchdog sets a flag, has the backend issue a
+   process-wide barrier (`membarrier` on Linux, behind the scheduler's backend contract so that a
+   core for another system can say it cannot), and re-reads the two words the worker stores at
+   every switch; if it sees no change it takes the slot with an atomic exchange, and the worker
+   takes it with a compare-exchange when it sees the flag or when its backend cannot issue a
+   barrier. Pinned tasks stay put on a stuck worker. Acceptance: a spinning task costs one worker
    and nothing else waits; a blocking C call inside a task is detected and named.
 
    Shipped: the spin test queues 32 tasks behind a task that spins for 500 ms with no Io call and
@@ -137,7 +138,7 @@ pinning. The stealing policy comes from the table above, not from the current co
    a worker shared with one other task let that task run first. Task names come from
    `Io.spawnedName`, a comptime instantiation whose type name carries the function's declaration
    name, since the language has no reflection from a function value to its declaration; ids come
-   from one counter for the program. Step 5 below adds the naming API on top.
+   from one counter for the program. Step 7 below adds the naming API on top.
 5. **The other cores.** `Kqueue` rewritten on the shared scheduler for macOS and BSD; `Dispatch`
    retired once it reaches parity; IOCP and the Windows fiber work last.
 6. **BEAM shapes.** Arenas, `Io.Scoped`, `Io.Supervisor`, overflow policies.

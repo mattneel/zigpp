@@ -26,7 +26,8 @@
 //! for a stuck worker: makes its queued tasks takeable whatever their number, starts one
 //! replacement worker so that parallelism stays, counts the episode, and names the task in one
 //! log line. A task that owns its worker's resources, being pinned, waits for the worker instead;
-//! see `Affinity.pinned`. The watchdog costs a relaxed store per switch and nothing else.
+//! see `Affinity.pinned`. A worker pays one store per switch for the watchdog, of the task it
+//! runs, and one load of a flag when it takes the task in its slot; nothing else.
 //!
 //! A backend embeds the scheduler as its field `sched` and declares:
 //! * `Worker`, its state for each worker, with `workerInit`, `workerStart` (called on the worker's

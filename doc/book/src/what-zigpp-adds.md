@@ -221,15 +221,16 @@ const io = threadz.io();
   for it and the one in its slot for the next task, become takeable by every
   worker whatever their number; and one replacement worker is started for it,
   so that parallelism stays, which stops once it has nothing to run and the
-  stuck worker switches out again. A worker with a limit of one is enough for
-  this: the replacement is where the tasks behind the stuck one run. Pinned
-  tasks on a stuck worker wait for the worker, which they own the resources of.
-  `Threadz.stats()` reads the counters: workers running, replacements, workers
-  stuck now, stuck episodes, the rounds of samples the watchdog made, and the
-  task of the last episode. The watchdog costs two relaxed stores per switch
-  and nothing else, and it waits without a timeout while every worker is
-  parked, so an idle program is not woken to sample workers that are all
-  asleep.
+  stuck worker switches out again. An instance whose worker limit is one is
+  covered too: the replacement is where the tasks behind the stuck one run.
+  Pinned tasks on a stuck worker wait for the worker, which they own the
+  resources of. `Threadz.stats()` reads the counters: workers running,
+  replacements, workers stuck now, stuck episodes, the rounds of samples the
+  watchdog made, and the task of the last episode. A worker pays one store per
+  switch for the watchdog, of the task it runs, and one load of a flag when it
+  takes the task in its slot. The watchdog waits without a timeout while every
+  worker is parked, so an idle program is not woken to sample workers that are
+  all asleep.
 - Threads outside the pool can use the synchronization primitives, whose
   futexes they wait on in the kernel. Other `Io` calls from those threads are
   not supported yet.
