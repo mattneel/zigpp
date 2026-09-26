@@ -524,7 +524,7 @@ pub fn build(b: *std.Build) !void {
             .filters = if (test_filters.len != 0)
                 test_filters
             else
-                &.{ "Io.test.test.", "Io.net.test.test.", "Io.Threadz" },
+                &.{ "Io.test.test.", "Io.net.test.test.", "Io.Threadz", "Io.Uring.test." },
             .zig_lib_dir = b.path("lib"),
         });
         const run_threadz_tests = b.addRunArtifact(threadz_tests);

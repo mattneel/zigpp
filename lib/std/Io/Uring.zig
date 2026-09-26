@@ -81,6 +81,8 @@ csprng: Csprng,
 const Thread = struct {
     io_uring: IoUring,
     csprng: Csprng,
+    /// The task that has acquired this ring, if any. See `Ring`.
+    owner: RingOwner,
 
     fn current() *Thread {
         return &Scheduler.Worker.current().backend;
@@ -104,6 +106,16 @@ const Thread = struct {
             else => |e| @panic(@errorName(e)),
         };
     }
+};
+
+const RingOwner = struct {
+    task: ?*Fiber = null,
+    /// Set while the owner is parked in `Ring.waitCqes`.
+    waiting: bool = false,
+    /// Completions of the owner's operations that `poll` took off the ring while the owner was
+    /// not waiting, oldest first from `head`.
+    queue: std.ArrayList(linux.io_uring_cqe) = .empty,
+    head: usize = 0,
 };
 
 /// For the scheduler: a worker's state in this backend.
@@ -595,6 +607,93 @@ pub fn setWorkerLimit(ev: *Evented, n: usize) void {
     ev.sched.setWorkerLimit(n);
 }
 
+/// The number of workers this instance may run, counting the thread that called `init`. A task
+/// pinned to a worker has an index below this.
+pub fn workerLimit(ev: *Evented) u32 {
+    return ev.sched.limit.load(.monotonic);
+}
+
+/// The `Evented` behind `any_io`, or `null` if `any_io` is another `Io` implementation.
+pub fn fromIo(any_io: Io) ?*Evented {
+    return if (any_io.vtable.operate == &operate) @ptrCast(@alignCast(any_io.userdata)) else null;
+}
+
+/// The bit of an SQE's `user_data` that makes its completion the ring owner's. Threadz's own
+/// operations leave it clear.
+pub const ring_owner_bit: u64 = 1 << 63;
+
+/// A worker's io_uring, lent to a task pinned to that worker that drives operations of its own,
+/// such as a server's event loop. The task queues SQEs on `uring` with `ring_owner_bit` set in
+/// their `user_data`, and takes their completions with `copyCqes` and `waitCqes`. The worker
+/// handles every other completion as before, so the owner and the worker's other tasks share
+/// the ring, and the owner parks rather than blocking its worker.
+pub const Ring = struct {
+    ev: *Evented,
+    worker: *Scheduler.Worker,
+
+    /// The worker's ring, for SQEs, `submit`, and registering buffer rings. Its completions are
+    /// taken with `copyCqes` and `waitCqes`, never with its own `copy_cqes`.
+    pub fn uring(r: Ring) *IoUring {
+        return &r.worker.backend.io_uring;
+    }
+
+    /// Submits the queued SQEs, then copies up to `cqes.len` completions of the owner's
+    /// operations, oldest first, and returns how many. The worker's other completions found on
+    /// the way are handled. Does not park.
+    pub fn copyCqes(r: Ring, cqes: []linux.io_uring_cqe) usize {
+        const thread = &r.worker.backend;
+        const owner = &thread.owner;
+        assert(owner.task == r.worker.currentTask());
+        const queued = owner.queue.items[owner.head..];
+        const n = @min(queued.len, cqes.len);
+        @memcpy(cqes[0..n], queued[0..n]);
+        owner.head += n;
+        if (owner.head == owner.queue.items.len) {
+            owner.queue.clearRetainingCapacity();
+            owner.head = 0;
+        }
+        enterRing(thread, .nonblocking);
+        return n + drain(r.ev, r.worker, cqes[n..]);
+    }
+
+    /// `copyCqes`, parking the task until at least one completion of its own has arrived. Not
+    /// cancelable: a loop that waits here stops on an operation of its own, such as a
+    /// `MSG_RING` from the task that stops it.
+    pub fn waitCqes(r: Ring, cqes: []linux.io_uring_cqe) usize {
+        assert(cqes.len != 0);
+        while (true) {
+            const n = r.copyCqes(cqes);
+            if (n != 0) return n;
+            r.worker.backend.owner.waiting = true;
+            r.ev.sched.park();
+        }
+    }
+
+    /// Ends the loan. Completions of operations still in flight are dropped, so the owner reaps
+    /// or cancels its operations first.
+    pub fn release(r: Ring) void {
+        const owner = &r.worker.backend.owner;
+        assert(owner.task == r.worker.currentTask());
+        owner.task = null;
+        owner.waiting = false;
+        owner.queue.clearRetainingCapacity();
+        owner.head = 0;
+    }
+};
+
+/// Lends the calling task its worker's ring until `Ring.release`. The task must be pinned, since
+/// the ring belongs to the worker; see `SpawnOptions`. A ring has one owner at a time.
+pub fn acquireRing(ev: *Evented) error{ NotPinned, RingOwned, OutOfMemory }!Ring {
+    const worker = Scheduler.Worker.current();
+    const task = worker.currentTask();
+    if (task.affinity != .pinned) return error.NotPinned;
+    const owner = &worker.backend.owner;
+    if (owner.task != null) return error.RingOwned;
+    try owner.queue.ensureTotalCapacity(std.heap.page_allocator, worker.backend.io_uring.cq.cqes.len);
+    owner.task = task;
+    return .{ .ev = ev, .worker = worker };
+}
+
 pub const Completion = struct {
     result: i32,
     flags: u32,
@@ -636,6 +735,7 @@ pub fn workerInit(ev: *Evented, worker: *Scheduler.Worker) !void {
             break :ring try .init_params(entries, &params);
         },
         .csprng = .uninitialized,
+        .owner = .{},
     };
 }
 
@@ -652,121 +752,170 @@ pub fn workerStart(ev: *Evented, worker: *Scheduler.Worker) void {
 /// For the scheduler.
 pub fn workerDeinit(ev: *Evented, worker: *Scheduler.Worker) void {
     _ = ev;
+    worker.backend.owner.queue.deinit(std.heap.page_allocator);
     worker.backend.io_uring.deinit();
 }
 
 /// For the scheduler: submits this worker's queued operations, then hands each task whose
 /// operation finished back to the scheduler. `.block` first waits for at least one completion.
 pub fn poll(ev: *Evented, worker: *Scheduler.Worker, mode: scheduler.PollMode) void {
-    const thread = &worker.backend;
+    enterRing(&worker.backend, mode);
+    _ = drain(ev, worker, &.{});
+}
+
+/// Submits the queued operations and, for `.block`, waits for a completion. A nonblocking call
+/// enters the kernel only to submit, or to run the completion work the kernel has flagged:
+/// completions it has already posted are in the ring.
+fn enterRing(thread: *Thread, mode: scheduler.PollMode) void {
     const ring = &thread.io_uring;
-    // A nonblocking poll enters the kernel only to submit, or to run the completion work the
-    // kernel has flagged. Completions it has already posted are in the ring.
-    const enter = switch (mode) {
-        .block => true,
-        .nonblocking => ring.sq_ready() != 0 or @atomicLoad(u32, ring.sq.flags, .unordered) &
-            (linux.IORING_SQ_TASKRUN | linux.IORING_SQ_CQ_OVERFLOW) != 0,
-    };
-    if (enter) _ = ring.submit_and_wait(switch (mode) {
+    switch (mode) {
+        .block => {},
+        .nonblocking => if (ring.sq_ready() == 0 and @atomicLoad(u32, ring.sq.flags, .unordered) &
+            (linux.IORING_SQ_TASKRUN | linux.IORING_SQ_CQ_OVERFLOW) == 0) return,
+    }
+    _ = ring.submit_and_wait(switch (mode) {
         .nonblocking => 0,
         .block => 1,
     }) catch |err| switch (err) {
         error.SignalInterrupt => {},
         else => |e| @panic(@errorName(e)),
     };
+}
+
+/// Handles the completions in the worker's ring, oldest first, and returns how many of the ring
+/// owner's it copied to `owner_cqes`, which is where they go while there is room. Called from
+/// `poll`, with no room, it leaves them to the owner: if the owner waits in `Ring.waitCqes`, the
+/// first one stays in the ring and the owner is made runnable; if not, they move to its queue.
+fn drain(ev: *Evented, worker: *Scheduler.Worker, owner_cqes: []linux.io_uring_cqe) usize {
+    const thread = &worker.backend;
+    const cq = &thread.io_uring.cq;
+    var copied: usize = 0;
     while (true) {
-        var cqes_buffer: [1 << 8]linux.io_uring_cqe = undefined;
-        const cqes = cqes_buffer[0 .. thread.io_uring.copy_cqes(&cqes_buffer, 0) catch |err| switch (err) {
-            error.SignalInterrupt => 0,
-            else => |e| @panic(@errorName(e)),
-        }];
-        if (cqes.len == 0) return;
-        for (cqes) |cqe| if (cqe.flags & linux.IORING_CQE_F_SKIP == 0) switch (@as(
-            Completion.Userdata,
-            @fromBackingInt(@intCast(cqe.user_data)),
-        )) {
-            .unused => unreachable, // bad submission queued?
-            .wakeup => {},
-            .futex_wake => switch (Completion.errno(.{ .result = cqe.res, .flags = cqe.flags })) {
-                .SUCCESS => recoverableOsBugDetected(), // success is skipped
-                .INVAL => {}, // invalid futex_wait() on ptr done elsewhere
-                .INTR, .CANCELED => recoverableOsBugDetected(), // `Completion.Userdata.futex_wake` is not cancelable
-                .FAULT => {}, // pointer became invalid while doing the wake
-                else => recoverableOsBugDetected(), // deadlock due to operating system bug
-            },
-            .close => switch (Completion.errno(.{ .result = cqe.res, .flags = cqe.flags })) {
-                .BADF => recoverableOsBugDetected(), // Always a race condition.
-                .INTR => {}, // This is still a success. See https://github.com/ziglang/zig/issues/2425
-                else => {},
-            },
-            .cleanup => @panic("failed to notify another worker"),
-            _ => if (@as(?*Fiber, ready_fiber: switch (@as(u2, @truncate(cqe.user_data))) {
-                0b00 => {
-                    const ready_fiber: *Fiber = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
-                    ready_fiber.resultPointer(Completion).* = .{
-                        .result = cqe.res,
-                        .flags = cqe.flags,
-                    };
-                    break :ready_fiber ready_fiber;
-                },
-                0b01 => {
-                    // Another worker asks this ring to cancel an operation it holds.
-                    thread.enqueue().* = .{
-                        .opcode = .ASYNC_CANCEL,
-                        .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
-                        .ioprio = 0,
-                        .fd = 0,
-                        .off = 0,
-                        .addr = cqe.user_data & ~@as(usize, 0b11),
-                        .len = 0,
-                        .rw_flags = 0,
-                        .user_data = @backingInt(Completion.Userdata.wakeup),
-                        .buf_index = 0,
-                        .personality = 0,
-                        .splice_fd_in = 0,
-                        .addr3 = 0,
-                        .resv = 0,
-                    };
-                    break :ready_fiber null;
-                },
-                0b10 => {
-                    const batch_userdata: *Io.Operation.Storage.Pending.Userdata =
-                        @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
-                    const batch: *Io.Batch = @ptrFromInt(batch_userdata[0]);
-                    var next: usize = 0b00;
-                    batch_userdata[0..3].* = .{ next, @as(u32, @bitCast(cqe.res)), cqe.flags };
-                    while (true) {
-                        next = @cmpxchgWeak(
-                            usize,
-                            @as(*usize, @ptrCast(&batch.userdata)),
-                            next,
-                            cqe.user_data,
-                            .release,
-                            .acquire,
-                        ) orelse break;
-                        batch_userdata[0] = next;
+        var head = cq.head.*;
+        const tail = @atomicLoad(u32, cq.tail, .acquire);
+        if (head == tail) return copied;
+        while (head != tail) {
+            const cqe = cq.cqes[head & cq.mask];
+            const owned = cqe.user_data & ring_owner_bit != 0;
+            if (owned and thread.owner.task != null and cqe.flags & linux.IORING_CQE_F_SKIP == 0) {
+                const owner = &thread.owner;
+                if (copied < owner_cqes.len) {
+                    owner_cqes[copied] = cqe;
+                    copied += 1;
+                } else if (owner_cqes.len != 0 or owner.waiting) {
+                    // Leave it for the owner, which is running or about to.
+                    @atomicStore(u32, cq.head, head, .release);
+                    if (owner.waiting) {
+                        owner.waiting = false;
+                        ev.sched.readyFromPoll(worker, owner.task.?);
                     }
-                    break :ready_fiber switch (@as(u2, @truncate(next))) {
-                        0b00, 0b01 => @ptrFromInt(next & ~@as(usize, 0b11)),
-                        0b10, 0b11 => null,
+                    return copied;
+                } else owner.queue.append(std.heap.page_allocator, cqe) catch {
+                    @atomicStore(u32, cq.head, head, .release);
+                    return copied;
+                };
+                head +%= 1;
+                continue;
+            }
+            // Consumed before it is handled: handling can submit, and the kernel can then post
+            // completions only into room it knows about.
+            head +%= 1;
+            @atomicStore(u32, cq.head, head, .release);
+            // An owner's completion with no owner left is dropped.
+            if (!owned) handleCompletion(ev, worker, cqe);
+        }
+        @atomicStore(u32, cq.head, head, .release);
+    }
+}
+
+fn handleCompletion(ev: *Evented, worker: *Scheduler.Worker, cqe: linux.io_uring_cqe) void {
+    const thread = &worker.backend;
+    if (cqe.flags & linux.IORING_CQE_F_SKIP != 0) return;
+    switch (@as(
+        Completion.Userdata,
+        @fromBackingInt(@intCast(cqe.user_data)),
+    )) {
+        .unused => unreachable, // bad submission queued?
+        .wakeup => {},
+        .futex_wake => switch (Completion.errno(.{ .result = cqe.res, .flags = cqe.flags })) {
+            .SUCCESS => recoverableOsBugDetected(), // success is skipped
+            .INVAL => {}, // invalid futex_wait() on ptr done elsewhere
+            .INTR, .CANCELED => recoverableOsBugDetected(), // `Completion.Userdata.futex_wake` is not cancelable
+            .FAULT => {}, // pointer became invalid while doing the wake
+            else => recoverableOsBugDetected(), // deadlock due to operating system bug
+        },
+        .close => switch (Completion.errno(.{ .result = cqe.res, .flags = cqe.flags })) {
+            .BADF => recoverableOsBugDetected(), // Always a race condition.
+            .INTR => {}, // This is still a success. See https://github.com/ziglang/zig/issues/2425
+            else => {},
+        },
+        .cleanup => @panic("failed to notify another worker"),
+        _ => if (@as(?*Fiber, ready_fiber: switch (@as(u2, @truncate(cqe.user_data))) {
+            0b00 => {
+                const ready_fiber: *Fiber = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
+                ready_fiber.resultPointer(Completion).* = .{
+                    .result = cqe.res,
+                    .flags = cqe.flags,
+                };
+                break :ready_fiber ready_fiber;
+            },
+            0b01 => {
+                // Another worker asks this ring to cancel an operation it holds.
+                thread.enqueue().* = .{
+                    .opcode = .ASYNC_CANCEL,
+                    .flags = linux.IOSQE_CQE_SKIP_SUCCESS,
+                    .ioprio = 0,
+                    .fd = 0,
+                    .off = 0,
+                    .addr = cqe.user_data & ~@as(usize, 0b11),
+                    .len = 0,
+                    .rw_flags = 0,
+                    .user_data = @backingInt(Completion.Userdata.wakeup),
+                    .buf_index = 0,
+                    .personality = 0,
+                    .splice_fd_in = 0,
+                    .addr3 = 0,
+                    .resv = 0,
+                };
+                break :ready_fiber null;
+            },
+            0b10 => {
+                const batch_userdata: *Io.Operation.Storage.Pending.Userdata =
+                    @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
+                const batch: *Io.Batch = @ptrFromInt(batch_userdata[0]);
+                var next: usize = 0b00;
+                batch_userdata[0..3].* = .{ next, @as(u32, @bitCast(cqe.res)), cqe.flags };
+                while (true) {
+                    next = @cmpxchgWeak(
+                        usize,
+                        @as(*usize, @ptrCast(&batch.userdata)),
+                        next,
+                        cqe.user_data,
+                        .release,
+                        .acquire,
+                    ) orelse break;
+                    batch_userdata[0] = next;
+                }
+                break :ready_fiber switch (@as(u2, @truncate(next))) {
+                    0b00, 0b01 => @ptrFromInt(next & ~@as(usize, 0b11)),
+                    0b10, 0b11 => null,
+                };
+            },
+            0b11 => switch (Completion.errno(.{ .result = cqe.res, .flags = cqe.flags })) {
+                .SUCCESS => unreachable, // no event count specified
+                .TIME => {
+                    const context: *usize = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
+                    const fiber = @atomicRmw(usize, context, .Add, 0b01, .acquire);
+                    break :ready_fiber switch (@as(u2, @truncate(fiber))) {
+                        else => unreachable, // timeout completed multiple times
+                        0b00 => @ptrFromInt(fiber & ~@as(usize, 0b11)),
+                        0b10 => null,
                     };
                 },
-                0b11 => switch (Completion.errno(.{ .result = cqe.res, .flags = cqe.flags })) {
-                    .SUCCESS => unreachable, // no event count specified
-                    .TIME => {
-                        const context: *usize = @ptrFromInt(cqe.user_data & ~@as(usize, 0b11));
-                        const fiber = @atomicRmw(usize, context, .Add, 0b01, .acquire);
-                        break :ready_fiber switch (@as(u2, @truncate(fiber))) {
-                            else => unreachable, // timeout completed multiple times
-                            0b00 => @ptrFromInt(fiber & ~@as(usize, 0b11)),
-                            0b10 => null,
-                        };
-                    },
-                    .CANCELED => null, // user data may have been invalidated
-                    else => |err| unexpectedErrno(err) catch null,
-                },
-            })) |ready_fiber| ev.sched.readyFromPoll(worker, ready_fiber),
-        };
+                .CANCELED => null, // user data may have been invalidated
+                else => |err| unexpectedErrno(err) catch null,
+            },
+        })) |ready_fiber| ev.sched.readyFromPoll(worker, ready_fiber),
     }
 }
 
@@ -6506,4 +6655,77 @@ fn pwritevSync(
 
 test {
     _ = Fiber.CancelProtection;
+}
+
+test "Ring: the owner takes its completions while its worker runs other tasks" {
+    const testing = std.testing;
+    const ev = fromIo(testing.io) orelse return error.SkipZigTest;
+    const Owner = struct {
+        const nops = 100;
+
+        /// The ring is small, so a full queue is submitted to make room.
+        fn getSqe(ring: Ring) !*linux.io_uring_sqe {
+            return ring.uring().get_sqe() catch |err| switch (err) {
+                error.SubmissionQueueFull => {
+                    _ = try ring.uring().submit();
+                    return ring.uring().get_sqe();
+                },
+            };
+        }
+
+        /// Returns how many of its completions it saw, each once and in order.
+        fn run(e: *Evented) !usize {
+            const ring = try e.acquireRing();
+            defer ring.release();
+            for (0..nops) |i| {
+                const sqe = try getSqe(ring);
+                sqe.prep_nop();
+                sqe.user_data = ring_owner_bit | i;
+            }
+            // Its own Io call parks it while the NOPs complete, so the worker's poll takes
+            // them off the ring and queues them.
+            try testing.io.sleep(.fromMilliseconds(2), .awake);
+            // A timeout of its own makes `waitCqes` park it.
+            const ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
+            const sqe = try getSqe(ring);
+            sqe.prep_timeout(&ts, 0, 0);
+            sqe.user_data = ring_owner_bit | nops;
+
+            var cqes: [16]linux.io_uring_cqe = undefined;
+            var next: u64 = 0;
+            while (next <= nops) {
+                for (cqes[0..ring.waitCqes(&cqes)]) |cqe| {
+                    try testing.expectEqual(ring_owner_bit | next, cqe.user_data);
+                    next += 1;
+                }
+            }
+            return next;
+        }
+    };
+    var owner = try ev.concurrentWith(.{ .affinity = .{ .pinned = 0 } }, Owner.run, .{ev});
+    defer _ = owner.cancel(testing.io) catch {};
+    // Meanwhile, tasks of the same worker keep using the ring.
+    for (0..5) |_| try testing.io.sleep(.fromMilliseconds(1), .awake);
+    try testing.expectEqual(Owner.nops + 1, try owner.await(testing.io));
+}
+
+test "Ring: one pinned owner at a time" {
+    const testing = std.testing;
+    const ev = fromIo(testing.io) orelse return error.SkipZigTest;
+    const Acquire = struct {
+        fn run(e: *Evented) !void {
+            const ring = try e.acquireRing();
+            ring.release();
+        }
+
+        fn twice(e: *Evented) !void {
+            const ring = try e.acquireRing();
+            defer ring.release();
+            try testing.expectError(error.RingOwned, e.acquireRing());
+        }
+    };
+    var sticky = try ev.concurrentWith(.{}, Acquire.run, .{ev});
+    try testing.expectError(error.NotPinned, sticky.await(testing.io));
+    var pinned = try ev.concurrentWith(.{ .affinity = .{ .pinned = 0 } }, Acquire.twice, .{ev});
+    try pinned.await(testing.io);
 }
