@@ -59,7 +59,7 @@ that cannot be a configuration flag, and it is why they stay two constructors.
 | Workers | One OS worker per core by default, count explicit, `-j` honored. Pinning physical-cores-first as an init option, on by default for servers. | Every thread deliberate. Today `-j` limits only `Threaded` (`src/main.zig:6634-6650`). |
 | Affinity | Three per-task modes, set at spawn. **Sticky** (default): a task resumes on the worker that last ran it, and is stealable only when that worker's queue is over a threshold. **Pinned**: never moves; for tasks that own per-worker resources such as a listener or a slab. **Free**: goes to the global injection queue. | Zix's loops are pinned tasks; Zurtr's work is sticky; `Uring`'s `schedule` today is free, which is the missing locality rule. |
 | Scheduling | Cooperative. A task runs until it parks at an Io call, awaits, or yields. A budget inside the implementation forces a yield after 128 consecutive operations without parking. | Zurtr today, plus Tokio's budget. No compiler involvement. |
-| Runaway tasks | Work stealing contains a spinning task to one worker. A watchdog thread notices a worker that has not yielded in *N* ms, hands its run queue to a replacement worker, records a metric, and names the task. | Most of what preemption buys a server runtime, with nothing from the compiler. |
+| Runaway tasks | Work stealing contains a spinning task to one worker. A watchdog thread notices a worker that has not yielded in *N* ms, makes its run queue takeable by the other workers, records a metric, and names the task. A worker blocked in the kernel or in a C call, whose thread uses almost no CPU, also gets a replacement worker; a computing one does not. | Most of what preemption buys a server runtime, with nothing from the compiler. Replacing computing workers too would break "`-j` honored": the compiler on Threadz started a replacement, and printed a warning, for every compile task that ran past 100 ms. |
 | Stacks | Pooled, guarded by one page, lazily committed by the OS, released with `MADV_DONTNEED` beyond the pool size. Reservation is per spawn: 256 KiB default for tasks, large (the current 60 MiB) for the compiler's own Sema work. No growth. | Growable stacks need pointer maps Zig does not have. The compiler's recursion is why `Uring` reserves 60 MiB today; lazy commit makes a big reservation cost only its mapping. One mapping per task meets `vm.max_map_count` near 65k tasks; that is a sysctl, and the docs say so. |
 | Io calls | Sockets, timers, sleeps, futexes and file reads submit to the core and park the task. File operations the core can only finish on a kernel thread of its own (on Linux: positional writes, `statx`, `ftruncate`, opens that create or truncate, and directory changes) are made on the worker instead. | Upstream `Io` semantics; only the mechanism differs. The trip to the kernel thread and back costs more than the call: with every file write taking it, the compiler took 130 s to build itself at `-j8`, against 20-23 s with the writes made on the worker, as on `Threaded`. |
 | Rings | A task pinned to a worker may borrow the worker's io_uring (`acquireRing`) and drive operations of its own on it. The SQEs it queues carry `ring_owner_bit` in `user_data`, and `Ring.waitCqes` parks it until one of their completions arrives. The worker handles every other completion as before. A ring has one owner at a time. | Zix's loops keep their multishot receives, provided buffer rings and batched submissions, which `Io` has no vocabulary for. A loop on a ring of its own would block its worker in the kernel. |
@@ -124,10 +124,11 @@ pinning. The stealing policy comes from the table above, not from the current co
    task, by id and by the function it was spawned with, which is what tasks are named by now (see
    below); a thread that kept using its time is computing, which is what a compiler task is, and
    gets no replacement — `-j` and the worker limit mean what they say — and no log line.
-   `Threadz.stats()` counts the episodes of each kind and says which the last one was. An instance whose worker limit is one still reports and replaces, and with
-   every worker parked the watchdog sleeps until one unparks. A stuck worker's slot for the next
-   task is the watchdog's to put in the shared queue, which is what lets a worker take its own
-   slot with a plain load and store: the watchdog sets a flag, has the backend issue a
+   `Threadz.stats()` counts the episodes of each kind and says which the last one was. An
+   instance whose worker limit is one still reports a blocked task and replaces its worker, and
+   with every worker parked the watchdog sleeps until one unparks. A stuck worker's slot for the
+   next task is the watchdog's to put in the shared queue, which is what lets a worker take its
+   own slot with a plain load and store: the watchdog sets a flag, has the backend issue a
    process-wide barrier (`membarrier` on Linux, behind the scheduler's backend contract so that a
    core for another system can say it cannot), and re-reads the two words the worker stores at
    every switch; if it sees no change it takes the slot with an atomic exchange, and the worker
@@ -136,13 +137,19 @@ pinning. The stealing policy comes from the table above, not from the current co
    and nothing else waits; a blocking C call inside a task is detected and named.
 
    Shipped: the spin test queues 32 tasks behind a task that spins for 500 ms with no Io call and
-   has them all finish 114-116 ms later with the stuck counter up and the log line naming the
-   function; a task in a raw 300 ms `nanosleep` is reported the same way; 16 `io.blocking` calls
-   of 200 ms each finish in 205 ms while other tasks run; and 10,000 operations that never park on
-   a worker shared with one other task let that task run first. Task names come from
-   `Io.spawnedName`, a comptime instantiation whose type name carries the function's declaration
-   name, since the language has no reflection from a function value to its declaration; ids come
-   from one counter for the program. Step 7 below adds the naming API on top.
+   has them all finish 114-116 ms later, the spin counted as computing, named in `stats()`, with
+   no replacement and nothing printed; a task in a raw 300 ms `nanosleep` is counted as blocked,
+   gets a replacement and the log line naming it; 16 `io.blocking` calls of 200 ms each finish in
+   205 ms while other tasks run; and 10,000 operations that never park on a worker shared with one
+   other task let that task run first. The compiler built for evented Io builds itself at `-j8`
+   with no watchdog line. The budget costs the scheduler benchmark's handoffs about 2.5 ns each
+   (spawn-chain 53.7 to 55.7 ns, async-await 65.0 to 67.8 ns, medians of three interleaved runs)
+   and makes group-spawn a third faster (205 to 131 ns a task), because a task that spawns in a
+   loop yields every 128 spawns; the watchdog's store per switch measured as nothing. Task names
+   come from `Io.spawnedName`, a comptime instantiation whose type name carries the function's
+   declaration name, since the language has no reflection from a function value to its
+   declaration; ids are unique in the program, each worker taking them 1024 at a time from one
+   counter. Step 7 below adds the naming API on top.
 5. **The other cores.** `Kqueue` rewritten on the shared scheduler for macOS and BSD; `Dispatch`
    retired once it reaches parity; IOCP and the Windows fiber work last.
 6. **BEAM shapes.** Arenas, `Io.Scoped`, `Io.Supervisor`, overflow policies.

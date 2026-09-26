@@ -227,15 +227,16 @@ const io = threadz.io();
   computing, which is what a compiler task is: its queued work is taken just
   the same, but no worker is replaced — `-j` and the worker limit mean what
   they say — and nothing is logged. An instance whose worker limit is one is
-  covered too: the replacement is where the tasks behind the stuck one run.
-  Pinned tasks on a stuck worker wait for the worker, which they own the
+  covered for a blocked task, whose replacement is where the tasks behind it
+  run; a computing task holds the only worker, which is what a limit of one
+  means. Pinned tasks on a stuck worker wait for the worker, which they own the
   resources of. `Threadz.stats()` reads the counters: workers running,
-  replacements, workers stuck now, stuck episodes, the rounds of samples the
-  watchdog made, and the task of the last episode. A worker pays one store per
-  switch for the watchdog, of the task it runs, and one load of a flag when it
-  takes the task in its slot. The watchdog waits without a timeout while every
-  worker is parked, so an idle program is not woken to sample workers that are
-  all asleep.
+  replacements, workers stuck now, the episodes of each kind, the rounds of
+  samples the watchdog made, and the task and kind of the last episode. A
+  worker pays one store per switch for the watchdog, of the task it runs, and
+  one load of a flag when it takes the task in its slot. The watchdog waits
+  without a timeout while every worker is parked, so an idle program is not
+  woken to sample workers that are all asleep.
 - Threads outside the pool can use the synchronization primitives, whose
   futexes they wait on in the kernel. Other `Io` calls from those threads are
   not supported yet.
