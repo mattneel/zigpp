@@ -326,6 +326,7 @@ fn translate(d: *aro.Driver, tc: *aro.Toolchain, args: []const [:0]const u8, zig
 
 test {
     _ = Translator;
+    _ = @import("MacroTranslator.zig");
     _ = @import("helpers.zig");
     _ = @import("PatternList.zig");
 }
