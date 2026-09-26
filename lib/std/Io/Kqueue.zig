@@ -514,7 +514,14 @@ fn park(
     const w = Scheduler.Worker.current();
     const task = w.currentTask();
     const completion = task.resultPointer(Completion);
-    assert(completion.state.load(.monotonic) == .idle);
+    if (completion.state.load(.monotonic) != .idle) {
+        std.debug.panic("park: task {d} state {t} outcome {t} count {d}", .{
+            task.id,
+            completion.state.load(.monotonic),
+            completion.outcome,
+            completion.count,
+        });
+    }
     assert(registrations.len <= max_registrations);
     completion.outcome = .none;
     completion.count = @intCast(registrations.len);

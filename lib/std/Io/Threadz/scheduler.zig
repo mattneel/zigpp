@@ -3616,6 +3616,14 @@ test "watchdog: with one worker, what a blocked task queued still runs" {
     // Awaited before the checks, so that a failed check fails the test instead of leaving a task
     // that `deinit` finds never awaited.
     future.await(io);
+    const diag = b.sched.stats();
+    std.debug.print("watchdog test: done={} blocked={} stuck={d} replacements={d} rounds={d}\n", .{
+        done.load(.acquire),
+        blocked.load(.acquire),
+        diag.stuck_episodes,
+        diag.replacements,
+        diag.watchdog_rounds,
+    });
     try std.testing.expect(done.load(.acquire)); // it ran while the blocker still held the worker
     // The episode is counted by the watchdog, after the replacement started: wait for it.
     var stats = b.sched.stats();
