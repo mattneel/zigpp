@@ -116,11 +116,15 @@ pinning. The stealing policy comes from the table above, not from the current co
    the first such call, parking the calling task with the argument and result slots on its own
    stack; it is not cancelable once started. One watchdog thread per instance, started with the
    first task the instance makes or runs, samples every worker every 10 ms: a worker whose current
-   task has not switched out for 100 ms is stuck, its queued tasks become takeable by every other
-   worker whatever their number, one replacement worker is started for it and released when it
-   switches again, `Threadz.stats()` counts the episodes, and one `std.log` line scoped `.threadz`
-   names the task, by id and by the function it was spawned with, which is what tasks are named by
-   now (see below). An instance whose worker limit is one still reports and replaces, and with
+   task has not switched out for 100 ms is stuck, and its queued tasks become takeable by every
+   other worker whatever their number. Two rounds ten milliseconds apart, and the worker thread's
+   CPU time between them, tell the kinds apart: a thread that used less than a fifth of the wall
+   time is blocked, in the kernel or in a call that never said it blocks, and gets one replacement
+   worker, released when it switches again, and one `std.log` line scoped `.threadz` naming the
+   task, by id and by the function it was spawned with, which is what tasks are named by now (see
+   below); a thread that kept using its time is computing, which is what a compiler task is, and
+   gets no replacement — `-j` and the worker limit mean what they say — and no log line.
+   `Threadz.stats()` counts the episodes of each kind and says which the last one was. An instance whose worker limit is one still reports and replaces, and with
    every worker parked the watchdog sleeps until one unparks. A stuck worker's slot for the next
    task is the watchdog's to put in the shared queue, which is what lets a worker take its own
    slot with a plain load and store: the watchdog sets a flag, has the backend issue a

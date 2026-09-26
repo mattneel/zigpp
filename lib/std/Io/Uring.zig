@@ -255,6 +255,25 @@ pub fn wakeForeign(ev: *Evented, to: *Scheduler.Worker) void {
     ev.watchdog.wake(to);
 }
 
+/// For the scheduler: how much CPU time the worker's thread has used, in nanoseconds, or `null`
+/// when it cannot be read. The watchdog tells a worker that is blocked from one that is computing
+/// with it, and it reads the thread's own CPU clock, which counts kernel time as well as user time,
+/// so that a worker inside a syscall is seen to be using its thread.
+pub fn threadCpuTime(ev: *Evented, worker: *Scheduler.Worker) ?u64 {
+    _ = ev;
+    const tid = worker.backend.tid;
+    if (tid == 0) return null;
+    var tp: linux.timespec = undefined;
+    // MAKE_THREAD_CPUCLOCK(tid, CPUCLOCK_SCHED): the per-thread CPU clock, which glibc's
+    // `pthread_getcpuclockid` also returns.
+    const clock_id: linux.clockid_t = @bitCast((~@as(u32, @bitCast(tid)) << 3) | 6);
+    switch (linux.errno(linux.clock_gettime(clock_id, &tp))) {
+        .SUCCESS => {},
+        else => return null,
+    }
+    return @as(u64, @intCast(@max(0, tp.sec))) * std.time.ns_per_s + @as(u64, @intCast(@max(0, tp.nsec)));
+}
+
 /// Whether this process registered for the barrier below, once, and whether it can issue one.
 var barrier_registered: std.atomic.Value(bool) = .init(false);
 var barrier_available: std.atomic.Value(bool) = .init(true);
@@ -290,6 +309,8 @@ const Thread = struct {
     csprng: Csprng,
     /// The task that has acquired this ring, if any. See `Ring`.
     owner: RingOwner,
+    /// The worker's thread id, recorded on its own thread, for `threadCpuTime`.
+    tid: i32,
 
     fn current() *Thread {
         return &Scheduler.Worker.current().backend;
@@ -966,12 +987,14 @@ pub fn workerInit(ev: *Evented, worker: *Scheduler.Worker) !void {
         },
         .csprng = .uninitialized,
         .owner = .{},
+        .tid = 0,
     };
 }
 
 /// For the scheduler: on the worker's own thread, which becomes the ring's only submitter.
 pub fn workerStart(ev: *Evented, worker: *Scheduler.Worker) void {
     _ = ev;
+    worker.backend.tid = linux.gettid();
     if (worker.index == 0) return;
     switch (linux.errno(linux.io_uring_register(worker.backend.io_uring.fd, .REGISTER_ENABLE_RINGS, null, 0))) {
         .SUCCESS => {},
@@ -7070,7 +7093,9 @@ fn testQueuedTask(done: *std.atomic.Value(u32)) void {
 
 /// Runs `hostile` as a task pinned to worker 1, with the `queued` tasks it makes of its own, and
 /// checks what the watchdog does about it: the tasks behind it finish while it still holds the
-/// worker, the stuck counter moves, and the report names the task and the function it runs.
+/// worker, the counter for its kind moves, and the report names the task and the function it
+/// runs. `expect_kind` is what the watchdog has to make of it: a task that blocked ends with a
+/// replacement worker and a log line, and one that computed with neither.
 fn testWatchdog(
     ev: *Evented,
     comptime hostile: anytype,
@@ -7078,6 +7103,7 @@ fn testWatchdog(
     queued: usize,
     limit_ns: u64,
     comptime expected_name: []const u8,
+    expect_kind: Stats.Kind,
 ) !void {
     const testing = std.testing;
     if (workerLimit(ev) < 2) return error.SkipZigTest; // a worker to stick, and one to run elsewhere
@@ -7090,7 +7116,7 @@ fn testWatchdog(
     defer future.cancel(testing.io);
     defer group.cancel(testing.io);
 
-    const before = ev.stats().stuck_episodes;
+    const before = ev.stats();
     while (!started.load(.acquire)) try testing.io.sleep(.fromMicroseconds(50), .awake);
     const start = testNow();
     while (done.load(.acquire) != queued) {
@@ -7099,13 +7125,26 @@ fn testWatchdog(
     }
     try testing.expect(testNow() - start < limit_ns);
     const snapshot = ev.stats();
-    try testing.expect(snapshot.stuck_episodes > before);
     const stuck = snapshot.last_stuck orelse return error.TestUnexpectedResult;
-    // The same task and name are what the watchdog names in its log line.
+    // The same task, name and kind are what the watchdog names in its log line, and only a
+    // blocked worker gets a replacement: a computing one keeps the worker it is using.
+    try testing.expectEqual(expect_kind, stuck.kind);
     try testing.expectEqualStrings(expected_name, stuck.name);
     try testing.expect(stuck.ms >= stuck_after_ms);
     try testing.expect(stuck.id != 0);
     try testing.expectEqual(@as(u32, 1), stuck.worker);
+    switch (expect_kind) {
+        .blocked => {
+            try testing.expect(snapshot.stuck_episodes > before.stuck_episodes);
+            try testing.expect(snapshot.replacements > before.replacements);
+            try testing.expectEqual(before.computing_episodes, snapshot.computing_episodes);
+        },
+        .computing => {
+            try testing.expect(snapshot.computing_episodes > before.computing_episodes);
+            try testing.expectEqual(before.replacements, snapshot.replacements);
+            try testing.expectEqual(before.stuck_episodes, snapshot.stuck_episodes);
+        },
+    }
     future.await(testing.io);
     try group.await(testing.io);
 }
@@ -7130,7 +7169,9 @@ test "watchdog: a spinning task costs one worker, and nothing else waits" {
             }
         }
     };
-    try testWatchdog(ev, S.spin, .{500 * std.time.ns_per_ms}, 32, 150 * std.time.ns_per_ms, "spin");
+    // Compiling is this: seconds of work with no Io call in it, on every worker. It is stranded so
+    // that its queued work runs elsewhere, but it is not replaced and it is not logged.
+    try testWatchdog(ev, S.spin, .{500 * std.time.ns_per_ms}, 32, 150 * std.time.ns_per_ms, "spin", .computing);
 }
 
 test "watchdog: a blocking syscall is reported like a spin" {
@@ -7147,7 +7188,7 @@ test "watchdog: a blocking syscall is reported like a spin" {
             _ = linux.nanosleep(&ts, null);
         }
     };
-    try testWatchdog(ev, S.sleepRaw, .{300 * std.time.ns_per_ms}, 4, 150 * std.time.ns_per_ms, "sleepRaw");
+    try testWatchdog(ev, S.sleepRaw, .{300 * std.time.ns_per_ms}, 4, 150 * std.time.ns_per_ms, "sleepRaw", .blocked);
 }
 
 test "io.blocking: 16 blocking calls run at once, holding no worker" {

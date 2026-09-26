@@ -214,14 +214,19 @@ const io = threadz.io();
   of their own, make the call on the calling thread.
 - One watchdog thread per instance, started with the first task the instance
   makes or runs, samples every worker every 10 ms. A worker whose current task
-  has not switched out for 100 ms is stuck, whether it is spinning or inside a
-  C call that never said it blocks: the task is named in one `std.log` warning
-  scoped `.threadz`, with its id, the function it was spawned with, and how
+  has not switched out for 100 ms is stuck. Two rounds ten milliseconds apart,
+  and the worker thread's CPU time between them, tell the kinds apart: a thread
+  that used less than a fifth of the wall time is blocked, in the kernel or in
+  a C call that never said it blocks, and its task is named in one `std.log`
+  warning scoped `.threadz`, with its id, the function it was spawned with, and how
   long it has run; its queued tasks, including the ones others made runnable
   for it and the one in its slot for the next task, become takeable by every
   worker whatever their number; and one replacement worker is started for it,
   so that parallelism stays, which stops once it has nothing to run and the
-  stuck worker switches out again. An instance whose worker limit is one is
+  stuck worker switches out again. A thread that kept using its time is
+  computing, which is what a compiler task is: its queued work is taken just
+  the same, but no worker is replaced — `-j` and the worker limit mean what
+  they say — and nothing is logged. An instance whose worker limit is one is
   covered too: the replacement is where the tasks behind the stuck one run.
   Pinned tasks on a stuck worker wait for the worker, which they own the
   resources of. `Threadz.stats()` reads the counters: workers running,

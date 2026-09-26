@@ -38,6 +38,10 @@
 //! * `wake(backend, from, to)`, which ends `to`'s current or next blocking `poll`;
 //! * `wakeForeign(backend, to)`, the same from a thread that is not one of the workers, which is
 //!   the watchdog. It must be safe to call from any thread;
+//! * `threadCpuTime(backend, w) ?u64`, the CPU time in nanoseconds the worker's thread has used,
+//!   or `null` when it cannot be read. The watchdog tells a worker that is blocked from one that
+//!   is computing with it: see `watchdogWorker`. A backend that does not declare it leaves every
+//!   stuck worker blocked, which is what a worker that cannot say otherwise is;
 //! * `heavyBarrier(backend) bool`, whether the backend issued a barrier that makes this thread's
 //!   earlier stores visible to every other thread of the process, after their own barriers. The
 //!   watchdog takes a stuck worker's slot for the next task with it, and a worker that takes its
@@ -175,6 +179,8 @@ pub fn Scheduler(comptime Backend: type) type {
         watchdog_rounds: std.atomic.Value(u64),
         /// Episodes in which a worker was found stuck. See `stats`.
         stuck_episodes: std.atomic.Value(u64),
+        /// Episodes in which a worker was found computing. See `stats`.
+        computing_episodes: std.atomic.Value(u64),
         /// Replacement workers the watchdog started for stuck workers. See `stats`.
         replacements: std.atomic.Value(u64),
         /// What the watchdog reported about the last stuck episode. See `stats`.
@@ -193,6 +199,10 @@ pub fn Scheduler(comptime Backend: type) type {
         /// Whether the backend declares `heavyBarrier`. Without it, every taker of a slot for the
         /// next task pays a compare-exchange, and the watchdog takes none: see `takeNext`.
         const has_heavy_barrier = @hasDecl(Backend, "heavyBarrier");
+        /// Whether the backend declares `threadCpuTime`. Without it, a worker that does not switch
+        /// out is taken to be blocked, which is what has to be assumed of a worker that cannot
+        /// say otherwise.
+        const has_thread_cpu_time = @hasDecl(Backend, "threadCpuTime");
         /// Cleared when the backend says it cannot issue the barrier, which the watchdog finds
         /// out when it first needs one. Every taker of a slot then pays a compare-exchange: see
         /// `takeNext`.
@@ -433,7 +443,7 @@ pub fn Scheduler(comptime Backend: type) type {
                 return self;
             }
 
-            pub fn currentTask(w: *Worker) *Task {
+            pub inline fn currentTask(w: *Worker) *Task {
                 assert(w.current_context != &w.idle_context);
                 return @alignCast(@fieldParentPtr("context", w.current_context));
             }
@@ -640,6 +650,8 @@ pub fn Scheduler(comptime Backend: type) type {
 
         /// What the watchdog keeps about the last stuck episode, for `stats`.
         const StuckReport = struct {
+            /// Which kind it was: see `Stats.Kind`.
+            kind: std.atomic.Value(Stats.Kind) = .init(.blocked),
             /// The task's number, or 0 before the first episode.
             id: std.atomic.Value(u64) = .init(0),
             /// The name of the function the task runs, or null before the first episode.
@@ -663,9 +675,16 @@ pub fn Scheduler(comptime Backend: type) type {
             spares: u32,
             /// The workers stuck right now.
             stuck: u32,
-            /// Episodes in which a worker was found stuck: its current task had not switched out
-            /// for `stuck_after`. The watchdog writes one log line per episode, naming the task.
+            /// Episodes in which a worker was found blocked: its current task had not switched
+            /// out for `stuck_after` and its thread used less than a fifth of the wall time, so
+            /// it is in the kernel or in a call that blocks. The watchdog writes one log line per
+            /// episode, names the task, and starts a replacement for the worker.
             stuck_episodes: u64,
+            /// Episodes in which a worker was found computing: its current task had not switched
+            /// out for `stuck_after` and its thread kept using its time, so it is running CPU
+            /// work with no Io call in it. Its queued tasks become takeable, but nothing is
+            /// replaced and nothing is logged, because that is what compiling is.
+            computing_episodes: u64,
             /// The replacements the watchdog started for stuck workers.
             replacements: u64,
             /// Rounds of samples the watchdog made. It makes none while every worker is parked:
@@ -675,6 +694,8 @@ pub fn Scheduler(comptime Backend: type) type {
             last_stuck: ?Stuck = null,
 
             pub const Stuck = struct {
+                /// Which kind of episode this was: a blocked worker or a computing one.
+                kind: Kind,
                 /// The task's number. See `Task.id`.
                 id: u64,
                 /// The name of the function the task runs.
@@ -685,6 +706,9 @@ pub fn Scheduler(comptime Backend: type) type {
                 /// The worker it ran on.
                 worker: u32,
             };
+
+            /// The two kinds of stuck worker: see `stuck_episodes` and `computing_episodes`.
+            pub const Kind = enum(u8) { blocked, computing };
         };
 
         /// What the watchdog keeps about one worker between samples.
@@ -695,8 +719,20 @@ pub fn Scheduler(comptime Backend: type) type {
             tick: u32 = 0,
             /// When it last saw this task with this switch count.
             since: i96 = 0,
-            /// Whether this worker has been reported stuck and has not switched out since.
-            stuck: bool = false,
+            /// Whether this worker has been reported and has not switched out since.
+            reported: bool = false,
+            /// Set by the round that first found this worker over `stuck_after`, so that the next
+            /// round can tell a blocked worker from a computing one by its thread's CPU time: see
+            /// `watchdogWorker`.
+            measuring: ?Measuring = null,
+
+            const Measuring = struct {
+                /// The CPU time of the worker's thread when the measurement started, or null when
+                /// the backend cannot say.
+                cpu: ?u64,
+                /// When it was read, on the same clock as the rounds.
+                at: i96,
+            };
         };
 
         /// Mappings of the default size kept by one worker, linked through their top bytes.
@@ -730,7 +766,7 @@ pub fn Scheduler(comptime Backend: type) type {
             }
         };
 
-        pub fn backendOf(s: *Sched) *Backend {
+        pub inline fn backendOf(s: *Sched) *Backend {
             return @fieldParentPtr("sched", s);
         }
 
@@ -784,6 +820,7 @@ pub fn Scheduler(comptime Backend: type) type {
                 .watchdog_sleeping = .init(false),
                 .watchdog_rounds = .init(0),
                 .stuck_episodes = .init(0),
+                .computing_episodes = .init(0),
                 .replacements = .init(0),
                 .report = .{},
                 .reaped_live = 0,
@@ -820,6 +857,9 @@ pub fn Scheduler(comptime Backend: type) type {
             if (tsan.enable) w.idle_tsan_fiber = tsan.__tsan_create_fiber(0);
             errdefer if (tsan.enable) tsan.__tsan_destroy_fiber(w.idle_tsan_fiber);
             try Backend.workerInit(s.backendOf(), w);
+            // Worker 0 runs on this thread, so its `workerStart` is this call: a backend records
+            // what only a thread can know about itself, such as its id, there.
+            Backend.workerStart(s.backendOf(), w);
             Worker.self = w;
             if (tracy.enable) tracy.fiberEnter(main_task.name);
         }
@@ -1042,8 +1082,12 @@ pub fn Scheduler(comptime Backend: type) type {
         /// charging an operation that always parks changes nothing. Does nothing on a thread
         /// that is not one of the workers: those threads run no task, and the operations they
         /// may call block in the kernel rather than park.
-        pub fn charge(s: *Sched) void {
-            const w = Worker.currentOrNull() orelse return;
+        pub inline fn charge(s: *Sched) void {
+            // Inline throughout, with the worker's own threadlocal read here rather than through
+            // a call: this runs at the entry of every Threadz operation, and the benchmarks that
+            // are nothing but operations, async-await and spawn-chain, pay for every instruction
+            // between them and the work.
+            const w = Worker.self orelse return;
             // The idle context runs on the worker's own stack, not in a task.
             if (w.current_context == &w.idle_context) return;
             const task = w.currentTask();
@@ -1497,9 +1541,11 @@ pub fn Scheduler(comptime Backend: type) type {
                 .spares = spares,
                 .stuck = stuck,
                 .stuck_episodes = s.stuck_episodes.load(.monotonic),
+                .computing_episodes = s.computing_episodes.load(.monotonic),
                 .replacements = s.replacements.load(.monotonic),
                 .watchdog_rounds = s.watchdog_rounds.load(.monotonic),
                 .last_stuck = if (name) |n| .{
+                    .kind = s.report.kind.load(.monotonic),
                     .id = s.report.id.load(.monotonic),
                     .name = std.mem.span(n),
                     .ms = s.report.ms.load(.monotonic),
@@ -1624,19 +1670,36 @@ pub fn Scheduler(comptime Backend: type) type {
                 sample.task = task;
                 sample.tick = tick;
                 sample.since = now;
-                if (sample.stuck) {
+                sample.measuring = null;
+                if (sample.reported) {
                     // It switches out again: it is not stuck, and what it had queued goes back
                     // to being takeable only when the queue is over the threshold.
-                    sample.stuck = false;
+                    sample.reported = false;
                     s.releaseStranded(w);
                 }
                 return;
             }
-            if (sample.stuck) return; // reported already; until it switches out, it is stuck
+            if (sample.reported) return; // reported already; until it switches out, it is stuck
             const elapsed = now - sample.since;
             if (elapsed < stuck_after) return;
-            sample.stuck = true;
-            s.reportStuck(w, task.?, tick, @intCast(@divTrunc(elapsed, std.time.ns_per_ms)));
+            if (sample.measuring) |measuring| {
+                // A round later, still the same task and the same switch count. A thread that
+                // used less than a fifth of the wall time since it was first found is waiting for
+                // something outside the process — a syscall, a lock, a C call — and a replacement
+                // keeps its worker's share of the parallelism; one that kept using its time is
+                // computing, which is what compiling is, and nothing about it needs replacing.
+                sample.reported = true;
+                s.reportStuck(w, task.?, tick, @intCast(@divTrunc(elapsed, std.time.ns_per_ms)), .{
+                    .cpu = measuring.cpu,
+                    .cpu_now = if (comptime has_thread_cpu_time) Backend.threadCpuTime(s.backendOf(), w) else null,
+                    .wall = now - measuring.at,
+                });
+                return;
+            }
+            sample.measuring = .{
+                .cpu = if (comptime has_thread_cpu_time) Backend.threadCpuTime(s.backendOf(), w) else null,
+                .at = now,
+            };
         }
 
         /// The worker switches out again: what was queued on it is takeable only when the queue
@@ -1655,16 +1718,27 @@ pub fn Scheduler(comptime Backend: type) type {
         /// Reports worker `w`, whose task `task` has not switched out for `ms`: the task is named
         /// in one log line, its queued tasks become takeable whatever their number, one
         /// replacement worker is started for it, and the episode is counted.
-        fn reportStuck(s: *Sched, w: *Worker, task: *Task, tick: u32, ms: u64) void {
+        fn reportStuck(s: *Sched, w: *Worker, task: *Task, tick: u32, ms: u64, measurement: Measurement) void {
+            const blocked: bool = if (measurement.cpu) |before| blk: {
+                const after = measurement.cpu_now orelse break :blk true; // cannot say: blocked
+                if (after <= before) break :blk true; // no time used at all: waiting for something
+                break :blk (after - before) * 5 < measurement.wall; // less than a fifth of the wall
+            } else true; // the backend cannot say: treat it as blocked
+            const kind: Stats.Kind = if (blocked) .blocked else .computing;
+            s.report.kind.store(kind, .monotonic);
             s.report.ms.store(ms, .monotonic);
             s.report.worker.store(w.index, .monotonic);
             s.report.id.store(task.id, .monotonic);
             s.report.name.store(task.name.ptr, .release);
-            _ = s.stuck_episodes.fetchAdd(1, .monotonic);
-            std.log.scoped(.threadz).warn(
-                "task {d} ({s}) has not switched out for {d} ms on worker {d}: its queued tasks are takeable, and a replacement worker was started",
-                .{ task.id, task.name, ms, w.index },
-            );
+            if (blocked) {
+                _ = s.stuck_episodes.fetchAdd(1, .monotonic);
+                std.log.scoped(.threadz).warn(
+                    "task {d} ({s}) has not switched out for {d} ms on worker {d}: it is blocked, its queued tasks are takeable, and a replacement worker was started",
+                    .{ task.id, task.name, ms, w.index },
+                );
+            } else {
+                _ = s.computing_episodes.fetchAdd(1, .monotonic);
+            }
             w.stranded.store(true, .release);
             if (comptime has_heavy_barrier) {
                 // Make the store above visible to every worker that has not looked at it yet, so
@@ -1677,9 +1751,23 @@ pub fn Scheduler(comptime Backend: type) type {
                         s.takeStuckSlot(w);
                 } else heavy_barrier_available.store(false, .release);
             }
-            s.startSpare(w);
+            // A computing worker keeps its worker: it is using it. Only a blocked one gets a
+            // replacement, so that working around it does not raise the parallelism a program
+            // asked for with `-j` and a worker limit.
+            if (blocked) s.startSpare(w);
             s.wakeIdle();
         }
+
+        /// What the deciding round measured: the thread's CPU time before and after, and the wall
+        /// time between the two reads.
+        const Measurement = struct {
+            /// The CPU time when the worker was first found, or null when the backend cannot say.
+            cpu: ?u64 = null,
+            /// The CPU time a round later, or null.
+            cpu_now: ?u64 = null,
+            /// The wall time between the two reads.
+            wall: i96 = 0,
+        };
 
         /// Takes the task in stuck worker `w`'s slot for the next task, which only its own worker
         /// would take, and puts it in the shared queue, where every worker looks. Called by the
@@ -2135,7 +2223,7 @@ pub fn Scheduler(comptime Backend: type) type {
         }
 
         /// `charge`, from a vtable entry point's `userdata`.
-        pub fn charged(userdata: ?*anyopaque) void {
+        pub inline fn charged(userdata: ?*anyopaque) void {
             charge(fromUserdata(userdata));
         }
 
@@ -2589,7 +2677,11 @@ const TestBackend = struct {
     const Sched = Scheduler(TestBackend);
 
     pub const Completion = struct { result: i32 };
-    pub const Worker = struct { wake_word: std.atomic.Value(u32) };
+    pub const Worker = struct {
+        wake_word: std.atomic.Value(u32),
+        /// The worker's thread id, recorded on its own thread, for `threadCpuTime`.
+        tid: i32 = 0,
+    };
 
     const FutexWaiter = struct {
         ptr: *const u32,
@@ -2650,7 +2742,21 @@ const TestBackend = struct {
 
     pub fn workerStart(b: *TestBackend, w: *Sched.Worker) void {
         _ = b;
-        _ = w;
+        w.backend.tid = linux.gettid();
+    }
+
+    /// How much CPU time the worker's thread has used: see the backend contract.
+    pub fn threadCpuTime(b: *TestBackend, w: *Sched.Worker) ?u64 {
+        _ = b;
+        const tid = w.backend.tid;
+        if (tid == 0) return null;
+        var tp: linux.timespec = undefined;
+        const clock_id: linux.clockid_t = @bitCast((~@as(u32, @bitCast(tid)) << 3) | 6);
+        switch (linux.errno(linux.clock_gettime(clock_id, &tp))) {
+            .SUCCESS => {},
+            else => return null,
+        }
+        return @as(u64, @intCast(@max(0, tp.sec))) * std.time.ns_per_s + @as(u64, @intCast(@max(0, tp.nsec)));
     }
 
     pub fn workerDeinit(b: *TestBackend, w: *Sched.Worker) void {
@@ -2893,24 +2999,21 @@ fn testNow() u64 {
     return @as(u64, @intCast(tp.sec)) * std.time.ns_per_s + @as(u64, @intCast(tp.nsec));
 }
 
-test "watchdog: with one worker, what a stuck task queued still runs" {
+test "watchdog: with one worker, what a blocked task queued still runs" {
     const b = try testBackend(4);
     defer destroyTestBackend(b);
     b.sched.setWorkerLimit(1);
     const io = b.io();
 
     const S = struct {
-        /// Queues one task behind itself, then holds the only worker for 300 ms without making
-        /// an Io call: the replacement is the only way that task runs.
-        fn spinner(inner_io: Io, done: *std.atomic.Value(bool), word: *std.atomic.Value(u32), spinning: *std.atomic.Value(bool), spin_ns: u64) void {
+        /// Queues one task behind itself, then blocks the only worker in a raw nanosleep: with
+        /// one worker, a computing task would hold it just as well, but a blocked one is what the
+        /// replacement worker exists for, and the replacement is the only way that task runs.
+        fn blocker(inner_io: Io, done: *std.atomic.Value(bool), word: *std.atomic.Value(u32), spinning: *std.atomic.Value(bool), sleep_ns: u64) void {
             var future = inner_io.concurrent(short, .{ inner_io, done, word, spinning }) catch return;
             spinning.store(true, .release);
-            const until = testNow() + spin_ns;
-            var x: u64 = 0;
-            while (testNow() < until) {
-                inline for (0..8) |i| x +%= i;
-                std.mem.doNotOptimizeAway(x);
-            }
+            const ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(sleep_ns) };
+            _ = linux.nanosleep(&ts, null);
             spinning.store(false, .release);
             future.await(inner_io);
         }
@@ -2926,14 +3029,16 @@ test "watchdog: with one worker, what a stuck task queued still runs" {
     var done: std.atomic.Value(bool) = .init(false);
     var word: std.atomic.Value(u32) = .init(0);
     var spinning: std.atomic.Value(bool) = .init(false);
-    var future = try b.sched.concurrentWith(.{}, S.spinner, .{ io, &done, &word, &spinning, 300 * std.time.ns_per_ms });
+    var future = try b.sched.concurrentWith(.{}, S.blocker, .{ io, &done, &word, &spinning, 300 * std.time.ns_per_ms });
     // The main task is the only worker's task: it parks, and the task the spinner queued wakes
     // it when it has run.
     io.futexWaitUncancelable(u32, &word.raw, 0);
     try std.testing.expect(done.load(.acquire)); // it ran while the spinner still held the worker
     const stats = b.sched.stats();
     try std.testing.expect(stats.stuck_episodes >= 1);
-    try std.testing.expectEqualStrings("spinner", stats.last_stuck.?.name);
+    try std.testing.expect(stats.replacements >= 1);
+    try std.testing.expectEqual(TestBackend.Sched.Stats.Kind.blocked, stats.last_stuck.?.kind);
+    try std.testing.expectEqualStrings("blocker", stats.last_stuck.?.name);
     future.await(io);
 }
 
@@ -3030,4 +3135,38 @@ test "watchdog: without a barrier, a stuck task's next task waits for it" {
     future.await(io);
     // The queued task ran, and it ran after the spinner let the worker go.
     try std.testing.expect(!witnessed.load(.acquire));
+}
+
+test "watchdog: a computing task starts no replacement" {
+    const b = try testBackend(4);
+    defer destroyTestBackend(b);
+    const io = b.io();
+
+    const S = struct {
+        /// Spins for 300 ms without making an Io call: computing, not blocked. The idle workers
+        /// can take whatever it queues, and nothing about it is worth a replacement thread or a
+        /// log line.
+        fn compute(inner_io: Io, word: *std.atomic.Value(u32), spin_ns: u64) void {
+            const until = testNow() + spin_ns;
+            var x: u64 = 0;
+            while (testNow() < until) {
+                inline for (0..8) |i| x +%= i;
+                std.mem.doNotOptimizeAway(x);
+            }
+            word.store(1, .release);
+            inner_io.futexWake(u32, &word.raw, std.math.maxInt(u32));
+        }
+    };
+
+    const before = b.sched.stats();
+    var word: std.atomic.Value(u32) = .init(0);
+    var future = try b.sched.concurrentWith(.{ .affinity = .{ .pinned = 1 } }, S.compute, .{ io, &word, 300 * std.time.ns_per_ms });
+    // The main task parks, so that worker 0 is idle too while the computing task runs.
+    io.futexWaitUncancelable(u32, &word.raw, 0);
+    const after = b.sched.stats();
+    try std.testing.expect(after.computing_episodes > before.computing_episodes);
+    try std.testing.expectEqual(before.stuck_episodes, after.stuck_episodes); // nothing blocked
+    try std.testing.expectEqual(before.replacements, after.replacements); // and nothing replaced
+    try std.testing.expectEqual(TestBackend.Sched.Stats.Kind.computing, after.last_stuck.?.kind);
+    future.await(io);
 }
