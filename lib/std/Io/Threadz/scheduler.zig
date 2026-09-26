@@ -3638,14 +3638,35 @@ test "watchdog: with one worker, what a blocked task queued still runs" {
     // Awaited before the checks, so that a failed check fails the test instead of leaving a task
     // that `deinit` finds never awaited.
     future.await(io);
-    try std.testing.expect(done.load(.acquire)); // it ran while the blocker still held the worker
-    // The episode is counted by the watchdog, after the replacement started: wait for it.
+    // The episode is counted by the watchdog, after the replacement started: wait for it. This
+    // comes before the checks, because what the watchdog saw is what says whether a queued task
+    // that did not run was waiting on a worker counted as blocked or as computing.
     var stats = b.sched.stats();
     var waited_ms: u32 = 0;
     while (stats.stuck_episodes == 0 and waited_ms < 10_000) : (waited_ms += 1) {
         testSleep(std.time.ns_per_ms);
         stats = b.sched.stats();
     }
+    if (!done.load(.acquire)) {
+        // The queued task did not run while the blocker held the only worker. What the watchdog
+        // made of that worker, and what its thread's CPU time reads as now, is the difference
+        // between a worker it never replaced and a replacement that did not take the task.
+        const stuck = stats.last_stuck;
+        std.debug.print(
+            "one-worker watchdog: done=false blocked={} stuck={d} computing={d} replacements={d} kind={t} worker={d} stuck_ms={d} cpu_ns={?d}\n",
+            .{
+                blocked.load(.acquire),
+                stats.stuck_episodes,
+                stats.computing_episodes,
+                stats.replacements,
+                if (stuck) |st| st.kind else .blocked,
+                if (stuck) |st| st.worker else 0,
+                if (stuck) |st| st.ms else 0,
+                TestBackend.threadCpuTime(b, &b.sched.workers[0]),
+            },
+        );
+    }
+    try std.testing.expect(done.load(.acquire)); // it ran while the blocker still held the worker
     try std.testing.expect(stats.stuck_episodes >= 1);
     try std.testing.expect(stats.replacements >= 1);
     try std.testing.expectEqual(TestBackend.Sched.Stats.Kind.blocked, stats.last_stuck.?.kind);
