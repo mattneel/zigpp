@@ -370,7 +370,9 @@ pub fn Scheduler(comptime Backend: type) type {
             /// Set by `notify` when it wakes this worker to look for work: the worker counts in
             /// `Idle.searching` from then on, and takes the count over when it next looks.
             woken_to_search: std.atomic.Value(bool),
-            tick: u32,
+            /// Switches this worker made out of a task, the watchdog's second sample. See
+            /// `running`.
+            tick: std.atomic.Value(u32),
             steal_start: u32,
             stacks: StackCache,
             /// Tasks spawned here minus tasks that ended here. The sum over all workers counts
@@ -380,9 +382,6 @@ pub fn Scheduler(comptime Backend: type) type {
             /// publishes it with a release store at every switch; the watchdog reads it to tell
             /// a running task from a worker that is looking for work, and to name a stuck task.
             running: std.atomic.Value(?*Task) align(std.atomic.cache_line),
-            /// Switches out of a task. The watchdog samples it to tell a task that keeps
-            /// switching out from one that has not. Relaxed: the watchdog only compares values.
-            switched: std.atomic.Value(u64),
             /// Set by the watchdog while this worker is stuck: its queued tasks are takeable
             /// whatever their number. Cleared, by the watchdog, once the worker switches again.
             stranded: std.atomic.Value(bool),
@@ -648,7 +647,7 @@ pub fn Scheduler(comptime Backend: type) type {
             /// The task that worker runs, or null while it runs no task.
             task: ?*Task = null,
             /// Its switch count when the sample last saw it change.
-            switched: u64 = 0,
+            tick: u32 = 0,
             /// When it last saw this task with this switch count.
             since: i96 = 0,
             /// Whether this worker has been reported stuck and has not switched out since.
@@ -793,12 +792,11 @@ pub fn Scheduler(comptime Backend: type) type {
                 .inbox = .{},
                 .parked = .init(false),
                 .woken_to_search = .init(false),
-                .tick = 0,
+                .tick = .init(0),
                 .steal_start = index,
                 .stacks = .{},
                 .live = 0,
                 .running = .init(null),
-                .switched = .init(0),
                 .stranded = .init(false),
                 .spare = null,
                 .idle_tsan_fiber = undefined,
@@ -837,7 +835,6 @@ pub fn Scheduler(comptime Backend: type) type {
                 if (spare.state.load(.acquire) == .running) {
                     spare.thread.join();
                     const w = &spare.worker;
-                    if (tsan.enable) tsan.__tsan_destroy_fiber(w.idle_tsan_fiber);
                     live += w.live;
                     s.unmapStacks(w);
                     Backend.workerDeinit(s.backendOf(), w);
@@ -919,10 +916,8 @@ pub fn Scheduler(comptime Backend: type) type {
                 else
                     null;
                 if (old) |task| {
-                    // It parked or yielded: its budget starts over, and the watchdog sees that
-                    // this worker switched out of a task.
+                    // It parked or yielded: its budget starts over.
                     task.ops = 0;
-                    _ = w.switched.store(w.switched.load(.monotonic) +% 1, .monotonic);
                 }
                 // What the watchdog samples. Release: it names the task it publishes, and the
                 // task's fields are the ones the queue handoff made visible to this worker.
@@ -1011,8 +1006,9 @@ pub fn Scheduler(comptime Backend: type) type {
         /// The next task this worker can run without looking at other workers or polling, or
         /// `null` every `poll_interval` switches so that its scheduling loop polls.
         fn nextLocal(s: *Sched, w: *Worker) ?*Task {
-            w.tick +%= 1;
-            if (w.tick % poll_interval == 0) return null;
+            const tick = w.tick.load(.monotonic) +% 1;
+            w.tick.store(tick, .monotonic);
+            if (tick % poll_interval == 0) return null;
             return s.takeLocal(w);
         }
 
@@ -1474,10 +1470,10 @@ pub fn Scheduler(comptime Backend: type) type {
         /// something: the sample starts over. A task that does not for `stuck_after` is stuck.
         fn watchdogWorker(s: *Sched, w: *Worker, sample: *Sample, now: i96) void {
             const task = w.running.load(.acquire);
-            const switched = w.switched.load(.monotonic);
-            if (task == null or task != sample.task or switched != sample.switched) {
+            const tick = w.tick.load(.monotonic);
+            if (task == null or task != sample.task or tick != sample.tick) {
                 sample.task = task;
-                sample.switched = switched;
+                sample.tick = tick;
                 sample.since = now;
                 if (sample.stuck) {
                     // It switches out again: it is not stuck, and what it had queued goes back
@@ -1593,7 +1589,8 @@ pub fn Scheduler(comptime Backend: type) type {
         fn reapSpare(s: *Sched, spare: *Spare) void {
             spare.thread.join();
             const w = &spare.worker;
-            if (tsan.enable) tsan.__tsan_destroy_fiber(w.idle_tsan_fiber);
+            // No fiber to destroy: a worker past worker 0 uses the fiber its thread already has,
+            // which ends with the thread. Only worker 0's idle fiber is one this scheduler made.
             s.reaped_live += w.live;
             s.unmapStacks(w);
             Backend.workerDeinit(s.backendOf(), w);

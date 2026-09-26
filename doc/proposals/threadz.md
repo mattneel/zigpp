@@ -107,8 +107,30 @@ pinning. The stealing policy comes from the table above, not from the current co
    `localbench-isolate.sh` for `http1-uring`, `http1-ws-uring`, `http2-uring`,
    `http2-grpc-uring` and `http3-uring`. The recorded results are undated, so the baseline is
    re-measured first.
-4. **Budget, blocking, watchdog.** Acceptance: a spinning task costs one worker and nothing else
-   waits; a blocking C call inside a task is detected and named.
+4. **Budget, blocking, watchdog.** A task counts the Io operations it completes without parking,
+   and the operation past 128 yields it first, to the back of its worker's queue with its affinity
+   kept; the constant is `scheduler.budget`, and every Threadz entry point charges, the count
+   starting over at each park or yield. `io.blocking(fn, args)` is a new Io operation: `Threaded`,
+   `Kqueue`, `Dispatch` and the failing implementation make the call on the calling thread, and
+   Threadz runs it on a dirty pool, an `Io.Threaded` instance the instance owns and starts with
+   the first such call, parking the calling task with the argument and result slots on its own
+   stack; it is not cancelable once started. One watchdog thread per instance, started with the
+   first worker past worker 0, samples every worker every 10 ms: a worker whose current task has
+   not switched out for 100 ms is stuck, its queued tasks become takeable by every other worker
+   whatever their number, one replacement worker is started for it and released when it switches
+   again, `Threadz.stats()` counts the episodes, and one `std.log` line scoped `.threadz` names the
+   task, by id and by the function it was spawned with, which is what tasks are named by now (see
+   below). Pinned tasks stay put on a stuck worker. Acceptance: a spinning task costs one worker
+   and nothing else waits; a blocking C call inside a task is detected and named.
+
+   Shipped: the spin test queues 32 tasks behind a task that spins for 500 ms with no Io call and
+   has them all finish 114-116 ms later with the stuck counter up and the log line naming the
+   function; a task in a raw 300 ms `nanosleep` is reported the same way; 16 `io.blocking` calls
+   of 200 ms each finish in 205 ms while other tasks run; and 10,000 operations that never park on
+   a worker shared with one other task let that task run first. Task names come from
+   `Io.spawnedName`, a comptime instantiation whose type name carries the function's declaration
+   name, since the language has no reflection from a function value to its declaration; ids come
+   from one counter for the program. Step 5 below adds the naming API on top.
 5. **The other cores.** `Kqueue` rewritten on the shared scheduler for macOS and BSD; `Dispatch`
    retired once it reaches parity; IOCP and the Windows fiber work last.
 6. **BEAM shapes.** Arenas, `Io.Scoped`, `Io.Supervisor`, overflow policies.

@@ -193,7 +193,9 @@ fn dirtyBlocking(
     // word is on this task's stack, and a wake that arrives before the wait below does is not
     // lost: the wait returns at once when the word is not 0.
     futexWaitUncancelable(userdata, &done.raw, 0);
-    assert(done.raw != 0);
+    // Acquire: the pool thread wrote the result before it set this word, so what it wrote is
+    // visible here.
+    assert(done.load(.acquire) != 0);
 }
 
 /// The ring the watchdog wakes parked workers from. A ring has one submitter, so the watchdog
