@@ -1083,20 +1083,29 @@ pub fn Scheduler(comptime Backend: type) type {
         /// that is not one of the workers: those threads run no task, and the operations they
         /// may call block in the kernel rather than park.
         pub inline fn charge(s: *Sched) void {
-            // Inline throughout, with the worker's own threadlocal read here rather than through
-            // a call: this runs at the entry of every Threadz operation, and the benchmarks that
-            // are nothing but operations, async-await and spawn-chain, pay for every instruction
-            // between them and the work.
-            const w = Worker.self orelse return;
+            _ = s.chargeFetch();
+        }
+
+        /// `charge`, returning the worker the calling task runs on afterwards: the one it ran on
+        /// unless the charge yielded it, or `null` on a thread that is not a worker. An entry
+        /// point that needs the current worker takes this one rather than looking it up again,
+        /// which is what keeps the scheduler's own operations, all of them charged, to one
+        /// lookup. The lookup is `Worker.currentOrNull`, never an inline read of the
+        /// threadlocal: a task may resume on another thread after a switch, and a compiler may
+        /// reuse a threadlocal's address anywhere within one function.
+        pub inline fn chargeFetch(s: *Sched) ?*Worker {
+            const w = Worker.currentOrNull() orelse return null;
             // The idle context runs on the worker's own stack, not in a task.
-            if (w.current_context == &w.idle_context) return;
+            if (w.current_context == &w.idle_context) return w;
             const task = w.currentTask();
             if (task.ops < budget) {
                 task.ops += 1;
+                return w;
             } else {
                 @branchHint(.unlikely);
                 task.ops = 0;
                 s.yield(null, .reschedule);
+                return Worker.currentOrNull();
             }
         }
 
@@ -1974,10 +1983,12 @@ pub fn Scheduler(comptime Backend: type) type {
 
         // Spawning
 
-        /// Makes a task for `start` and its arguments. `name` is the name of the function it
-        /// will run, for the task names a log line reports: see `Io.spawnedName`.
+        /// Makes a task for `start` and its arguments, on worker `w`, the calling task's. `name`
+        /// is the name of the function it will run, for the task names a log line reports: see
+        /// `Io.spawnedName`.
         fn spawn(
             s: *Sched,
+            w: *Worker,
             options: SpawnOptions,
             result_len: usize,
             result_alignment: Alignment,
@@ -1986,7 +1997,6 @@ pub fn Scheduler(comptime Backend: type) type {
             name: [:0]const u8,
             start: @FieldType(Task, "start"),
         ) Io.ConcurrentError!*Task {
-            const w: *Worker = .current();
             const page = std.heap.pageSize();
             const result_space = @max(result_len, @sizeOf(Backend.Completion)) + result_alignment.toByteUnits();
             const header_size = @sizeOf(Task) + result_space + context.len + context_alignment.toByteUnits() + 64;
@@ -2252,12 +2262,13 @@ pub fn Scheduler(comptime Backend: type) type {
             start: *const fn (context: *const anyopaque, result: *anyopaque) void,
         ) Io.ConcurrentError!*Io.AnyFuture {
             const s = fromUserdata(userdata);
-            charge(s);
-            return s.spawnFuture(.{}, result_len, result_alignment, context, context_alignment, name, start);
+            const w = s.chargeFetch() orelse Worker.current();
+            return s.spawnFuture(w, .{}, result_len, result_alignment, context, context_alignment, name, start);
         }
 
         fn spawnFuture(
             s: *Sched,
+            w: *Worker,
             options: SpawnOptions,
             result_len: usize,
             result_alignment: Alignment,
@@ -2266,8 +2277,8 @@ pub fn Scheduler(comptime Backend: type) type {
             name: [:0]const u8,
             start: *const fn (context: *const anyopaque, result: *anyopaque) void,
         ) Io.ConcurrentError!*Io.AnyFuture {
-            const task = try s.spawn(options, result_len, result_alignment, context, context_alignment, name, .{ .future = start });
-            s.enqueueSpawned(.current(), task);
+            const task = try s.spawn(w, options, result_len, result_alignment, context, context_alignment, name, .{ .future = start });
+            s.enqueueSpawned(w, task);
             return @ptrCast(task);
         }
 
@@ -2278,12 +2289,15 @@ pub fn Scheduler(comptime Backend: type) type {
             result_alignment: Alignment,
         ) void {
             const s = fromUserdata(userdata);
-            charge(s);
+            var w = s.chargeFetch() orelse Worker.current();
             const awaiting: *Task = @ptrCast(@alignCast(future));
-            if (@atomicLoad(?*Task, &awaiting.link.awaiter, .acquire) != Task.finished)
+            if (@atomicLoad(?*Task, &awaiting.link.awaiter, .acquire) != Task.finished) {
                 s.yield(null, .{ .await = awaiting });
+                // The task may resume on another worker.
+                w = .current();
+            }
             @memcpy(result, awaiting.resultBytes(result_alignment));
-            s.destroyTask(.current(), awaiting);
+            s.destroyTask(w, awaiting);
         }
 
         pub fn cancel(
@@ -2342,12 +2356,13 @@ pub fn Scheduler(comptime Backend: type) type {
             start: *const fn (context: *const anyopaque) void,
         ) Io.ConcurrentError!void {
             const s = fromUserdata(userdata);
-            charge(s);
-            return s.spawnGroupMember(.{}, type_erased, context, context_alignment, name, start);
+            const w = s.chargeFetch() orelse Worker.current();
+            return s.spawnGroupMember(w, .{}, type_erased, context, context_alignment, name, start);
         }
 
         fn spawnGroupMember(
             s: *Sched,
+            w: *Worker,
             options: SpawnOptions,
             type_erased: *Io.Group,
             context: []const u8,
@@ -2356,12 +2371,12 @@ pub fn Scheduler(comptime Backend: type) type {
             start: *const fn (context: *const anyopaque) void,
         ) Io.ConcurrentError!void {
             const group: Group = .{ .ptr = type_erased };
-            const task = try s.spawn(options, 0, .@"1", context, context_alignment, name, .{ .group = .{
+            const task = try s.spawn(w, options, 0, .@"1", context, context_alignment, name, .{ .group = .{
                 .group = group,
                 .start = start,
             } });
             group.addTask(task);
-            s.enqueueSpawned(.current(), task);
+            s.enqueueSpawned(w, task);
         }
 
         pub fn groupAwait(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *anyopaque) Io.Cancelable!void {
@@ -2392,8 +2407,8 @@ pub fn Scheduler(comptime Backend: type) type {
 
         pub fn checkCancel(userdata: ?*anyopaque) Io.Cancelable!void {
             const s = fromUserdata(userdata);
-            charge(s);
-            const task = Worker.current().currentTask();
+            const w = s.chargeFetch() orelse Worker.current();
+            const task = w.currentTask();
             switch (task.cancel_protection.check()) {
                 .unblocked => {
                     const cancel_status = @atomicLoad(Task.CancelStatus, &task.cancel_status, .monotonic);
@@ -2441,6 +2456,7 @@ pub fn Scheduler(comptime Backend: type) type {
             };
             var future: Io.Future(Result) = undefined;
             future.any_future = try s.spawnFuture(
+                .current(),
                 options,
                 @sizeOf(Result),
                 .of(Result),
@@ -2466,7 +2482,7 @@ pub fn Scheduler(comptime Backend: type) type {
                     _ = @as(Io.Cancelable!void, @call(.auto, function, args_casted.*)) catch {};
                 }
             };
-            return s.spawnGroupMember(options, group, @ptrCast(&args), .of(Args), Io.spawnedName(function), TypeErased.start);
+            return s.spawnGroupMember(.current(), options, group, @ptrCast(&args), .of(Args), Io.spawnedName(function), TypeErased.start);
         }
 
         pub const Group = struct {
