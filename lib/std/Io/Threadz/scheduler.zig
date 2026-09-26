@@ -48,7 +48,7 @@
 //!   own pays no locked instruction while the backend can issue one. On Linux it is
 //!   `membarrier(PRIVATE_EXPEDITED)`, registered for once per process. A backend that does not
 //!   declare it, or that says it cannot, has every taker of a slot pay a compare-exchange, and
-//!   the watchdog takes no slot;
+//!   the watchdog takes the slot with the same exchange, which one of them wins;
 //! * `cancelOperation(backend, from, task, token)`, which cancels the operation `task` is waiting
 //!   for in the worker identified by `token`;
 //! * `allocator(backend)`;
@@ -1883,7 +1883,18 @@ pub fn Scheduler(comptime Backend: type) type {
                     const current = w.running.load(.acquire);
                     if (current != null and current.? == task and w.tick.load(.monotonic) == tick)
                         s.takeStuckSlot(w);
-                } else heavy_barrier_available.store(false, .release);
+                } else {
+                    // The backend cannot issue the barrier, so from here on every taker of a slot
+                    // pays a compare-exchange: see `takeNext`. An atomic swap is such a taker, so
+                    // the task the stuck worker had next is taken here as well, and the tasks
+                    // behind it do not wait for the worker either.
+                    heavy_barrier_available.store(false, .release);
+                    s.takeStuckSlot(w);
+                }
+            } else {
+                // No barrier at all: every taker of a slot pays a compare-exchange already, which
+                // this swap is one of, so the slot is the watchdog's like any stranded queue.
+                s.takeStuckSlot(w);
             }
             s.wakeIdle();
         }

@@ -22,6 +22,11 @@
 //! * `wake` is a trigger on the worker's own `EVFILT.USER` event, which any thread may set on any
 //!   kqueue.
 //!
+//! This core declares no `heavyBarrier` and no `threadCpuTime`-less shortcuts: no BSD has
+//! `membarrier`, or a way to read another thread's CPU time on all five systems. So the
+//! scheduler's cheaper taker of a stuck worker's slot is not available — every taker pays a
+//! compare-exchange — and a worker whose thread cannot be read is taken to be blocked.
+//!
 //! Regular files, directories, `stat`, locks, mappings, and process spawn and exec are made on
 //! the worker itself, as `Uring`'s synchronous paths are: kqueue has no event for them, and the
 //! calls are quick. A regular file's `fsync` is not, and goes to the scheduler's pool, the same
@@ -222,15 +227,6 @@ pub fn workerDeinit(ev: *Evented, worker: *Scheduler.Worker) void {
 pub fn threadCpuTime(ev: *Evented, worker: *Scheduler.Worker) ?u64 {
     _ = ev;
     return scheduler.CpuTime.read(worker.backend.cpu);
-}
-
-/// For the scheduler: whether this platform can issue a barrier that makes this thread's earlier
-/// stores visible to every other thread of the process after their own barriers. Darwin and the
-/// BSDs have no `membarrier`, so there is none, and every taker of a slot for the next task pays
-/// a compare-exchange while the watchdog takes no slot. See the scheduler's backend contract.
-pub fn heavyBarrier(ev: *Evented) bool {
-    _ = ev;
-    return false;
 }
 
 /// For the scheduler: cancels the operation `task` waits for. The token it registered is
@@ -514,17 +510,11 @@ fn park(
     const w = Scheduler.Worker.current();
     const task = w.currentTask();
     const completion = task.resultPointer(Completion);
-    const raw_state: u8 = @as(*const u8, @ptrCast(&completion.state)).*;
-    if (raw_state != 0) {
-        std.debug.panic("park: task {d} {s} raw_state {d} raw_outcome {d} count {d} fd {d}", .{
-            task.id,
-            task.name,
-            raw_state,
-            @as(*const u8, @ptrCast(&completion.outcome)).*,
-            completion.count,
-            completion.kq_fd,
-        });
-    }
+    // Nothing is assumed about the completion's bytes: the result space of a recycled mapping
+    // holds the last task's result, and a task that has never parked has whatever the mapping
+    // had, which for the main task is `undefined`. Every field a park needs is written below,
+    // before anything can act on it, and nothing acts on a completion whose task is not in the
+    // parked list.
     assert(registrations.len <= max_registrations);
     completion.outcome = .none;
     completion.count = @intCast(registrations.len);
