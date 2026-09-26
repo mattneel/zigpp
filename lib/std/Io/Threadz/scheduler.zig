@@ -309,6 +309,9 @@ pub fn Scheduler(comptime Backend: type) type {
             inbox: Inbox,
             /// Set while blocked in `poll` with nothing to run. A worker that clears it wakes this one.
             parked: std.atomic.Value(bool),
+            /// Set by `notify` when it wakes this worker to look for work: the worker counts in
+            /// `Idle.searching` from then on, and takes the count over when it next looks.
+            woken_to_search: std.atomic.Value(bool),
             tick: u32,
             steal_start: u32,
             stacks: StackCache,
@@ -617,6 +620,7 @@ pub fn Scheduler(comptime Backend: type) type {
                 .local = .{},
                 .inbox = .{},
                 .parked = .init(false),
+                .woken_to_search = .init(false),
                 .tick = 0,
                 .steal_start = index,
                 .stacks = .{},
@@ -821,9 +825,14 @@ pub fn Scheduler(comptime Backend: type) type {
         fn schedulingLoop(s: *Sched, w: *Worker) void {
             while (true) {
                 Backend.poll(s.backendOf(), w, .nonblocking);
+                // A worker `notify` woke counts as searching already.
+                const counted = w.woken_to_search.load(.monotonic) and w.woken_to_search.swap(false, .seq_cst);
                 // The shared queue first now and then, so that workers whose tasks keep them busy
                 // do not starve it.
-                const task = s.shared.pop() orelse s.takeLocal(w) orelse s.search(w) orelse {
+                const task = if (s.shared.pop() orelse s.takeLocal(w)) |task| task: {
+                    if (counted) s.stopSearching(w);
+                    break :task task;
+                } else s.search(w, counted) orelse {
                     if (s.stopping.load(.acquire)) return;
                     s.parkWorker(w);
                     continue;
@@ -888,9 +897,11 @@ pub fn Scheduler(comptime Backend: type) type {
         // Finding work
 
         /// Looks through the shared queue and the other workers' queues a few times, the first
-        /// searcher spinning for longer. Returns `null` if it found nothing to run.
-        fn search(s: *Sched, w: *Worker) ?*Task {
-            const spins: u32 = if (s.idle.searching.fetchAdd(1, .seq_cst) == 0) spin_limit else 0;
+        /// searcher spinning for longer. Returns `null` if it found nothing to run. `counted` says
+        /// that `notify` counted this worker as searching when it woke it.
+        fn search(s: *Sched, w: *Worker, counted: bool) ?*Task {
+            const first = counted or s.idle.searching.fetchAdd(1, .seq_cst) == 0;
+            const spins: u32 = if (first) spin_limit else 0;
             var attempt: u32 = 0;
             while (attempt < @max(spins, search_rounds)) : (attempt += 1) {
                 // A spinning worker looks through every queue only now and then.
@@ -899,9 +910,7 @@ pub fn Scheduler(comptime Backend: type) type {
                     (if (!w.inbox.isEmpty()) s.takeLocal(w) else null) orelse
                     (if (scan) s.steal(w) else null);
                 if (found) |task| {
-                    // Workers queueing tasks wake nobody while one searches, so the last searcher
-                    // to find something wakes another one if more is waiting.
-                    if (s.idle.searching.fetchSub(1, .seq_cst) == 1 and s.anyStealable(w)) s.notify(w);
+                    s.stopSearching(w);
                     return task;
                 }
                 if (s.stopping.load(.monotonic)) break;
@@ -909,6 +918,13 @@ pub fn Scheduler(comptime Backend: type) type {
             }
             _ = s.idle.searching.fetchSub(1, .seq_cst);
             return null;
+        }
+
+        /// `w` found a task while counted as searching. Workers queueing tasks wake nobody while
+        /// one searches, so the last searcher to find something wakes another one if more is
+        /// waiting.
+        fn stopSearching(s: *Sched, w: *Worker) void {
+            if (s.idle.searching.fetchSub(1, .seq_cst) == 1 and s.anyStealable(w)) s.notify(w);
         }
 
         /// Takes tasks from another worker whose queue has more than `steal_threshold`: the
@@ -979,18 +995,29 @@ pub fn Scheduler(comptime Backend: type) type {
         fn notify(s: *Sched, from: *Worker) void {
             if (s.idle.searching.load(.seq_cst) != 0) return;
             if (s.idle.parked.load(.seq_cst) != 0) {
+                // The worker woken here counts as searching from now on, so that the work queued
+                // before it gets to look wakes no other worker.
+                if (s.idle.searching.cmpxchgStrong(0, 1, .seq_cst, .monotonic) != null) return;
                 while (true) {
                     const index = index: {
                         s.idle.lock.lock();
                         defer s.idle.lock.unlock();
-                        if (s.idle.len == 0) return; // all being woken already
+                        if (s.idle.len == 0) {
+                            // All being woken already.
+                            _ = s.idle.searching.fetchSub(1, .seq_cst);
+                            return;
+                        }
                         s.idle.len -= 1;
                         break :index s.idle.stack[s.idle.len];
                     };
                     const target = &s.workers[index];
+                    target.woken_to_search.store(true, .seq_cst);
                     if (target.parked.cmpxchgStrong(true, false, .seq_cst, .monotonic) == null) {
                         return Backend.wake(s.backendOf(), from, target);
                     }
+                    // Awake already. If it took the count over meanwhile, it searches; if not,
+                    // the count goes to the next parked worker.
+                    if (!target.woken_to_search.swap(false, .seq_cst)) return;
                 }
             }
             s.startWorker(s.reserved.load(.monotonic)) catch {};

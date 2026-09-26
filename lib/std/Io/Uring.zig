@@ -621,12 +621,15 @@ pub fn workerInit(ev: *Evented, worker: *Scheduler.Worker) !void {
     const entries = @as(u16, 1) << ev.log2_ring_entries;
     worker.backend = .{
         .io_uring = if (worker.index == 0)
-            try .init(entries, linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER)
+            try .init(entries, linux.IORING_SETUP_COOP_TASKRUN |
+                linux.IORING_SETUP_TASKRUN_FLAG |
+                linux.IORING_SETUP_SINGLE_ISSUER)
         else ring: {
             var params = std.mem.zeroInit(linux.io_uring_params, .{
                 .flags = linux.IORING_SETUP_ATTACH_WQ |
                     linux.IORING_SETUP_R_DISABLED |
                     linux.IORING_SETUP_COOP_TASKRUN |
+                    linux.IORING_SETUP_TASKRUN_FLAG |
                     linux.IORING_SETUP_SINGLE_ISSUER,
                 .wq_fd = @as(u32, @intCast(ev.sched.workers[0].backend.io_uring.fd)),
             });
@@ -656,7 +659,15 @@ pub fn workerDeinit(ev: *Evented, worker: *Scheduler.Worker) void {
 /// operation finished back to the scheduler. `.block` first waits for at least one completion.
 pub fn poll(ev: *Evented, worker: *Scheduler.Worker, mode: scheduler.PollMode) void {
     const thread = &worker.backend;
-    _ = thread.io_uring.submit_and_wait(switch (mode) {
+    const ring = &thread.io_uring;
+    // A nonblocking poll enters the kernel only to submit, or to run the completion work the
+    // kernel has flagged. Completions it has already posted are in the ring.
+    const enter = switch (mode) {
+        .block => true,
+        .nonblocking => ring.sq_ready() != 0 or @atomicLoad(u32, ring.sq.flags, .unordered) &
+            (linux.IORING_SQ_TASKRUN | linux.IORING_SQ_CQ_OVERFLOW) != 0,
+    };
+    if (enter) _ = ring.submit_and_wait(switch (mode) {
         .nonblocking => 0,
         .block => 1,
     }) catch |err| switch (err) {
