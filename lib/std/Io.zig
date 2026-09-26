@@ -2696,7 +2696,10 @@ test {
     _ = Reader;
     _ = Writer;
     _ = Threadz;
-    _ = @import("Io/Threadz/scheduler.zig");
+    // The shared scheduler runs under `Uring` and nowhere else yet, and its own tests use Linux
+    // futexes and Linux's mmap flags; the other cores bring it to their systems. The OS test
+    // comes first so that no other system analyzes `Threadz` against Linux's cores.
+    if (builtin.os.tag == .linux and Threadz != void) _ = @import("Io/Threadz/scheduler.zig");
     _ = Threaded;
     _ = RwLock;
     _ = Semaphore;
