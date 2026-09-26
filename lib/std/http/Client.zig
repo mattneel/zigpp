@@ -96,6 +96,7 @@ pub const ConnectionPool = struct {
             if (!connection.host().eql(criteria.host)) continue;
 
             pool.acquireUnsafe(connection);
+            connection.reused = true;
             return connection;
         }
 
@@ -237,6 +238,10 @@ pub const Connection = struct {
     proxied: bool,
     closing: bool,
     protocol: Protocol,
+    /// Whether the pool handed this connection out for another request. A server may close a
+    /// connection while it sits idle in the pool, and `Request.receiveHead` sends a request
+    /// again on a new connection when a reused one turns out to be closed.
+    reused: bool = false,
 
     const Plain = struct {
         connection: Connection,
@@ -1136,6 +1141,11 @@ pub const Request = struct {
             const head_buffer = r.reader.receiveHead() catch |err| {
                 // Failure here means the connection can no longer be reused.
                 connection.closing = true;
+                if (r.closedWhileIdle(err)) {
+                    try r.reconnect();
+                    try r.sendBodiless();
+                    continue;
+                }
                 return err;
             };
             const response: Response = .{
@@ -1275,6 +1285,46 @@ pub const Request = struct {
             .max_head_len = r.client.read_buffer_size,
         };
         r.redirect_behavior.subtractOne();
+    }
+
+    /// Whether `err`, from receiving the head of the response, means that the server closed the
+    /// connection while it sat idle in the pool, so that the request can be sent again on a new
+    /// one: the connection was reused, not one byte of the response arrived, and sending the
+    /// request again is safe, because its method is idempotent and it has no body.
+    fn closedWhileIdle(r: *const Request, err: http.Reader.HeadError) bool {
+        const connection = r.connection.?;
+        if (!connection.reused) return false;
+        if (!r.method.idempotent() or r.transfer_encoding != .none) return false;
+        return switch (err) {
+            error.HttpConnectionClosing => true,
+            error.ReadFailed => if (connection.getReadError()) |read_err|
+                read_err == error.ConnectionResetByPeer
+            else
+                false,
+            else => false,
+        };
+    }
+
+    /// Replaces the request's connection with a new one to the same host, releasing the old
+    /// one. A pooled connection that is closed as well fails in turn and is released too, so
+    /// the pool runs out of stale connections.
+    fn reconnect(r: *Request) ConnectError!void {
+        const io = r.client.io;
+        // `r.uri` made the connection being replaced, so both of these succeed.
+        const protocol = Protocol.fromUri(r.uri).?;
+        var host_name_buffer: [HostName.max_len]u8 = undefined;
+        const host = HostName.fromUri(r.uri, &host_name_buffer) catch unreachable;
+        r.client.connection_pool.release(r.connection.?, io);
+        r.connection = null;
+        const new_connection = try r.client.connect(host, uriPort(r.uri, protocol), protocol);
+        r.connection = new_connection;
+        r.reader = .{
+            .in = new_connection.reader(),
+            .state = .ready,
+            // Populated when `http.Reader.bodyReader` is called.
+            .interface = undefined,
+            .max_head_len = r.client.read_buffer_size,
+        };
     }
 
     /// Returns true if the default behavior is required, otherwise handles

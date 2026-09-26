@@ -1262,21 +1262,30 @@ test "redirect to different connection" {
     }
 }
 
-test "boot failed connections from the pool" {
+test "a request on a pooled connection the server closed is sent again" {
     if (builtin.os.tag == .openbsd) return error.SkipZigTest; // https://codeberg.org/ziglang/zig/issues/30806
 
     const io = std.testing.io;
     const gpa = std.testing.allocator;
 
-    const test_server_orig = try createTestServer(io, struct {
-        fn run(test_server: *TestServer) anyerror!void {
-            const net_server = &test_server.net_server;
+    // Answers the first request on each connection and closes it on the second, after reading
+    // that request whole: a server whose idle timeout fired as the second request arrived.
+    const global = struct {
+        var connections: std.atomic.Value(u32) = .init(0);
+    };
+    global.connections.store(0, .monotonic);
+    const test_server = try createTestServer(io, struct {
+        fn run(ts: *TestServer) anyerror!void {
+            const net_server = &ts.net_server;
             var recv_buffer: [500]u8 = undefined;
             var send_buffer: [500]u8 = undefined;
+            var body_buffer: [64]u8 = undefined;
 
-            accept: while (!test_server.shutting_down) {
+            accept: while (!ts.shutting_down) {
                 var stream = try net_server.accept(io);
                 defer stream.close(io);
+                if (ts.shutting_down) break;
+                _ = global.connections.fetchAdd(1, .monotonic);
 
                 for (0..2) |i| {
                     var connection_br = stream.reader(io, &recv_buffer);
@@ -1286,12 +1295,16 @@ test "boot failed connections from the pool" {
                         error.HttpConnectionClosing => continue :accept,
                         else => |e| return e,
                     };
-                    if (i == 0) try request.respond("hello", .{});
+                    if (i == 0) {
+                        try request.respond("hello", .{});
+                    } else {
+                        _ = try request.readerExpectNone(&body_buffer).discardRemaining();
+                    }
                 }
             }
         }
     });
-    defer test_server_orig.destroy();
+    defer test_server.destroy();
 
     var client: http.Client = .{
         .allocator = gpa,
@@ -1300,23 +1313,24 @@ test "boot failed connections from the pool" {
     defer client.deinit();
 
     var loc_buf: [100]u8 = undefined;
-    const location = try std.mem.print(&loc_buf, "http://127.0.0.1:{d}/", .{
-        test_server_orig.port(),
-    });
+    const location = try std.mem.print(&loc_buf, "http://127.0.0.1:{d}/", .{test_server.port()});
     const uri = try std.Uri.parse(location);
 
-    {
+    // A GET finds the pooled connection closed, and is sent again on a new one, every time.
+    for (1..4) |n| {
         const response = try client.fetch(.{ .location = .{ .uri = uri } });
         try expectEqual(.ok, response.status);
+        try expectEqual(n, global.connections.load(.monotonic));
     }
-    {
-        try expectError(error.HttpConnectionClosing, client.fetch(.{ .location = .{ .uri = uri } }));
-    }
-    {
-        const response = try client.fetch(.{ .location = .{ .uri = uri } });
-        try expectEqual(.ok, response.status);
-    }
-    {
-        try expectError(error.HttpConnectionClosing, client.fetch(.{ .location = .{ .uri = uri } }));
-    }
+
+    // A request with a body is not sent twice: the closed connection fails it, and is booted
+    // from the pool.
+    try expectError(error.HttpConnectionClosing, client.fetch(.{
+        .location = .{ .uri = uri },
+        .method = .POST,
+        .payload = "twice would be once too many",
+    }));
+    const response = try client.fetch(.{ .location = .{ .uri = uri } });
+    try expectEqual(.ok, response.status);
+    try expectEqual(4, global.connections.load(.monotonic));
 }
