@@ -348,9 +348,6 @@ fn unpark(
     const completion = task.resultPointer(Completion);
     const state = completion.state.load(.monotonic);
     assert(state == .parked or state == .waiting);
-    std.log.scoped(.threadz).warn("diag: task {d} {s} done, outcome {t}, worker {d}", .{
-        task.id, task.name, outcome, backend_index(backend),
-    });
     completion.state.store(.idle, .monotonic);
     completion.outcome = outcome;
     removeParked(backend, task);
@@ -535,9 +532,6 @@ fn park(
         w.backend.parked = task;
         register(ev, &w.backend, task);
     }
-    std.log.scoped(.threadz).warn("diag: task {d} {s} parks, {d} registrations, worker {d}", .{
-        task.id, task.name, completion.count, w.index,
-    });
     if (region) |r| r.arm(w) catch |err| {
         assert(err == error.Canceled);
         // Nothing is armed, so nothing can reach this task any more: it takes itself out.
@@ -559,7 +553,11 @@ fn park(
     switch (completion.outcome) {
         .ready => return .ready,
         .timeout => return .timeout,
-        .canceled, .none => return error.Canceled,
+        .canceled => return error.Canceled,
+        // Nothing completed this wait: the task was woken by the futex table, whose waker has no
+        // worker to write an outcome and no work to do here — the caller re-reads its word, and an
+        // operation retries its system call.
+        .none => return .ready,
     }
 }
 
@@ -668,12 +666,6 @@ fn otherWaitingOn(backend: *Worker, task: *Fiber, reg: Registration) ?*Fiber {
         if (waitsOn(other_completion, reg)) return other;
     }
     return null;
-}
-
-/// The index of the worker that owns this backend, for a diagnostic line.
-fn backend_index(backend: *Worker) u32 {
-    const scheduler_worker: *Scheduler.Worker = @alignCast(@fieldParentPtr("backend", backend));
-    return scheduler_worker.index;
 }
 
 /// Whether this completion has the event, whether it added it or not.

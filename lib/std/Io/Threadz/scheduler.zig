@@ -1354,7 +1354,6 @@ pub fn Scheduler(comptime Backend: type) type {
                 // do not starve it.
                 const task = if (s.shared.pop() orelse s.takeLocal(w)) |task| task: {
                     if (counted) s.stopSearching(w);
-                    std.log.scoped(.threadz).warn("diag: worker {d} takes task {d}", .{ w.index, task.id });
                     break :task task;
                 } else s.search(w, counted) orelse {
                     if (s.stopping.load(.acquire)) return;
@@ -1549,9 +1548,6 @@ pub fn Scheduler(comptime Backend: type) type {
                 s.idle.len += 1;
             }
             if (w.inbox.isEmpty() and !s.anyStealable(w) and !s.stopping.load(.seq_cst)) {
-                std.log.scoped(.threadz).warn("diag: worker {d} blocks in poll, shared {d}", .{
-                    w.index, s.shared.len.load(.seq_cst),
-                });
                 Backend.poll(s.backendOf(), w, .block);
             }
             w.parked.store(false, .seq_cst);
@@ -1595,9 +1591,6 @@ pub fn Scheduler(comptime Backend: type) type {
         /// to park announces it with `.seq_cst` stores, then looks at the queues with `.seq_cst`
         /// loads. So either this sees the worker searching or parked, or the worker sees the work.
         fn notify(s: *Sched, from: ?*Worker) void {
-            std.log.scoped(.threadz).warn("diag: notify from {}: searching {d}, parked {d}, shared {d}", .{
-                from != null, s.idle.searching.load(.seq_cst), s.idle.parked.load(.seq_cst), s.shared.len.load(.seq_cst),
-            });
             if (s.idle.searching.load(.seq_cst) != 0) return;
             if (s.idle.parked.load(.seq_cst) != 0) {
                 // The worker woken here counts as searching from now on, so that the work queued
@@ -1952,11 +1945,7 @@ pub fn Scheduler(comptime Backend: type) type {
         /// would take, and puts it in the shared queue, where every worker looks. Called by the
         /// watchdog, which is the only other taker of a slot: see `takeNext`.
         fn takeStuckSlot(s: *Sched, w: *Worker) void {
-            const task = w.run_next.swap(null, .acquire) orelse {
-                std.log.scoped(.threadz).warn("diag: stuck worker {d} had no slot task", .{w.index});
-                return;
-            };
-            std.log.scoped(.threadz).warn("diag: took task {d} from stuck worker {d}'s slot", .{ task.id, w.index });
+            const task = w.run_next.swap(null, .acquire) orelse return;
             s.shared.push(&.{task});
             s.notify(null);
         }
@@ -2136,7 +2125,6 @@ pub fn Scheduler(comptime Backend: type) type {
                 // its slot is the wrong place for this task: a slot has one taker, and that taker
                 // is the worker itself, which is what `takeStuckSlot` exists to work around. The
                 // shared queue is where every worker looks, and one of them is woken for this.
-                std.log.scoped(.threadz).warn("diag: task {d} to the shared queue; worker {d} is stranded", .{ task.id, w.index });
                 s.shared.push(&.{task});
                 s.notify(null);
                 return;
@@ -3648,14 +3636,6 @@ test "watchdog: with one worker, what a blocked task queued still runs" {
     // Awaited before the checks, so that a failed check fails the test instead of leaving a task
     // that `deinit` finds never awaited.
     future.await(io);
-    const diag = b.sched.stats();
-    std.debug.print("watchdog test: done={} blocked={} stuck={d} replacements={d} rounds={d}\n", .{
-        done.load(.acquire),
-        blocked.load(.acquire),
-        diag.stuck_episodes,
-        diag.replacements,
-        diag.watchdog_rounds,
-    });
     try std.testing.expect(done.load(.acquire)); // it ran while the blocker still held the worker
     // The episode is counted by the watchdog, after the replacement started: wait for it.
     var stats = b.sched.stats();
