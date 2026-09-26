@@ -42,6 +42,15 @@ TypeScript does. The compiler is at `0.17.0-dev`, every push to master is a
 release, and [Versions and Releases](versions.md) explains what the version
 string means.
 
+**What version is Zig++?** None. Every push to master is a release, and every
+release is kept forever: you pin the build you use. A build is named for the
+upstream version it tracks, its commit height, and its commit, as in
+`0.17.0-dev.2469+zigpp.04926fc36`. See [Live at Head](live-at-head.md).
+
+**When is 1.0?** 1.0 is a milestone, not a version. The milestone closes when
+Zig++ gets its borrow checker, and the build that closes it ships like every
+other build. There is no Zig++ 1.0.
+
 **Can upstream Zig build Zig++?** No. Zig++ changed `std.lang.Type`, and an
 upstream Zig binary cannot compile against it. Use the CMake build,
 `bootstrap.c`, or an existing Zig++ binary; see

@@ -10,12 +10,13 @@
      └─ the upstream version it is based on
 ```
 
-The base version is the last upstream Zig release that this commit descends
-from: `0.17.0`. `0.16.0` is the tag that the commit count is measured from, so
-`dev.2361` is 2361 commits after it. Both numbers come from `git describe`, and
-the commit is its abbreviated hash. The base version and the tagged ancestor
-are checked against each other, and a checkout where `git describe` cannot
-answer is built as the plain base version.
+The base version, `0.17.0`, is upstream's version in development: `build.zig`
+names it, and it must be greater than the last upstream release this commit
+descends from, `0.16.0`. That release's tag is where the commit count starts,
+so `dev.2361` is 2361 commits after it. The count comes from `git describe`,
+which considers only upstream's tags, and the commit is its abbreviated hash. A
+checkout where `git describe` cannot answer is built as the plain base version.
+Zig++ numbers nothing else; see [Live at Head](live-at-head.md).
 
 The version is what `zig version` prints, what `zig env` reports, and what names
 the archives of a release. It is also what tells two Zig++ builds apart: unlike
