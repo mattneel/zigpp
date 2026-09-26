@@ -603,7 +603,13 @@ fn park(
     switch (completion.outcome) {
         .ready => return .ready,
         .timeout => return .timeout,
-        .canceled => return error.Canceled,
+        .canceled => {
+            // The cancelation arrived as this wait's result, which is where it is acknowledged:
+            // the task stays cancel-protected until it re-arms the request with `Io.recancel` or
+            // ends the protection, which is what makes the error a delivered one.
+            task.cancel_protection.acknowledge();
+            return error.Canceled;
+        },
         // Nothing completed this wait: the task was woken by the futex table, whose waker has no
         // worker to write an outcome and no work to do here — the caller re-reads its word, and an
         // operation retries its system call.
