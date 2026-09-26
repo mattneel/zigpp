@@ -1520,21 +1520,25 @@ pub fn Scheduler(comptime Backend: type) type {
         /// threads in the kernel sleeps here rather than spinning.
         fn watchdogWait(s: *Sched) void {
             const io = Backend.io(s.backendOf());
-            var timeout: Io.Timeout = .{ .duration = .{
+            if (s.allParked()) {
+                // The flag is set before the word is cleared, and the loop looks at the workers
+                // after both: a worker that unparks after that look sees the flag and sets and
+                // wakes the word, which ends the wait; one that unparks before it ends the loop
+                // there. A wait that returns for any other reason, such as a spurious wake,
+                // waits again, so that an idle program has no rounds at all.
+                s.watchdog_sleeping.store(true, .release);
+                defer s.watchdog_sleeping.store(false, .release);
+                s.watchdog_wait.store(0, .release);
+                while (s.watchdog_wait.load(.acquire) == 0 and s.allParked() and !s.stopping.load(.acquire)) {
+                    Io.futexWaitTimeout(io, u32, &s.watchdog_wait.raw, 0, .none) catch {};
+                }
+                return;
+            }
+            s.watchdog_wait.store(0, .release);
+            Io.futexWaitTimeout(io, u32, &s.watchdog_wait.raw, 0, .{ .duration = .{
                 .raw = .fromNanoseconds(watchdog_interval),
                 .clock = .awake,
-            } };
-            if (s.allParked()) {
-                // The flag is set before the word is cleared, and the second look is after the
-                // flag: a worker that unparks between the two either sees the flag and wakes the
-                // word, which makes the wait below return at once, or clears its `parked` before
-                // the second look, which keeps the timeout below.
-                s.watchdog_sleeping.store(true, .release);
-                s.watchdog_wait.store(0, .release);
-                if (s.allParked() and !s.stopping.load(.acquire)) timeout = .none;
-            } else s.watchdog_wait.store(0, .release);
-            Io.futexWaitTimeout(io, u32, &s.watchdog_wait.raw, 0, timeout) catch {};
-            s.watchdog_sleeping.store(false, .release);
+            } }) catch {};
         }
 
         /// Whether every worker that exists is parked, which is when the watchdog has nothing to
@@ -2926,37 +2930,45 @@ test "watchdog: an idle instance has no rounds" {
             inner_io.futexWaitUncancelable(u32, &word.raw, 0);
         }
 
-        /// Waits for every worker to be parked, then measures the watchdog's rounds over a
-        /// window, then wakes the parked tasks. A thread that is not one of the workers wakes
-        /// them through the Io interface: a wake of the kernel would not reach tasks this
-        /// backend parks itself.
-        fn measure(b2: *TestBackend, inner_io: Io, word: *std.atomic.Value(u32), before: *std.atomic.Value(u64), during: *std.atomic.Value(u64)) void {
-            // Wait for the workers to park and the watchdog to settle into its untimed wait.
-            const settle: linux.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
-            _ = linux.nanosleep(&settle, null);
-            const start = b2.sched.stats().watchdog_rounds;
+        /// Waits for the watchdog to fall asleep, which it does once every worker is parked,
+        /// then counts its rounds over a window, then wakes the parked tasks and waits for the
+        /// watchdog to sample again. Each wait is for the state it expects, not for a fixed
+        /// time, which a loaded machine can outlast. A thread that is not one of the workers
+        /// wakes the tasks through the Io interface: a wake of the kernel would not reach tasks
+        /// this backend parks itself.
+        fn measure(b2: *TestBackend, inner_io: Io, word: *std.atomic.Value(u32), result: *Result) void {
+            const s = &b2.sched;
+            const step: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+            var tries: u32 = 0;
+            while (!s.watchdog_sleeping.load(.acquire) and tries < 10_000) : (tries += 1) _ = linux.nanosleep(&step, null);
+            result.asleep = s.watchdog_sleeping.load(.acquire);
+            const start = s.stats().watchdog_rounds;
             const window: linux.timespec = .{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
             _ = linux.nanosleep(&window, null);
-            const end = b2.sched.stats().watchdog_rounds;
-            before.store(start, .release);
-            during.store(end - start, .release);
+            const end = s.stats().watchdog_rounds;
+            result.during = end - start;
             word.store(1, .release);
             inner_io.futexWake(u32, &word.raw, std.math.maxInt(u32)); // every waiter
+            tries = 0;
+            while (s.stats().watchdog_rounds == end and tries < 10_000) : (tries += 1) _ = linux.nanosleep(&step, null);
+            result.woken = s.stats().watchdog_rounds != end;
         }
+
+        const Result = struct { asleep: bool = false, during: u64 = 0, woken: bool = false };
     };
 
     var word: std.atomic.Value(u32) = .init(0);
-    var before: std.atomic.Value(u64) = .init(0);
-    var during: std.atomic.Value(u64) = .init(0);
+    var result: S.Result = .{};
     // One task parked on each worker, so that both workers are parked and there is nothing to
     // sample.
     var parked_here = try b.sched.concurrentWith(.{ .affinity = .{ .pinned = 1 } }, S.park, .{ io, &word });
     var parked_there = try b.sched.concurrentWith(.{ .affinity = .{ .pinned = 0 } }, S.park, .{ io, &word });
-    const thread = try std.Thread.spawn(.{}, S.measure, .{ b, io, &word, &before, &during });
+    const thread = try std.Thread.spawn(.{}, S.measure, .{ b, io, &word, &result });
     io.futexWaitUncancelable(u32, &word.raw, 0);
     thread.join();
-    try std.testing.expect(before.load(.acquire) >= 1); // the watchdog ran while tasks ran
-    try std.testing.expectEqual(0, during.load(.acquire)); // and no rounds with every worker parked
+    try std.testing.expect(result.asleep); // every worker parked: the watchdog waits untimed
+    try std.testing.expectEqual(0, result.during); // and has no rounds while they stay parked
+    try std.testing.expect(result.woken); // until a worker unparks, which wakes it
     parked_here.await(io);
     parked_there.await(io);
 }
