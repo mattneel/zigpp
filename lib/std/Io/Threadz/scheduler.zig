@@ -1945,7 +1945,11 @@ pub fn Scheduler(comptime Backend: type) type {
         /// would take, and puts it in the shared queue, where every worker looks. Called by the
         /// watchdog, which is the only other taker of a slot: see `takeNext`.
         fn takeStuckSlot(s: *Sched, w: *Worker) void {
-            const task = w.run_next.swap(null, .acquire) orelse return;
+            const task = w.run_next.swap(null, .acquire) orelse {
+                std.log.scoped(.threadz).warn("diag: stuck worker {d} had no slot task", .{w.index});
+                return;
+            };
+            std.log.scoped(.threadz).warn("diag: took task {d} from stuck worker {d}'s slot", .{ task.id, w.index });
             s.shared.push(&.{task});
             s.notify(null);
         }
@@ -2125,6 +2129,7 @@ pub fn Scheduler(comptime Backend: type) type {
                 // its slot is the wrong place for this task: a slot has one taker, and that taker
                 // is the worker itself, which is what `takeStuckSlot` exists to work around. The
                 // shared queue is where every worker looks, and one of them is woken for this.
+                std.log.scoped(.threadz).warn("diag: task {d} to the shared queue; worker {d} is stranded", .{ task.id, w.index });
                 s.shared.push(&.{task});
                 s.notify(null);
                 return;
