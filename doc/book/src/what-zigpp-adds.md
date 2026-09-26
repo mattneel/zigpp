@@ -275,8 +275,10 @@ watchdog needs to tell a blocked worker from a computing one, through Mach's
 `thread_info` and the thread clock `pthread_getcpuclockid` hands out; the other
 BSDs can only read their own thread's, so there a stuck worker is always taken
 to be blocked. And no BSD has an equivalent of Linux's `membarrier`, so every
-taker of a stuck worker's slot pays a compare-exchange and the watchdog takes
-none.
+taker of a stuck worker's slot pays a compare-exchange, the watchdog's own
+taker among them: an atomic swap against a compare-exchange, one winner
+either way. That is how the task a blocked worker had next, and the tasks
+behind it, run on the replacement instead of waiting for the worker.
 
 A task that drives io_uring itself, such as a server's event loop, can borrow
 its worker's ring instead of making one of its own. `acquireRing` lends it to a
