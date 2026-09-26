@@ -2966,11 +2966,13 @@ test "watchdog: an idle instance has no rounds" {
     const thread = try std.Thread.spawn(.{}, S.measure, .{ b, io, &word, &result });
     io.futexWaitUncancelable(u32, &word.raw, 0);
     thread.join();
+    // Awaited before the checks, so that a failed check fails the test instead of leaving tasks
+    // that `deinit` finds never awaited.
+    parked_here.await(io);
+    parked_there.await(io);
     try std.testing.expect(result.asleep); // every worker parked: the watchdog waits untimed
     try std.testing.expectEqual(0, result.during); // and has no rounds while they stay parked
     try std.testing.expect(result.woken); // until a worker unparks, which wakes it
-    parked_here.await(io);
-    parked_there.await(io);
 }
 
 test "watchdog: without a barrier, a stuck task's next task waits for it" {
