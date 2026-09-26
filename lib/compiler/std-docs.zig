@@ -11,6 +11,9 @@ fn usage(io: Io) noreturn {
     Io.File.stdout().writeStreamingAll(io,
         \\Usage: zig std [options]
         \\
+        \\Serves the standard library documentation, and at /langref.html the language
+        \\reference, of this installation.
+        \\
         \\Options:
         \\  -h, --help                Print this help and exit
         \\  -p [port], --port [port]  Port to listen on. Default is 0, meaning an ephemeral port chosen by the system.
@@ -149,6 +152,8 @@ fn serveRequest(request: *std.http.Server.Request, context: *Context) !void {
         std.mem.eql(u8, request.head.target, "/debug/sources.tar"))
     {
         try serveSourcesTar(request, context);
+    } else if (std.mem.eql(u8, request.head.target, "/langref.html")) {
+        try serveLangRef(request, context);
     } else {
         try request.respond("not found", .{
             .status = .not_found,
@@ -157,6 +162,37 @@ fn serveRequest(request: *std.http.Server.Request, context: *Context) !void {
             },
         });
     }
+}
+
+/// Where an installation keeps its language reference, relative to its lib directory: beside
+/// `lib/` in a release archive and other `-Dflat` installations, and two levels up from the
+/// `lib/zig/` of the others.
+const langref_paths = [_][]const u8{ "../doc/langref.html", "../../doc/langref.html" };
+
+/// The language reference of the compiler that serves the docs, so the two describe the same
+/// build.
+fn serveLangRef(request: *std.http.Server.Request, context: *Context) !void {
+    const gpa = context.gpa;
+    const io = context.io;
+    for (langref_paths) |path| {
+        const contents = context.lib_dir.readFileAlloc(io, path, gpa, .limited(64 * 1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => |e| return e,
+        };
+        defer gpa.free(contents);
+        return request.respond(contents, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "text/html" },
+                cache_control_header,
+            },
+        });
+    }
+    try request.respond("This installation has no language reference: it keeps none at doc/langref.html beside its lib directory.", .{
+        .status = .not_found,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "text/plain" },
+        },
+    });
 }
 
 const cache_control_header: std.http.Header = .{
