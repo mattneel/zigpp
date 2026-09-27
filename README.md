@@ -177,14 +177,14 @@ releases; upstream does it for us.
    disappear.
 5. **The root project's pin wins.** Dependencies state minimums, and a pin
    older than a dependency's minimum is an error that names the dependency and
-   the build to move to. *The minimum check is tooling: planned.*
+   the build to move to. *The minimum check is planned: [#39](https://github.com/mattneel/zigpp/issues/39).*
 6. **Breakage is announced at the upgrade, not by a number.** Every commit that
    breaks existing code carries a `Breaking:` trailer saying what breaks and
    what to write instead, and a merge of upstream Zig carries one for each of
    upstream's breaking changes in the merged range. *Collecting them for an
-   upgrade is tooling: planned.*
+   upgrade is planned: [#37](https://github.com/mattneel/zigpp/issues/37) and [#38](https://github.com/mattneel/zigpp/issues/38).*
 7. **There are no LTS branches.** Security fixes land on head, and advisories
-   name the affected range of builds. *Advisories are tooling: planned.*
+   name the affected range of builds. *Advisories are planned: [#40](https://github.com/mattneel/zigpp/issues/40).*
 8. **Docs travel with the pin.** Every build carries its own std docs and
    language reference, and `zig std` serves them (the language reference from
    0.17.0-dev.2476 on).

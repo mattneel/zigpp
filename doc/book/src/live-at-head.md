@@ -43,7 +43,7 @@ releases; upstream does it for us.
    than a dependency's minimum is an error that names the dependency and the
    build to move to. The root pin wins today: `zig` runs the build that the
    nearest `build.zig.zon` names and reads no dependency's pin. The minimum
-   check is *tooling: planned*.
+   check is planned: [#39](https://github.com/mattneel/zigpp/issues/39).
 
 6. **Breakage is announced at the upgrade, not by a number.** Every commit that
    breaks existing code carries a `Breaking:` trailer saying what breaks and
@@ -56,11 +56,12 @@ releases; upstream does it for us.
    Merges of upstream Zig are the largest source of breakage, so the merge
    commit carries `Breaking:` trailers for upstream's changes in the merged
    range. The trailers are in force today. Collecting them into the download
-   index, and printing them when a project upgrades, is *tooling: planned*.
+   index is planned in [#37](https://github.com/mattneel/zigpp/issues/37), and printing them when a project upgrades in
+   [#38](https://github.com/mattneel/zigpp/issues/38).
 
 7. **There are no LTS branches.** Security fixes land on head, and advisories
    name the affected range of builds. The advisory format, and a warning on
-   every compile with an affected build, are *tooling: planned*.
+   every compile with an affected build, are planned: [#40](https://github.com/mattneel/zigpp/issues/40).
 
 8. **Docs travel with the pin.** The build you run serves its own std docs and
    language reference. `zig std` serves the standard library documentation of
@@ -113,7 +114,7 @@ hand, `ppup install 0.17.0-dev.2469+zigpp.04926fc36`, or take its archive from
 
 3. Move the pin, build, and fix what the notes name.
 
-`zig upgrade` will do the first two steps for you. It is *tooling: planned*.
+`zig upgrade` will do the first two steps for you. It is planned: [#38](https://github.com/mattneel/zigpp/issues/38).
 
 ## Where the tooling stands
 
@@ -123,9 +124,9 @@ hand, `ppup install 0.17.0-dev.2469+zigpp.04926fc36`, or take its archive from
 | Builds are forever | Enforced: immutable releases from 26 September 2026 on. |
 | Master is append-only | Enforced by the repository's rules. |
 | Version identity comes from upstream tags | Enforced by `build.zig` and `CMakeLists.txt`. |
-| The root project's pin wins | Works. Dependency minimums: *tooling: planned*. |
-| `Breaking:` trailers | In force. Collected notes and `zig upgrade`: *tooling: planned*. |
-| No LTS branches, advisories | No LTS branches. Advisories and compile warnings: *tooling: planned*. |
+| The root project's pin wins | Works. Dependency minimums: planned, [#39](https://github.com/mattneel/zigpp/issues/39). |
+| `Breaking:` trailers | In force. Collected notes and `zig upgrade`: planned, [#37](https://github.com/mattneel/zigpp/issues/37) and [#38](https://github.com/mattneel/zigpp/issues/38). |
+| No LTS branches, advisories | No LTS branches. Advisories and compile warnings: planned, [#40](https://github.com/mattneel/zigpp/issues/40). |
 | Docs travel with the pin | Works: std docs always, the language reference from 0.17.0-dev.2476. |
 | Upstream and vendored code tracked and pinned | By practice: merges of upstream, a pinned LLVM devkit. |
 | 1.0 is a milestone | Enforced by `build.zig`. |
