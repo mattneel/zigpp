@@ -189,6 +189,12 @@ fn nextInner(unwinder: *SelfUnwinder, gpa: Allocator, cache_entry: *const CacheE
         },
     };
 
+    // A frame's CFA is the previous frame's stack pointer, which the ABI places above the current
+    // frame's. When it is not, the frame chain has left the real stack -- a fiber's stack has no
+    // frame above its entry point -- and the register rules below would read arbitrary memory. The
+    // caller falls back to frame-pointer unwinding when this reports an error.
+    if (cfa <= (try regNative(&unwinder.cpu_state, sp_reg_num)).*) return error.InvalidDebugInfo;
+
     // Create a copy of the CPU state, to which we will apply the new rules.
     var new_cpu_state = unwinder.cpu_state;
 
