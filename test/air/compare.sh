@@ -18,8 +18,13 @@ dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/async_await
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-# The functions both files must define, in a fixed order.
-functions='awaitBinding concurrentBinding cancelBinding voidBinding test.the task forms'
+# The functions both files must define, in a fixed order. One per line: the
+# test's name has spaces in it.
+functions='awaitBinding
+concurrentBinding
+cancelBinding
+voidBinding
+test.the task forms'
 
 dump() {
     file=$1
@@ -32,10 +37,11 @@ dump() {
         head -20 "$tmp/$base.raw" >&2
         exit 1
     fi
-    for f in $functions; do
+    printf '%s\n' "$functions" | while IFS= read -r f; do
         awk -v want="$base.$f" -v fn="$f" -v base="$base" '
             /^# Begin Function AIR: / {
-                name = $5
+                name = $0
+                sub(/^# Begin Function AIR: /, "", name)
                 sub(/:$/, "", name)
                 gsub(/\//, ".", name)
                 name = substr(name, length(name) - length(want) + 1)
@@ -49,6 +55,9 @@ dump() {
                 if (!printing) next
                 gsub(/%[0-9]+/, "%")
                 gsub(/dbg_stmt\([0-9]+:[0-9]+\)/, "dbg_stmt()")
+                # The two files are different files, so the name of the file
+                # appears in the types of its own declarations.
+                gsub(base "[.]", "@.", $0)
                 print
             }
         ' "$tmp/$base.raw"
@@ -59,7 +68,7 @@ dump "$dir/sugar.zig" >"$tmp/sugar.air"
 dump "$dir/hand.zig" >"$tmp/hand.air"
 
 # A comparison of nothing is not a comparison: every function must be there.
-for f in $functions; do
+printf '%s\n' "$functions" | while IFS= read -r f; do
     for base in sugar hand; do
         if ! grep -q "^# $f$" "$tmp/$base.air"; then
             echo "$base.air has no AIR for $f" >&2
