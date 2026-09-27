@@ -1390,12 +1390,18 @@ fn remap(
 
 fn free(userdata: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    std.debug.print("diag kqueue free: userdata={*} len={d} needs_mutex={}\n", .{ userdata, memory.len, ev.backing_allocator_needs_mutex });
+    std.debug.print("diag free a: userdata={*} len={d}\n", .{ userdata, memory.len });
     const ev_io = ev.io();
+    std.debug.print("diag free b\n", .{});
     ev.backing_allocator_mutex.lockUncancelable(ev_io);
+    std.debug.print("diag free c\n", .{});
     defer ev.backing_allocator_mutex.unlock(ev_io);
-    return ev.backing_allocator.rawFree(memory, alignment, ret_addr);
+    ev.backing_allocator.rawFree(memory, alignment, ret_addr);
+    std.debug.print("diag free d: child={*}\n", .{ev.backing_allocator.ptr});
+    _ = &mem_lock_probe;
 }
+
+var mem_lock_probe: u32 = 0;
 
 pub const InitOptions = struct {
     /// Whether the backing allocator this instance is given needs a lock around it: it is used
