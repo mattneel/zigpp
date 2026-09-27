@@ -290,9 +290,18 @@ pub fn Scheduler(comptime Backend: type) type {
 
                 /// Releases everything the arena holds, if it holds anything.
                 fn free(task: *Task) void {
-                    std.debug.print("diag arena free: task={*} id={d} created={}\n", .{ task, task.id, task.arena.created });
+                    std.debug.print("diag arena free: task={*} id={d} created={} child={*}/{*} used={?*} free={?*}\n", .{
+                        task,
+                        task.id,
+                        task.arena.created,
+                        task.arena.allocator.child_allocator.ptr,
+                        task.arena.allocator.child_allocator.vtable,
+                        task.arena.allocator.state.used_list,
+                        task.arena.allocator.state.free_list,
+                    });
                     if (!task.arena.created) return;
                     task.arena.allocator.deinit();
+                    std.debug.print("diag arena free end: task={*} id={d}\n", .{ task, task.id });
                     task.arena.created = false;
                 }
             };

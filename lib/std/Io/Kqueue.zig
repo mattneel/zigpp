@@ -1390,6 +1390,7 @@ fn remap(
 
 fn free(userdata: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
+    std.debug.print("diag kqueue free: userdata={*} len={d} needs_mutex={}\n", .{ userdata, memory.len, ev.backing_allocator_needs_mutex });
     const ev_io = ev.io();
     ev.backing_allocator_mutex.lockUncancelable(ev_io);
     defer ev.backing_allocator_mutex.unlock(ev_io);
