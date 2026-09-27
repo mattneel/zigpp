@@ -104,6 +104,84 @@ that naming that field from another file fails with a diagnostic that mentions
 The full rules, with the tests above as runnable examples, are in the language
 reference: [Private Fields](/langref.html#Private-Fields).
 
+## `async` and `await`
+
+Five forms reach `std.Io`'s futures: `async(io) f(x)` spawns a call as a task,
+`concurrent(io) f(x)` spawns it with real concurrency, `await a` joins a task
+and yields its result, `cancel a` requests cancellation and then joins, and
+`detach(io) f(x)` hands a task to the runtime. The five words are not keywords:
+the tokenizer is unchanged, and the parser recognises a form contextually, with
+one token of lookahead, only where the words cannot be read as ordinary code.
+`fn async(x: u8) u8`, `async(1)`, `f.await(io)`, `Future.cancel(io)`, and a
+variable named `await` used as `await + 1` all keep their meaning.
+
+```zig
+fn fetch(url: []const u8) ![]u8 { ... }
+
+fn handler(io: Io, url: []const u8) !void {
+    // Spawn and bind. `page` is a task binding; its result is `![]u8`, exactly
+    // the callee's return type. The parenthesised operand is the `Io` the spawn
+    // is made with, evaluated once, where the spawn appears.
+    const page = async(io) fetch(url);
+
+    // Consume the binding. `await` joins the task and yields its result;
+    // `cancel` requests cancellation and then joins. Each binding is consumed
+    // at most once on a path.
+    const body = try await page;
+
+    // `concurrent` promises a unit of concurrency, so it can fail.
+    const other = try concurrent(io) fetch("/");
+    _ = try await other;
+
+    // A binding whose result is not wanted is consumed explicitly.
+    const spare = async(io) fetch("/x");
+    _ = cancel spare;
+}
+```
+
+`async(io) f(x)` has type `Io.Future(R)`, where `R` is the callee's declared
+return type including its error union, so the spawn of `fetch` above has type
+`Io.Future(![]u8)`; `await a` and `cancel a` yield `R`, which makes
+`try await a` the usual spelling for a fallible task. `concurrent(io) f(x)` has
+type `Io.ConcurrentError!Io.Future(R)`, with `error.ConcurrencyUnavailable` in
+the error set, so a binding writes `try concurrent(io) f(x)`. The arguments the
+spawned call receives are exactly the arguments written: the callee does not
+receive the `Io`, which the compiler keeps in a slot beside the future, so
+`await` and `cancel`, which take no operand, cannot disagree with the spawn
+about it. The callee of a spawn names a declaration: an identifier, a field of
+a namespace, or a method. A callee reached through a call or an index is an
+error, whose message says to bind the receiver or the function first.
+
+A task binding is a `const` or `var` declaration whose whole initializer is one
+spawn form. The binding may appear only as the operand of `await` or `cancel`;
+any other use, such as `_ = a;`, passing it, storing it, or returning it, is an
+error, *a spawned task is not a value; `await` it or `cancel` it*. A task never
+outlives the frame that spawned it: the compiler joins a bound task at the end
+of the block that binds it, a `defer`, and cancels it, which also joins, on
+error exits, an `errdefer`, while `await a` and `cancel a` join earlier on the
+path the program chooses. An error returned by the task is discarded at the
+implicit join; the binding is consumed explicitly to observe it.
+
+Two boundaries are the compiler's rather than the runtime's. Each binding is
+consumed at most once on a path, and `await` and `cancel` accept a task binding,
+not any future value: a hand-written `Io.Future` is joined with `x.await(io)`.
+A spawn needs a frame to join it, so `async` or `concurrent` outside a function
+body, or inside a `comptime` block, is an error.
+
+The implemented cut is the bindings and the two consumes; the rest of the
+design is the proposal's staged plan. A spawn statement such as
+`async(io) log("started");` needs the frame's task group and is not accepted
+yet, and `detach(io) f(x)` needs the borrow checker's `owned` rule and is
+refused for now. Task names in a runtime's task dump, and futures as ordinary
+values which a helper can take and join, come with later stages. The forms are
+defined by `std.Io` and behave the same on every `Io` implementation.
+
+A file which uses the forms does not build with upstream Zig: the five words
+are not keywords there, so each form is a syntax error.
+
+The full rules, with the messages the compiler gives, are in the language
+reference: [The Task Keywords](/langref.html#Task-Keywords).
+
 ## LLVM is forever
 
 Upstream Zig plans to drop its dependency on the LLVM libraries, and to

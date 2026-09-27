@@ -1,7 +1,8 @@
 # The `async` and `await` keywords
 
-Status: **proposal, for the BDFL's review.** Nothing in this document is implemented; the branch it
-lands on changes `doc/` only.
+Status: **approved** (merged as PR #36, 2026-09-26). Stage 1 (§8, "the front end, and the frame rule
+for bindings") is implemented: the five forms parse, and AstGen lowers task bindings with the frame
+rule of §4.1. Stages 2-5 are not implemented.
 
 The BDFL's direction, 2026-09-25: *"async/await keywords as sugar over Io futures; structured task
 groups that join before the frame exits (detached spawns take owned data)"*. Threadz's plan names

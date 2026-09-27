@@ -590,6 +590,18 @@ fn renderExpression(r: *Render, node: Ast.Node.Index, space: Space) Error!void {
             return renderExpression(r, tree.nodeData(node).node, space);
         },
 
+        .spawn_expr => {
+            const io_operand, const spawned_call = tree.nodeData(node).node_and_node;
+            var buf: [1]Ast.Node.Index = undefined;
+            try renderCall(r, tree.fullCall(&buf, io_operand).?, .space);
+            return renderExpression(r, spawned_call, space);
+        },
+
+        .consume_expr => {
+            try renderToken(r, tree.nodeMainToken(node), .space);
+            return renderExpression(r, tree.nodeData(node).node, space);
+        },
+
         .array_type,
         .array_type_sentinel,
         => return renderArrayType(r, tree.fullArrayType(node).?, space),

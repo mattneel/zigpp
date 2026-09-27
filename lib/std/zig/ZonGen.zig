@@ -114,6 +114,8 @@ fn expr(zg: *ZonGen, node: Ast.Node.Index, dest_node: Zoir.Node.Index) Allocator
         .aligned_var_decl => unreachable,
         .@"defer" => unreachable,
         .@"errdefer" => unreachable,
+        .spawn_expr => unreachable,
+        .consume_expr => unreachable,
         .switch_case => unreachable,
         .switch_case_inline => unreachable,
         .switch_case_one => unreachable,

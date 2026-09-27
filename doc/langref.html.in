@@ -2287,6 +2287,114 @@ or
       {#see_also|@import|@typeInfo|@field#}
       {#header_close#}
 
+      {#header_open|Task Keywords#}
+      <p>
+      A call can be spawned as a <em>task</em> and consumed where its result is wanted. Five forms do
+      it: {#syntax#}async(io) f(x){#endsyntax#} spawns the call and returns a handle to it,
+      {#syntax#}concurrent(io) f(x){#endsyntax#} spawns it with real concurrency,
+      {#syntax#}await a{#endsyntax#} joins a task and yields its result,
+      {#syntax#}cancel a{#endsyntax#} requests cancellation and then joins, and
+      {#syntax#}detach(io) f(x){#endsyntax#} hands a task to the runtime. The forms are legal in
+      expression position inside a function body, and they are defined by {#syntax#}std.Io{#endsyntax#}:
+      they behave the same on every {#syntax#}Io{#endsyntax#} implementation.
+      </p>
+      <p>
+      None of the five words is a keyword. The tokenizer is unchanged and they remain ordinary
+      identifiers; the parser recognises a form contextually, with one token of lookahead, only where
+      the words cannot be read as ordinary code: {#syntax#}async{#endsyntax#},
+      {#syntax#}concurrent{#endsyntax#} and {#syntax#}detach{#endsyntax#} introduce a spawn when the
+      parenthesised operand is followed by a call, and {#syntax#}await{#endsyntax#} and
+      {#syntax#}cancel{#endsyntax#} are the consume forms when they are not followed by
+      {#syntax#}({#endsyntax#}. Every program which compiles today keeps its meaning:
+      {#syntax#}fn async(x: u8) u8{#endsyntax#}, {#syntax#}async(1){#endsyntax#},
+      {#syntax#}f.await(io){#endsyntax#}, {#syntax#}Future.cancel(io){#endsyntax#}, and a variable
+      named {#syntax#}await{#endsyntax#} used as {#syntax#}await + 1{#endsyntax#} all still work. The
+      forms themselves are syntax errors in upstream Zig, so a file which uses them does not build
+      there.
+      </p>
+      <pre>{#syntax#}fn fetch(url: []const u8) ![]u8 { ... }
+
+fn handler(io: Io, url: []const u8) !void {
+    // Spawn and bind. `page` is a task binding; its result is `![]u8`, exactly
+    // the callee's return type. The parenthesised operand is the `Io` the spawn
+    // is made with, evaluated once, where the spawn appears.
+    const page = async(io) fetch(url);
+
+    // Consume the binding. `await` joins the task and yields its result;
+    // `cancel` requests cancellation and then joins. Each binding is consumed
+    // at most once on a path.
+    const body = try await page;
+
+    // `concurrent` promises a unit of concurrency, so it can fail.
+    const other = try concurrent(io) fetch("/");
+    _ = try await other;
+
+    // A binding whose result is not wanted is consumed explicitly.
+    const spare = async(io) fetch("/x");
+    _ = cancel spare;
+}{#endsyntax#}</pre>
+      <p>
+      {#syntax#}async(io) f(x){#endsyntax#} has type {#syntax#}Io.Future(R){#endsyntax#}, where
+      {#syntax#}R{#endsyntax#} is the callee's declared return type including its error union, so the
+      spawn of {#syntax#}fetch{#endsyntax#} above has type {#syntax#}Io.Future(![]u8){#endsyntax#};
+      {#syntax#}await a{#endsyntax#} and {#syntax#}cancel a{#endsyntax#} yield {#syntax#}R{#endsyntax#},
+      which makes {#syntax#}try await a{#endsyntax#} the usual spelling for a fallible task.
+      {#syntax#}concurrent(io) f(x){#endsyntax#} has type
+      {#syntax#}Io.ConcurrentError!Io.Future(R){#endsyntax#}, with
+      {#syntax#}error.ConcurrencyUnavailable{#endsyntax#} in the error set, so a binding writes
+      {#syntax#}try concurrent(io) f(x){#endsyntax#}. The spawned call's arguments are exactly the
+      arguments written; the callee does not receive the {#syntax#}Io{#endsyntax#}.
+      </p>
+      <p>
+      A <em>task binding</em> is a {#syntax#}const{#endsyntax#} or {#syntax#}var{#endsyntax#}
+      declaration whose whole initializer is one spawn form. The binding may appear only as the
+      operand of {#syntax#}await{#endsyntax#} or {#syntax#}cancel{#endsyntax#}: using it as a value
+      ({#syntax#}_ = a;{#endsyntax#}, passing it, storing it, returning it) is an error, <em>a spawned
+      task is not a value; await it or cancel it</em>.
+      </p>
+      <p>
+      A task never outlives the frame which spawned it. The compiler inserts the disposal: a bound
+      task is joined at the end of the block which binds it, a {#syntax#}defer{#endsyntax#}, and
+      cancelled, which also joins, on error exits, an {#syntax#}errdefer{#endsyntax#}.
+      {#syntax#}await a{#endsyntax#} and {#syntax#}cancel a{#endsyntax#} join earlier, on the path the
+      program chooses. An error returned by the task is discarded at the implicit join; the binding
+      is consumed explicitly to observe it.
+      </p>
+      <p>
+      The {#syntax#}Io{#endsyntax#} comes from the spawn's parenthesised operand, evaluated once,
+      where the spawn appears. {#syntax#}await{#endsyntax#} and {#syntax#}cancel{#endsyntax#} take no
+      operand because the compiler keeps that {#syntax#}Io{#endsyntax#} in a slot beside the future,
+      so the two cannot disagree.
+      </p>
+      <p>
+      A spawn needs a frame to join it: {#syntax#}async{#endsyntax#} or
+      {#syntax#}concurrent{#endsyntax#} outside a function body, or inside a
+      {#syntax#}comptime{#endsyntax#} block, is an error, <em>a task needs a frame to join it; spawn
+      inside a function body</em>.
+      </p>
+      <p>
+      The spawned call's callee names a declaration: an identifier ({#syntax#}f{#endsyntax#}), a field
+      of a namespace ({#syntax#}ns.f{#endsyntax#}, {#syntax#}Type.f{#endsyntax#}), or a method
+      ({#syntax#}a.b{#endsyntax#}). Anything else, such as {#syntax#}f(x).g{#endsyntax#} or a callee
+      reached through a call or an index, is an error, <em>the callee of {#syntax#}async{#endsyntax#}
+      must name a function; bind the receiver or the function first</em>.
+      </p>
+      <p>
+      {#syntax#}await x{#endsyntax#} where {#syntax#}x{#endsyntax#} is not a task binding (a
+      hand-written {#syntax#}Io.Future{#endsyntax#}, a {#syntax#}Select{#endsyntax#} member) is an
+      error which points at the method, <em>{#syntax#}await{#endsyntax#} works on a task spawned by
+      the keywords; for a future value write {#syntax#}x.await(io){#endsyntax#}</em>; the same holds
+      for {#syntax#}cancel{#endsyntax#}.
+      </p>
+      <p>
+      The five forms are the implemented cut of the design. A spawn <em>statement</em>, such as
+      {#syntax#}async(io) log("started");{#endsyntax#} with no binding, needs the frame's task group
+      and is not accepted yet; {#syntax#}detach(io) f(x){#endsyntax#} needs the borrow checker's
+      {#syntax#}owned{#endsyntax#} rule and is refused; task names in a runtime's task dump, and
+      futures as ordinary values which a helper can take and join, come with later stages.
+      </p>
+      {#header_close#}
+
       {#header_open|extern struct#}
       <p>An {#syntax#}extern struct{#endsyntax#} has in-memory layout matching
       the C ABI for the target.</p>

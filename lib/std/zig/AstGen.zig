@@ -444,6 +444,540 @@ fn reachableExprComptime(
     return result_inst;
 }
 
+/// A spawn form: `async(io) f(x)`, `concurrent(io) f(x)`, `detach(io) f(x)`.
+/// `parts` calls `taskSpawnParts`, which owns the AST lookups and the checks
+/// every spawn shares.
+const TaskSpawn = struct {
+    kind: Ast.TaskKeyword,
+    /// The keyword token (`async`, `concurrent` or `detach`).
+    token: Ast.TokenIndex,
+    /// `async(io)`: the call the operand is written as.
+    io_call: Ast.Node.Index,
+    /// The operand: the `Io` the spawn is made with.
+    io_node: Ast.Node.Index,
+    /// `<io>.<keyword>`: the field access the spawn is analysed as.
+    keyword_field: Ast.Node.Index,
+    /// `. { args }`: the spawned call's arguments.
+    args_tuple: Ast.Node.Index,
+    /// The spawned call: `f(x)`.
+    call_node: Ast.Node.Index,
+    call: Ast.full.Call,
+};
+
+/// The checks every spawn form shares (§4.2 rules 2, 3 and 6), and the parts
+/// the form is analysed from. `buf` must outlive the returned `TaskSpawn`:
+/// `Ast.fullCall` points the single-argument case at it.
+fn taskSpawnParts(
+    gz: *GenZir,
+    buf: *[1]Ast.Node.Index,
+    node: Ast.Node.Index,
+) InnerError!TaskSpawn {
+    const astgen = gz.astgen;
+    const tree = astgen.tree;
+
+    const token = tree.nodeMainToken(node);
+    const kind = Ast.TaskKeyword.fromSlice(tree.tokenSlice(token)).?;
+    assert(kind.isSpawn());
+
+    if (gz.is_comptime or !astgen.within_fn) {
+        return astgen.failNode(node, "a task needs a frame to join it; spawn inside a function body", .{});
+    }
+    if (kind == .detach) {
+        return astgen.failNode(node, "`detach` needs the borrow checker's `owned` rule; compile this module with `-fborrow-check`", .{});
+    }
+
+    const io_call, const extra_index = tree.nodeData(node).node_and_extra;
+    const spawn = tree.extraData(extra_index, Ast.Node.Spawn);
+
+    // The operand: one expression, the `Io` the spawn is made with.
+    const io_node: Ast.Node.Index = switch (tree.nodeTag(io_call)) {
+        .call_one, .call_one_comma => tree.nodeData(io_call).node_and_opt_node[1].unwrap() orelse
+            return astgen.failNode(io_call, "the operand of `{s}` is the `Io` to spawn with: `{s}(io) f(x)`", .{ @tagName(kind), @tagName(kind) }),
+        else => return astgen.failNode(io_call, "the operand of `{s}` is the `Io` to spawn with: `{s}(io) f(x)`", .{ @tagName(kind), @tagName(kind) }),
+    };
+
+    // The spawned call (§2.4).
+    const call = tree.fullCall(buf, spawn.spawned_call) orelse
+        return astgen.failNode(spawn.spawned_call, "the operand of `{s}` must be a call: `{s}(io) f(x)`", .{ @tagName(kind), @tagName(kind) });
+    if (!calleeNamesDeclaration(tree, call.ast.fn_expr)) {
+        return astgen.failNode(call.ast.fn_expr, "the callee of `{s}` must name a function; bind the receiver or the function first", .{@tagName(kind)});
+    }
+
+    return .{
+        .kind = kind,
+        .token = token,
+        .io_call = io_call,
+        .io_node = io_node,
+        .keyword_field = spawn.keyword_field,
+        .args_tuple = spawn.args_tuple,
+        .call_node = spawn.spawned_call,
+        .call = .{ .ast = .{
+            .lparen = call.ast.lparen,
+            .fn_expr = call.ast.fn_expr,
+            .params = call.ast.params,
+        } },
+    };
+}
+
+/// §2.4: the callee must name a declaration — an identifier (`f`), a field of
+/// a namespace (`ns.f`, `Type.f`), or a method (`a.b`). Anything else is
+/// `f(x).g`, a callee reached through a call, an index, a dereference or a
+/// builtin.
+fn calleeNamesDeclaration(tree: *const Ast, node: Ast.Node.Index) bool {
+    return switch (tree.nodeTag(node)) {
+        .identifier => true,
+        .field_access => calleeNamesDeclaration(tree, tree.nodeData(node).node_and_token[0]),
+        else => false,
+    };
+}
+
+/// A `dbg_stmt` at the position the source cursor is at, without moving it.
+/// The sugar's expansion has statements the source does not spell (`const a_io
+/// = io;` and the flag), and Sema needs one `dbg_stmt` per statement.
+fn emitDbgStmtHere(gz: *GenZir) InnerError!void {
+    const astgen = gz.astgen;
+    try emitDbgStmt(gz, .{ astgen.source_line - gz.decl_line, astgen.source_column });
+}
+
+/// The name of one of the compiler's task slots, derived from the binding's
+/// name: `<name>_io` and `<name>_live`, as §3.1 spells them.
+fn taskSlotName(
+    astgen: *AstGen,
+    name_token: Ast.TokenIndex,
+    comptime suffix: []const u8,
+) InnerError!Zir.NullTerminatedString {
+    const gpa = astgen.gpa;
+    const string_bytes = &astgen.string_bytes;
+    const str_index: u32 = @intCast(string_bytes.items.len);
+    try string_bytes.appendSlice(gpa, try astgen.identifierTokenString(name_token));
+    try string_bytes.appendSlice(gpa, suffix);
+    try string_bytes.append(gpa, 0);
+    return @fromBackingInt(@intCast(str_index));
+}
+
+/// Adds `text` to the string table and returns its index: the names the sugar
+/// needs and the source does not spell (`await` and `cancel` for a disposal
+/// the program did not write).
+fn internString(astgen: *AstGen, text: []const u8) InnerError!Zir.NullTerminatedString {
+    const gpa = astgen.gpa;
+    const string_bytes = &astgen.string_bytes;
+    const str_index: u32 = @intCast(string_bytes.items.len);
+    try string_bytes.appendSlice(gpa, text);
+    try string_bytes.append(gpa, 0);
+    return @fromBackingInt(@intCast(str_index));
+}
+
+/// `async(io) f(x)` where the form is not the initializer of a task binding.
+/// A spawn has no value of its own: its handle lives in a binding, and a spawn
+/// with no handle needs the frame's group, which is stage 2 of the proposal.
+fn spawnExpr(
+    gz: *GenZir,
+    scope: *Scope,
+    ri: ResultInfo,
+    node: Ast.Node.Index,
+) InnerError!Zir.Inst.Ref {
+    _ = .{ scope, ri };
+    const astgen = gz.astgen;
+    var buf: [1]Ast.Node.Index = undefined;
+    const spawn = try taskSpawnParts(gz, &buf, node);
+    return astgen.failNode(node, "a spawn is not a value; bind it: const f = {s}(io) f(x);", .{@tagName(spawn.kind)});
+}
+
+/// `await a` and `cancel a`: consume the task `a` bound by
+/// `const a = async(io) f(x);`. The future and the `Io` are the compiler's
+/// slots, so the program cannot name a different one, and the flag says
+/// whether the task is still live.
+fn consumeExpr(
+    gz: *GenZir,
+    scope: *Scope,
+    ri: ResultInfo,
+    node: Ast.Node.Index,
+) InnerError!Zir.Inst.Ref {
+    const astgen = gz.astgen;
+    const tree = astgen.tree;
+
+    const token = tree.nodeMainToken(node);
+    const kind = Ast.TaskKeyword.fromSlice(tree.tokenSlice(token)).?;
+    assert(kind == .await or kind == .cancel);
+
+    const operand = tree.nodeData(node).node;
+    if (tree.nodeTag(operand) != .identifier) {
+        return astgen.failNode(operand, "`{s}` works on a task spawned by the keywords; for a future value write `x.{s}(io)`", .{ @tagName(kind), @tagName(kind) });
+    }
+    const ident_token = tree.nodeMainToken(operand);
+    const name = try astgen.identAsString(ident_token);
+    const local = try findTaskLocal(astgen, scope, name, operand);
+
+    // §4.2 rule 5: two consumes in one straight-line statement sequence.
+    if (local.task.?.consumed_in == gz) {
+        return astgen.failNode(operand, "task '{s}' is already consumed", .{tree.tokenSlice(ident_token)});
+    }
+    local.task.?.consumed_in = gz;
+    local.used = .fromToken(ident_token);
+
+    // `a_live = false;` — before the call, so that the disposal joins once even
+    // if the consume does not return (§3.1). The `dbg_stmt` after it stands for
+    // the flag statement the source does not spell.
+    _ = try gz.addPlNode(.store_node, operand, Zir.Inst.Bin{
+        .lhs = local.task.?.live,
+        .rhs = .bool_false,
+    });
+    try emitDbgStmtHere(gz);
+
+    const call_ref = try emitTaskCall(gz, scope, local.ptr, local.task.?.io, try astgen.identAsString(token), node, ri);
+    return rvalue(gz, ri, call_ref, node);
+}
+
+/// The task binding the name in `operand` refers to, or §4.2 rule 7: `await`
+/// and `cancel` do not accept hand-written futures.
+fn findTaskLocal(
+    astgen: *AstGen,
+    scope: *Scope,
+    name_str_index: Zir.NullTerminatedString,
+    operand: Ast.Node.Index,
+) InnerError!*Scope.LocalPtr {
+    var scope_var = scope;
+    find: switch (scope_var.unwrap()) {
+        .gen_zir => |gz| continue :find gz.parent.unwrap(),
+        .local_val => |local_val| {
+            if (local_val.name == name_str_index) break :find;
+            continue :find local_val.parent.unwrap();
+        },
+        .local_ptr => |local_ptr| {
+            if (local_ptr.name == name_str_index) {
+                if (local_ptr.task == null) break :find;
+                return local_ptr;
+            }
+            continue :find local_ptr.parent.unwrap();
+        },
+        .defer_normal, .defer_error => |defer_scope| continue :find defer_scope.parent.unwrap(),
+        .namespace => |ns| {
+            if (ns.decls.get(name_str_index) != null) break :find;
+            continue :find ns.parent.unwrap();
+        },
+        .top => break :find,
+    }
+    const token = astgen.tree.nodeMainToken(operand);
+    const kind = Ast.TaskKeyword.fromSlice(astgen.tree.tokenSlice(token)).?;
+    return astgen.failNode(operand, "`{s}` works on a task spawned by the keywords; for a future value write `x.{s}(io)`", .{ @tagName(kind), @tagName(kind) });
+}
+
+/// The field call of a consume: `<future>.<await|cancel>(<io>)`.
+fn emitTaskCall(
+    gz: *GenZir,
+    scope: *Scope,
+    future: Zir.Inst.Ref,
+    io: Zir.Inst.Ref,
+    /// The string table index of `await` or `cancel`.
+    method: Zir.NullTerminatedString,
+    node: Ast.Node.Index,
+    ri: ResultInfo,
+) InnerError!Zir.Inst.Ref {
+    const astgen = gz.astgen;
+
+    // If our result location is a try/catch/error-union-if/return, a function
+    // argument, or an initializer for a `const` variable, the error trace
+    // propagates. Otherwise, it should always be popped.
+    const propagate_error_trace = switch (ri.ctx) {
+        .error_handling_expr, .@"return", .fn_arg, .const_init => true,
+        else => false,
+    };
+
+    const call_index: Zir.Inst.Index = @fromBackingInt(@intCast(astgen.instructions.len));
+    const call_inst = call_index.toRef();
+    try astgen.instructions.append(astgen.gpa, undefined);
+    try gz.instructions.append(astgen.gpa, call_index);
+
+    const scratch_top = astgen.scratch.items.len;
+    defer astgen.scratch.items.len = scratch_top;
+    try astgen.scratch.resize(astgen.gpa, scratch_top + 1);
+    {
+        var arg_block = gz.makeSubBlock(scope);
+        defer arg_block.unstack();
+        _ = try arg_block.addBreakWithSrcNode(.break_inline, call_index, io, node);
+        const body = arg_block.instructionsSlice();
+        try astgen.scratch.ensureUnusedCapacity(astgen.gpa, countBodyLenAfterFixups(astgen, body));
+        appendBodyWithFixupsArrayList(astgen, &astgen.scratch, body);
+        astgen.scratch.items[scratch_top] = @intCast(astgen.scratch.items.len - scratch_top);
+    }
+
+    const modifier: std.lang.CallModifier = if (gz.nosuspend_node != .none) .no_suspend else .auto;
+    const payload_index = try addExtra(astgen, Zir.Inst.FieldCall{
+        .obj_ptr = future,
+        .field_name_start = method,
+        .flags = .{
+            .pop_error_return_trace = !propagate_error_trace,
+            .packed_modifier = @intCast(@backingInt(modifier)),
+            .args_len = 1,
+        },
+    });
+    try astgen.extra.appendSlice(astgen.gpa, astgen.scratch.items[scratch_top..]);
+    astgen.instructions.set(@backingInt(call_index), .{
+        .tag = .field_call,
+        .data = .{ .pl_node = .{
+            .src_node = gz.nodeIndexToRelative(node),
+            .payload_index = payload_index,
+        } },
+    });
+    return call_inst;
+}
+
+/// The spawn's call: `<io>.async(<callee>, .{<args>})`, as §3.1 writes it.
+fn emitTaskSpawnCall(
+    gz: *GenZir,
+    scope: *Scope,
+    spawn: TaskSpawn,
+    io_ref: Zir.Inst.Ref,
+    ri: ResultInfo,
+) InnerError!Zir.Inst.Ref {
+    const astgen = gz.astgen;
+    const tree = astgen.tree;
+
+    // The object of the field call is the operand, by reference, which is what
+    // `calleeExpr` does for `a_io.async(...)`.
+    const io_ptr = try rvalue(gz, .{ .rl = .ref }, io_ref, spawn.io_node);
+    const cursor = maybeAdvanceSourceCursorToMainToken(gz, spawn.keyword_field);
+    try emitDbgStmt(gz, cursor);
+
+    {
+        astgen.advanceSourceCursor(tree.tokenStart(spawn.call.ast.lparen));
+        const line = astgen.source_line - gz.decl_line;
+        const column = astgen.source_column;
+        // Sema expects a dbg_stmt immediately before call.
+        try emitDbgStmtForceCurrentIndex(gz, .{ line, column });
+    }
+
+    const call_index: Zir.Inst.Index = @fromBackingInt(@intCast(astgen.instructions.len));
+    const call_inst = call_index.toRef();
+    try astgen.instructions.append(astgen.gpa, undefined);
+    try gz.instructions.append(astgen.gpa, call_index);
+
+    const scratch_top = astgen.scratch.items.len;
+    defer astgen.scratch.items.len = scratch_top;
+
+    // The two arguments `Io.async` takes: the callee, and the tuple of the
+    // spawned call's arguments.
+    const params = [2]Ast.Node.Index{ spawn.call.ast.fn_expr, spawn.args_tuple };
+    var scratch_index = scratch_top;
+    try astgen.scratch.resize(astgen.gpa, scratch_top + params.len);
+    for (params) |param_node| {
+        var arg_block = gz.makeSubBlock(scope);
+        defer arg_block.unstack();
+
+        const arg_ref = try fullBodyExpr(&arg_block, &arg_block.base, .{ .rl = .{ .coerced_ty = call_inst }, .ctx = .fn_arg }, param_node, .normal);
+        _ = try arg_block.addBreakWithSrcNode(.break_inline, call_index, arg_ref, param_node);
+
+        const body = arg_block.instructionsSlice();
+        try astgen.scratch.ensureUnusedCapacity(astgen.gpa, countBodyLenAfterFixups(astgen, body));
+        appendBodyWithFixupsArrayList(astgen, &astgen.scratch, body);
+
+        astgen.scratch.items[scratch_index] = @intCast(astgen.scratch.items.len - scratch_top);
+        scratch_index += 1;
+    }
+
+    // If our result location is a try/catch/error-union-if/return, a function
+    // argument, or an initializer for a `const` variable, the error trace
+    // propagates. Otherwise, it should always be popped.
+    const propagate_error_trace = switch (ri.ctx) {
+        .error_handling_expr, .@"return", .fn_arg, .const_init => true,
+        else => false,
+    };
+    const modifier: std.lang.CallModifier = if (gz.nosuspend_node != .none) .no_suspend else .auto;
+    const payload_index = try addExtra(astgen, Zir.Inst.FieldCall{
+        .obj_ptr = io_ptr,
+        .field_name_start = try astgen.identAsString(spawn.token),
+        .flags = .{
+            .pop_error_return_trace = !propagate_error_trace,
+            .packed_modifier = @intCast(@backingInt(modifier)),
+            .args_len = params.len,
+        },
+    });
+    try astgen.extra.appendSlice(astgen.gpa, astgen.scratch.items[scratch_top..]);
+    astgen.instructions.set(@backingInt(call_index), .{
+        .tag = .field_call,
+        .data = .{ .pl_node = .{
+            .src_node = gz.nodeIndexToRelative(spawn.call_node),
+            .payload_index = payload_index,
+        } },
+    });
+    return call_inst;
+}
+
+/// The `defer`/`errdefer` pair of §4.1 for a task binding: `if (a_live) <join>`
+/// when the block exits normally, `if (a_live) <cancel>` when it exits with an
+/// error. Returns the scope to push for the block's exits.
+fn taskDisposal(
+    gz: *GenZir,
+    scope: *Scope,
+    block_arena: Allocator,
+    node: Ast.Node.Index,
+    future: Zir.Inst.Ref,
+    io: Zir.Inst.Ref,
+    live: Zir.Inst.Ref,
+    comptime method: []const u8,
+    scope_tag: Scope.Tag,
+) InnerError!*Scope {
+    const astgen = gz.astgen;
+    const method_str = try internString(astgen, method);
+
+    var defer_gen = gz.makeSubBlock(scope);
+    defer_gen.cur_defer_node = node.toOptional();
+    defer_gen.any_defer_node = node.toOptional();
+    defer defer_gen.unstack();
+
+    // The body of a `defer` is a block expression: `{ if (a_live) ...; }`.
+    try emitDbgStmtHere(&defer_gen);
+    const block_inst = try defer_gen.makeBlockInst(.block, node);
+    try defer_gen.instructions.append(astgen.gpa, block_inst);
+    {
+        var block_gen = defer_gen.makeSubBlock(&defer_gen.base);
+        defer block_gen.unstack();
+
+        // `if (a_live)`: the condition, then the two branches.
+        try emitDbgStmtHere(&block_gen);
+        var if_gen = block_gen.makeSubBlock(&block_gen.base);
+        const cond = try if_gen.addUnNode(.load, live, node);
+        const condbr = try if_gen.addCondBr(.condbr, node);
+        const if_block = try block_gen.makeBlockInst(.block, node);
+        try if_gen.setBlockBody(if_block);
+        try block_gen.instructions.append(astgen.gpa, if_block);
+
+        var then_gen = block_gen.makeSubBlock(&block_gen.base);
+        {
+            try emitDbgStmtHere(&then_gen);
+            const call_ref = try emitTaskCall(&then_gen, &then_gen.base, future, io, method_str, node, .{ .rl = .discard, .ctx = .assignment });
+            _ = try then_gen.addUnNode(.ensure_result_non_error, call_ref, node);
+            _ = try then_gen.addBreak(.@"break", if_block, .void_value);
+        }
+        var else_gen = block_gen.makeSubBlock(&block_gen.base);
+        _ = try else_gen.addBreak(.@"break", if_block, .void_value);
+        try setCondBrPayload(condbr, cond, &then_gen, &else_gen);
+        _ = try block_gen.addUnNode(.ensure_result_used, if_block.toRef(), node);
+
+        // The block's tail, as `blockExpr` writes it.
+        _ = try defer_gen.addRestoreErrRetIndex(.{ .block = block_inst }, .always, node);
+        _ = try block_gen.addBreak(.@"break", block_inst, .void_value);
+        try block_gen.setBlockBody(block_inst);
+    }
+    _ = try defer_gen.addBreak(.break_inline, @fromBackingInt(@intCast(0)), .void_value);
+
+    const body = defer_gen.instructionsSlice();
+    const body_len = astgen.countBodyLenAfterFixupsExtraRefs(body, &.{});
+
+    const index: u32 = @intCast(astgen.extra.items.len);
+    try astgen.extra.ensureUnusedCapacity(astgen.gpa, body_len);
+    astgen.appendBodyWithFixupsExtraRefsArrayList(&astgen.extra, body, &.{});
+
+    const defer_scope = try block_arena.create(Scope.Defer);
+    defer_scope.* = .{
+        .base = .{ .tag = scope_tag },
+        .parent = scope,
+        .index = index,
+        .len = body_len,
+    };
+    return &defer_scope.base;
+}
+
+/// `const a = async(io) f(x);` — a task binding. The expansion is §3.1's:
+/// the `Io` in a slot of its own, the future in a frame slot, a flag, and the
+/// disposal of §4.1 at the block's exits.
+fn taskDecl(
+    gz: *GenZir,
+    scope: *Scope,
+    node: Ast.Node.Index,
+    block_arena: Allocator,
+    var_decl: Ast.full.VarDecl,
+) InnerError!*Scope {
+    const astgen = gz.astgen;
+    const tree = astgen.tree;
+
+    const name_token = var_decl.ast.mut_token + 1;
+    const ident_name_raw = tree.tokenSlice(name_token);
+    const ident_name = try astgen.identAsString(name_token);
+    const id_cat: Scope.IdCat = if (tree.tokenTag(var_decl.ast.mut_token) == .keyword_const)
+        .@"local constant"
+    else
+        .@"local variable";
+    try astgen.detectLocalShadowing(scope, ident_name, name_token, ident_name_raw, id_cat);
+
+    const init_node = var_decl.ast.init_node.unwrap().?;
+    const spawn_node = switch (tree.nodeTag(init_node)) {
+        .spawn_expr => init_node,
+        .@"try" => switch (tree.nodeTag(tree.nodeData(init_node).node)) {
+            .spawn_expr => tree.nodeData(init_node).node,
+            else => unreachable, // `varDecl` only takes this path for a spawn
+        },
+        else => unreachable,
+    };
+    const try_node: Ast.Node.OptionalIndex = if (spawn_node == init_node) .none else init_node.toOptional();
+
+    var buf: [1]Ast.Node.Index = undefined;
+    const spawn = try taskSpawnParts(gz, &buf, spawn_node);
+    if (spawn.kind == .concurrent and try_node == .none) {
+        return astgen.failNode(spawn_node, "the result of `concurrent` is an error union; write `try concurrent(io) f(x)`", .{});
+    }
+
+    // `const a_io = io;` — the operand, evaluated once, where the spawn is.
+    try emitDbgNode(gz, node);
+    const io_ref = try expr(gz, scope, .{ .rl = .none, .ctx = .const_init }, spawn.io_node);
+    _ = try gz.addUnNode(.validate_const, io_ref, spawn.io_node);
+    try gz.addDbgVar(.dbg_var_val, try taskSlotName(astgen, name_token, "_io"), io_ref);
+
+    // `var a = a_io.async(f, .{x});`
+    try emitDbgStmtHere(gz);
+    const alloc = try gz.addNode(.alloc_inferred_mut, node);
+    if (try_node.unwrap()) |try_node_index| {
+        // `try concurrent(io) f(x)`: the operand is analysed with no result
+        // location, and the `try` writes its result into the slot.
+        const call_ref = try emitTaskSpawnCall(gz, scope, spawn, io_ref, .{ .rl = .none, .ctx = .error_handling_expr });
+        const try_inst = try gz.makeBlockInst(.@"try", try_node_index);
+        try gz.instructions.append(astgen.gpa, try_inst);
+        var else_gen = gz.makeSubBlock(scope);
+        defer else_gen.unstack();
+        const err_code = try else_gen.addUnNode(.err_union_code, call_ref, try_node_index);
+        try genDefers(&else_gen, &astgen.fn_block.?.base, scope, .normal_and_error);
+        try emitDbgStmtHere(&else_gen);
+        _ = try else_gen.addUnNode(.ret_node, err_code, try_node_index);
+        try else_gen.setTryBody(try_inst, call_ref);
+        _ = try rvalue(gz, .{ .rl = .{ .inferred_ptr = alloc } }, try_inst.toRef(), node);
+    } else {
+        _ = try emitTaskSpawnCall(gz, scope, spawn, io_ref, .{ .rl = .{ .inferred_ptr = alloc } });
+    }
+    const future = try gz.addUnNode(.resolve_inferred_alloc, alloc, node);
+    try gz.addDbgVar(.dbg_var_ptr, ident_name, future);
+
+    // `var a_live = true;`
+    try emitDbgStmtHere(gz);
+    const live_alloc = try gz.addNode(.alloc_inferred_mut, node);
+    _ = try gz.addPlNode(.store_to_inferred_ptr, node, Zir.Inst.Bin{
+        .lhs = live_alloc,
+        .rhs = .bool_true,
+    });
+    const live = try gz.addUnNode(.resolve_inferred_alloc, live_alloc, node);
+    try gz.addDbgVar(.dbg_var_ptr, try taskSlotName(astgen, name_token, "_live"), live);
+
+    // The disposal, in this block's scope: a `defer` that joins, and an
+    // `errdefer` that cancels and joins, both behind the flag.
+    const join_scope = try taskDisposal(gz, scope, block_arena, node, future, io_ref, live, "await", .defer_normal);
+    const cancel_scope = try taskDisposal(gz, join_scope, block_arena, node, future, io_ref, live, "cancel", .defer_error);
+
+    const sub_scope = try block_arena.create(Scope.LocalPtr);
+    sub_scope.* = .{
+        .parent = cancel_scope,
+        .gen_zir = gz,
+        .ptr = future,
+        .token_src = name_token,
+        .name = ident_name,
+        .id_cat = id_cat,
+        .maybe_comptime = false,
+        // The binding is used by its own disposal, which joins a task the
+        // program did not consume: that is legal (§5), not an unused local.
+        .used = .fromToken(name_token),
+        .task = .{ .io = io_ref, .live = live },
+    };
+    return &sub_scope.base;
+}
+
 fn lvalExpr(gz: *GenZir, scope: *Scope, node: Ast.Node.Index) InnerError!Zir.Inst.Ref {
     const astgen = gz.astgen;
     const tree = astgen.tree;
@@ -601,6 +1135,8 @@ fn lvalExpr(gz: *GenZir, scope: *Scope, node: Ast.Node.Index) InnerError!Zir.Ins
         .@"comptime",
         .@"nosuspend",
         .error_value,
+        .spawn_expr,
+        .consume_expr,
         => return astgen.failNode(node, "invalid left-hand side to assignment", .{}),
 
         .builtin_call,
@@ -670,6 +1206,9 @@ fn expr(gz: *GenZir, scope: *Scope, ri: ResultInfo, node: Ast.Node.Index) InnerE
             try assign(gz, scope, node);
             return rvalue(gz, ri, .void_value, node);
         },
+
+        .spawn_expr => return spawnExpr(gz, scope, ri, node),
+        .consume_expr => return consumeExpr(gz, scope, ri, node),
 
         .assign_destructure => {
             // Note that this variant does not declare any new var/const: that
@@ -2610,6 +3149,12 @@ fn blockExprStmts(gz: *GenZir, parent_scope: *Scope, statements: []const Ast.Nod
                     continue;
                 },
 
+                .spawn_expr => {
+                    var buf: [1]Ast.Node.Index = undefined;
+                    const spawn = try taskSpawnParts(gz, &buf, inner_node);
+                    return astgen.failNode(inner_node, "a spawn statement needs the frame's group, not yet implemented; bind the task: const f = {s}(io) f(x);", .{@tagName(spawn.kind)});
+                },
+
                 .while_simple,
                 .while_cont,
                 .@"while", => _ = try whileExpr(gz, scope, .{ .rl = .none }, inner_node, tree.fullWhile(inner_node).?, true),
@@ -3105,6 +3650,16 @@ fn varDecl(
     block_arena: Allocator,
     var_decl: Ast.full.VarDecl,
 ) InnerError!*Scope {
+    // A task binding: `const a = async(io) f(x);` (§3.1).
+    if (var_decl.ast.init_node.unwrap()) |init_node| switch (gz.astgen.tree.nodeTag(init_node)) {
+        .spawn_expr => return taskDecl(gz, scope, node, block_arena, var_decl),
+        .@"try" => switch (gz.astgen.tree.nodeTag(gz.astgen.tree.nodeData(init_node).node)) {
+            .spawn_expr => return taskDecl(gz, scope, node, block_arena, var_decl),
+            else => {},
+        },
+        else => {},
+    };
+
     try emitDbgNode(gz, node);
     const astgen = gz.astgen;
     const tree = astgen.tree;
@@ -8234,6 +8789,10 @@ fn localVarRef(
         },
         .local_ptr => |local_ptr| {
             if (local_ptr.name == name_str_index) {
+                if (local_ptr.task != null) {
+                    // §4.2 rule 4: the binding is not a value.
+                    return astgen.failNode(ident, "a spawned task is not a value; `await` it or `cancel` it", .{});
+                }
                 if (ri.rl == .discard and ri.ctx == .assignment) {
                     local_ptr.discarded = .fromToken(ident_token);
                 } else {
@@ -10335,6 +10894,8 @@ fn nodeMayEvalToError(tree: *const Ast, start_node: Ast.Node.Index) BuiltinFn.Ev
             .call_one_comma,
             .call,
             .call_comma,
+            .spawn_expr,
+            .consume_expr,
             => return .maybe,
 
             .@"return",
@@ -11221,6 +11782,23 @@ const Scope = struct {
         /// true means we find out during Sema whether the value is comptime.
         /// false means it is already known at AstGen the value is runtime-known.
         maybe_comptime: bool,
+        /// Present when the local is a task binding — `const f = async(io) g(x);`.
+        /// The name may then appear only as the operand of `await` or `cancel`.
+        task: ?Task = null,
+    };
+
+    /// What a task binding carries besides its frame slot: the `Io` of the
+    /// spawn's operand, and the flag that is false once the task is consumed.
+    const Task = struct {
+        /// The `Io` value of the spawn's operand, evaluated once where the
+        /// spawn appears.
+        io: Zir.Inst.Ref,
+        /// A `bool` in a frame slot, false once the task is consumed.
+        live: Zir.Inst.Ref,
+        /// The block whose statements last consumed this task, so that a second
+        /// consume in one statement sequence is an error while consumes on
+        /// different branches are not (the flag covers those at runtime).
+        consumed_in: ?*const GenZir = null,
     };
 
     const Defer = struct {

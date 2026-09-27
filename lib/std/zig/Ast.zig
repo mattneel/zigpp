@@ -298,6 +298,37 @@ pub fn extraDataSlice(tree: Ast, range: Node.SubRange, comptime T: type) []const
     return @ptrCast(tree.extra_data[@backingInt(range.start)..@backingInt(range.end)]);
 }
 
+/// The words of the task forms. They are contextual keywords: the tokenizer
+/// lexes them as ordinary identifiers (`Token.Tag.identifier`), and the parser
+/// recognises the forms by the token that follows, so a program that names a
+/// declaration `async` keeps meaning what it meant.
+pub const TaskKeyword = enum {
+    async,
+    concurrent,
+    detach,
+    await,
+    cancel,
+
+    /// Returns the task keyword that `text` spells exactly, or null.
+    pub fn fromSlice(text: []const u8) ?TaskKeyword {
+        if (mem.eql(u8, text, "async")) return .async;
+        if (mem.eql(u8, text, "concurrent")) return .concurrent;
+        if (mem.eql(u8, text, "detach")) return .detach;
+        if (mem.eql(u8, text, "await")) return .await;
+        if (mem.eql(u8, text, "cancel")) return .cancel;
+        return null;
+    }
+
+    /// Whether this word is the first token of a `spawn_expr`, as opposed to a
+    /// `consume_expr`.
+    pub fn isSpawn(kw: TaskKeyword) bool {
+        return switch (kw) {
+            .async, .concurrent, .detach => true,
+            .await, .cancel => false,
+        };
+    }
+};
+
 pub fn extraDataSliceWithLen(tree: Ast, start: ExtraIndex, len: u32, comptime T: type) []const T {
     return @ptrCast(tree.extra_data[@backingInt(start)..][0..len]);
 }
@@ -605,6 +636,8 @@ pub fn firstToken(tree: Ast, node: Node.Index) TokenIndex {
         .negation_wrap,
         .address_of,
         .@"try",
+        .spawn_expr,
+        .consume_expr,
         .optional_type,
         .@"switch",
         .switch_comma,
@@ -933,6 +966,7 @@ pub fn lastToken(tree: Ast, node: Node.Index) TokenIndex {
         .bool_and,
         .bool_or,
         .error_union,
+        .spawn_expr,
         .if_simple,
         .while_simple,
         .for_simple,
@@ -942,7 +976,7 @@ pub fn lastToken(tree: Ast, node: Node.Index) TokenIndex {
         => n = tree.nodeData(n).node_and_node[1],
 
         .test_decl => n = tree.nodeData(n).opt_token_and_node[1],
-        .@"defer", .@"errdefer" => n = tree.nodeData(n).node,
+        .@"defer", .@"errdefer", .consume_expr => n = tree.nodeData(n).node,
         .anyframe_type => n = tree.nodeData(n).token_and_node[1],
 
         .switch_case_one,
@@ -3239,6 +3273,24 @@ pub const Node = struct {
         address_of,
         /// `try expr`. The `main_token` field is the `try` token.
         @"try",
+        /// `async(io) f(x)`, `concurrent(io) f(x)`, `detach(io) f(x)`.
+        ///
+        /// `main_token` is the `async`, `concurrent` or `detach` token, which
+        /// the tokenizer lexes as an ordinary identifier; see
+        /// `TaskKeyword.fromSlice`.
+        ///
+        /// The `data` field is a `.node_and_extra`:
+        ///   1. a `Node.Index` to the call the operand is written as:
+        ///      `async(io)`.
+        ///   2. a `ExtraIndex` to a `Node.Spawn`: the form as it is analysed.
+        spawn_expr,
+        /// `await a`, `cancel a`.
+        ///
+        /// `main_token` is the `await` or `cancel` token, which the tokenizer
+        /// lexes as an ordinary identifier; see `TaskKeyword.fromSlice`.
+        ///
+        /// The `data` field is a `.node` to the operand.
+        consume_expr,
         /// `?expr`. The `main_token` field is the `?` token.
         optional_type,
         /// `[lhs]rhs`. The `main_token` field is the `[` token.
@@ -3886,6 +3938,20 @@ pub const Node = struct {
     pub const LocalVarDecl = struct {
         type_node: Index,
         align_node: Index,
+    };
+
+    /// How a `spawn_expr` is analysed: `async(io) f(x)` is
+    /// `<io>.async(f, .{x})`.
+    pub const Spawn = struct {
+        /// `<io>.<keyword>`: a `field_access` node whose object is the
+        /// operand and whose field token is the keyword, so that the `Io` is
+        /// evaluated once, where the spawn appears.
+        keyword_field: Index,
+        /// `. { args }`: the spawned call's arguments, as `Io.async` takes
+        /// them. A synthetic node: the source writes no `.{` of its own.
+        args_tuple: Index,
+        /// The spawned call itself: `f(x)`.
+        spawned_call: Index,
     };
 
     pub const ArrayTypeSentinel = struct {

@@ -16,7 +16,7 @@
 pub const Error = error{ParseError} || Allocator.Error;
 
 gpa: Allocator,
-source: []const u8,
+source: [:0]const u8,
 tokens: Ast.TokenList.Slice,
 tok_i: TokenIndex,
 errors: std.ArrayList(AstError),
@@ -43,6 +43,20 @@ fn nodeMainToken(p: *const Parse, node: Node.Index) TokenIndex {
 
 fn nodeData(p: *const Parse, node: Node.Index) Node.Data {
     return p.nodes.items(.data)[@backingInt(node)];
+}
+
+/// The task keyword spelled by `token_index`, if it is one. The words are
+/// ordinary identifiers to the tokenizer (`std.zig.Ast.TaskKeyword`), so the
+/// token is re-tokenized to read it exactly.
+fn taskKeyword(p: *const Parse, token_index: TokenIndex) ?Ast.TaskKeyword {
+    if (p.tokenTag(token_index) != .identifier) return null;
+    var tokenizer: std.zig.Tokenizer = .{
+        .buffer = p.source,
+        .index = p.tokenStart(token_index),
+    };
+    const token = tokenizer.next();
+    assert(token.loc.start == p.tokenStart(token_index));
+    return Ast.TaskKeyword.fromSlice(p.source[token.loc.start..token.loc.end]);
 }
 
 const SmallSpan = union(enum) {
@@ -1667,6 +1681,8 @@ fn parseExprPrecedence(p: *Parse, min_prec: i32) Error!?Node.Index {
 }
 
 fn parsePrefixExpr(p: *Parse) Error!?Node.Index {
+    if (try p.parseConsumeExpr()) |consume_expr| return consume_expr;
+
     const tag: Node.Tag = switch (p.tokenTag(p.tok_i)) {
         .bang => .bool_not,
         .minus => .negation,
@@ -1679,6 +1695,35 @@ fn parsePrefixExpr(p: *Parse) Error!?Node.Index {
     return try p.addNode(.{
         .tag = tag,
         .main_token = p.nextToken(),
+        .data = .{ .node = try p.expectPrefixExpr() },
+    });
+}
+
+/// Parses `await a` or `cancel a` (`consume_expr`) if the current token is one
+/// of those words followed by an expression, and returns null if it is
+/// anything else.
+///
+/// `await(` is an ordinary call to a function named `await`, and so are
+/// `await.x`, `await[0]` and `await + 1`: an expression is only a consume when
+/// what follows the word begins one, which is an identifier or `@`. A complete
+/// expression can never be followed by either, so no program that compiles
+/// without this rule changes meaning under it.
+fn parseConsumeExpr(p: *Parse) Error!?Node.Index {
+    if (p.tokenTag(p.tok_i) != .identifier) return null;
+    switch (p.tokenTag(p.tok_i + 1)) {
+        .identifier, .builtin => {},
+        else => return null,
+    }
+    const keyword = p.taskKeyword(p.tok_i) orelse return null;
+    switch (keyword) {
+        .await, .cancel => {},
+        .async, .concurrent, .detach => return null,
+    }
+    const word_token = p.tok_i;
+    p.tok_i += 1;
+    return try p.addNode(.{
+        .tag = .consume_expr,
+        .main_token = word_token,
         .data = .{ .node = try p.expectPrefixExpr() },
     });
 }
@@ -2220,11 +2265,131 @@ fn parseErrorUnionExpr(p: *Parse) !?Node.Index {
 }
 
 fn parseSuffixExpr(p: *Parse) !?Node.Index {
+    if (try p.parseSpawnExpr()) |spawn_expr| return spawn_expr;
+
     var res = try p.parsePrimaryTypeExpr() orelse return null;
     while (try p.parseSuffixOp(res)) |suffix_op| {
         res = suffix_op;
     }
     return res;
+}
+
+/// Parses a spawn form (`async(io) f(x)`, `concurrent(io) f(x)` or
+/// `detach(io) f(x)`) if the current token is one of those words followed by
+/// `(`, and returns null if it is anything else, or if what was parsed is an
+/// ordinary call to a function of that name.
+///
+/// The words are identifiers to the tokenizer, so the form is recognised by
+/// one token of lookahead: the parenthesised operand is parsed as an ordinary
+/// call's arguments, and the form is a spawn only when that call is followed
+/// by the spawned call, which begins with an identifier or `@`. A complete
+/// expression can never be followed by either, so no program that compiles
+/// without this rule changes meaning under it.
+///
+/// The form is analysed as `<io>.<keyword>(<callee>, .{<args>})`, which is how
+/// `std.Io` takes a spawn, so the AST carries those two nodes as well as the
+/// ones the source spells (`Node.Spawn`).
+fn parseSpawnExpr(p: *Parse) Error!?Node.Index {
+    if (p.tokenTag(p.tok_i) != .identifier or p.tokenTag(p.tok_i + 1) != .l_paren) return null;
+    const keyword = p.taskKeyword(p.tok_i) orelse return null;
+    if (!keyword.isSpawn()) return null;
+
+    const word_token = p.tok_i;
+    const keyword_node = try p.addNode(.{
+        .tag = .identifier,
+        .main_token = word_token,
+        .data = undefined,
+    });
+    p.tok_i += 1;
+    // `(` follows the word, so this is the operand's argument list.
+    var io_call = (try p.parseSuffixOp(keyword_node)).?;
+    switch (p.tokenTag(p.tok_i)) {
+        .identifier, .builtin => {},
+        else => {
+            // An ordinary call whose callee happens to be named `async`,
+            // `concurrent` or `detach`; nothing about it changes.
+            while (try p.parseSuffixOp(io_call)) |suffix_op| io_call = suffix_op;
+            return io_call;
+        },
+    }
+    // What follows the operand is the spawned call.
+    const spawned_call = (try p.parseSuffixExpr()) orelse return p.fail(.expected_expr);
+
+    const io_operand: Node.OptionalIndex = switch (p.nodeTag(io_call)) {
+        .call_one, .call_one_comma => p.nodeData(io_call).node_and_opt_node[1],
+        else => .none,
+    };
+    const keyword_field = try p.addNode(.{
+        .tag = .field_access,
+        .main_token = word_token,
+        .data = .{ .node_and_token = .{
+            io_operand.unwrap() orelse io_call,
+            word_token,
+        } },
+    });
+    const args_tuple = try p.spawnArgsTuple(spawned_call);
+    const extra = try p.addExtra(Node.Spawn{
+        .keyword_field = keyword_field,
+        .args_tuple = args_tuple,
+        .spawned_call = spawned_call,
+    });
+    return try p.addNode(.{
+        .tag = .spawn_expr,
+        .main_token = word_token,
+        .data = .{ .node_and_extra = .{ io_call, extra } },
+    });
+}
+
+/// The arguments of a spawned call, as the tuple `Io.async` takes them: a
+/// node of the same shape the source's `.{...}` produces, whose elements are
+/// the call's arguments.
+fn spawnArgsTuple(p: *Parse, call_node: Node.Index) Allocator.Error!Node.Index {
+    const scratch_top = p.scratch.items.len;
+    defer p.scratch.shrinkRetainingCapacity(scratch_top);
+
+    const comma = switch (p.nodeTag(call_node)) {
+        .call_one => false,
+        .call_one_comma => true,
+        .call => false,
+        .call_comma => true,
+        else => unreachable, // the spawned call is a call
+    };
+    const lparen = p.nodeMainToken(call_node);
+    switch (p.nodeTag(call_node)) {
+        .call_one, .call_one_comma => {
+            const arg = p.nodeData(call_node).node_and_opt_node[1];
+            return try p.addNode(.{
+                .tag = if (arg == .none)
+                    .struct_init_dot_two
+                else if (comma) .array_init_dot_two_comma else .array_init_dot_two,
+                .main_token = lparen,
+                .data = .{ .opt_node_and_opt_node = .{
+                    arg,
+                    .none,
+                } },
+            });
+        },
+        .call, .call_comma => {
+            const range = p.nodeData(call_node).extra_range;
+            const args = p.extra_data.items[@backingInt(range.start)..@backingInt(range.end)];
+            if (args.len <= 2) {
+                return try p.addNode(.{
+                    .tag = if (comma) .array_init_dot_two_comma else .array_init_dot_two,
+                    .main_token = lparen,
+                    .data = .{ .opt_node_and_opt_node = .{
+                        .fromOptional(@fromBackingInt(@intCast(args[0]))),
+                        if (args.len >= 2) .fromOptional(@fromBackingInt(@intCast(args[1]))) else .none,
+                    } },
+                });
+            }
+            return try p.addNode(.{
+                .tag = if (comma) .array_init_dot_comma else .array_init_dot,
+                .main_token = lparen,
+                .data = .{ .extra_range = try p.listToSpan(@ptrCast(args)) },
+            });
+        },
+        else => unreachable,
+    }
 }
 
 fn parsePrimaryTypeExpr(p: *Parse) !?Node.Index {
