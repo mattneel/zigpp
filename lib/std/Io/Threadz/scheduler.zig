@@ -2442,16 +2442,9 @@ pub fn Scheduler(comptime Backend: type) type {
                 .nothing => {},
                 .group => {
                     // The awaiter received a cancelation request while awaiting a group, so
-                    // propagate the cancelation to the group - unless the awaiter is
-                    // cancel-protected. A protected awaiter cannot be woken by its own
-                    // cancelation: the request is kept for its next cancelation point after it
-                    // unblocks, and the group's bookkeeping, which readies the awaiter itself, is
-                    // not entered from here (it would read `task.status` after the group had
-                    // already reset it). The awaiter is parked, so its protection is stable to
-                    // read from this thread.
-                    if (task.cancel_protection.check() == .unblocked and
-                        task.status.awaiting_group.cancel(s, null))
-                    {
+                    // propagate the cancelation to the group. Only an awaiter that its request may
+                    // wake says it awaits a group: see `Group.registerAwaiter`.
+                    if (task.status.awaiting_group.cancel(s, null)) {
                         task.status = .{ .queue_next = null };
                         s.ready(.current(), task);
                     }
@@ -2714,14 +2707,13 @@ pub fn Scheduler(comptime Backend: type) type {
                         .tasks = .pack(new_head),
                     }, .monotonic);
                 } else if (@atomicLoad(Awaiter, group.awaiterPtr(), .monotonic).awaiter.unpack()) |awaiter| {
-                    // A cancel-protected awaiter cannot be readied by its own request - there is no
-                    // propagation from `requestCancel` for it, and nothing else readies it - so it
-                    // is readied here, keeping the request for its next cancelation point after it
-                    // unblocks.
-                    const requested = awaiter.cancel_status.changeAwaiting(.group, .nothing);
-                    if (!requested or list.cancel_requested or
-                        awaiter.cancel_protection.check() == .blocked)
-                    {
+                    // A cancel-protected awaiter never said it awaits the group, so no cancel
+                    // request readies it: the group does, here, and the request waits for the
+                    // awaiter's next cancelation point after it unblocks. Its protection is read
+                    // under the lock it registered under, and it cannot change while it waits.
+                    const requested = awaiter.cancel_protection.check() == .unblocked and
+                        awaiter.cancel_status.changeAwaiting(.group, .nothing);
+                    if (!requested or list.cancel_requested) {
                         @atomicStore(List, list_ptr, .{
                             .cancel_requested = false,
                             .awaiter_delayed = false,
@@ -2760,7 +2752,7 @@ pub fn Scheduler(comptime Backend: type) type {
                 group.lock();
                 defer group.unlock();
                 if (@atomicLoad(List, group.listPtr(), .monotonic).tasks.unpack()) |_| {
-                    if (group.registerAwaiter(awaiter) and awaiter.cancel_protection.check() == .unblocked) {
+                    if (group.registerAwaiter(awaiter)) {
                         // The awaiter already had an unacknowledged cancelation request before
                         // attempting to await a group, so propagate the cancelation to the group.
                         assert(!group.cancelLocked(s, null));
@@ -2805,7 +2797,8 @@ pub fn Scheduler(comptime Backend: type) type {
                 return if (maybe_awaiter) |_| true else list.awaiter_delayed;
             }
 
-            /// Assumes the mutex is held.
+            /// Assumes the mutex is held. Returns whether the awaiter has a cancelation request it
+            /// may act on now.
             fn registerAwaiter(group: Group, awaiter: *Task) bool {
                 assert(awaiter.status.queue_next == null);
                 awaiter.status = .{ .awaiting_group = group };
@@ -2816,7 +2809,20 @@ pub fn Scheduler(comptime Backend: type) type {
                     .{ .locked = false, .contended = false, .awaiter = .pack(awaiter) },
                     .monotonic,
                 ).awaiter == .null);
-                return awaiter.cancel_status.changeAwaiting(.nothing, .group);
+                // A cancel-protected awaiter cannot be woken by a cancelation request, so it does
+                // not say that it awaits the group: `requestCancel` only records a request for it,
+                // and never reads its `status`, which the group resets when it readies it. The
+                // awaiter switched out on this thread before this runs, so this reads its own last
+                // write.
+                if (awaiter.cancel_protection.check() == .blocked) return false;
+                // Release: `requestCancel` reads `status` once it sees `.group`, and it does so
+                // without the group's lock.
+                const old_cancel_status = @atomicRmw(Task.CancelStatus, &awaiter.cancel_status, .Add, .{
+                    .requested = false,
+                    .awaiting = Task.CancelStatus.Awaiting.group.subWrap(.nothing),
+                }, .release);
+                assert(old_cancel_status.awaiting == .nothing);
+                return old_cancel_status.requested;
             }
         };
     };
