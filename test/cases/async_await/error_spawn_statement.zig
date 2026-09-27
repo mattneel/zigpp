@@ -10,4 +10,4 @@ fn handler(io: Io) void {
 // error
 // is_test=true
 //
-// :6:5: error: a spawn statement needs the frame's group, not yet implemented; bind the task: const f = async(io) f(x);
+// :7:5: error: a spawn statement needs the frame's group, not yet implemented; bind the task: const f = async(io) f(x);

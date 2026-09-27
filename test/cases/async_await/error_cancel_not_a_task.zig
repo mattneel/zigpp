@@ -11,4 +11,4 @@ fn handler(io: Io) void {
 // error
 // is_test=true
 //
-// :8:15: error: `cancel` works on a task spawned by the keywords; for a future value write `x.cancel(io)`
+// :8:16: error: `cancel` works on a task spawned by the keywords; for a future value write `x.cancel(io)`
