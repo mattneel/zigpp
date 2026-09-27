@@ -2,15 +2,17 @@ name: ppup
 
 # ppup is Zig++'s installer and toolchain manager: ppup/ppup for Linux and
 # macOS, ppup/ppup.ps1 for Windows. Both install from the published releases,
-# so this runs on every pull request that changes them, and after every release
-# on master, the same way the site is rebuilt.
+# through the site's download index, so this runs on every pull request that
+# changes them, and after every site deployment on master, which is how a
+# release reaches the index. Run after the release itself, it raced the
+# deployment: the index could change under a run.
 on:
   pull_request:
     paths:
       - "ppup/**"
       - ".github/workflows/ppup.yml"
   workflow_run:
-    workflows: [Release]
+    workflows: [Site]
     types: [completed]
     branches: [master]
 
@@ -22,7 +24,7 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
-    # A release that failed published nothing new.
+    # A deployment that failed published nothing new.
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     strategy:
       fail-fast: false
@@ -99,6 +101,9 @@ jobs:
           elsewhere="$RUNNER_TEMP/elsewhere"
           mkdir -p "$elsewhere"
           env -u PPUP_HOME HOME="$elsewhere" PATH=/usr/bin:/bin "$PPUP_HOME/bin/ppup" update
+          # A release published since the install is the default now: in
+          # ppup's own home, which is what this checks.
+          version=$(ppup default)
           env -u PPUP_HOME HOME="$elsewhere" "$PPUP_HOME/bin/ppup" list | grep -q "\* $version (default)" ||
             { echo "ppup without PPUP_HOME did not keep to its own home" >&2; exit 1; }
           if [ -n "$(ls -A "$elsewhere")" ]; then
@@ -107,10 +112,13 @@ jobs:
             exit 1
           fi
 
-          # The newest release is the default: nothing to update.
+          # The newest release is the default: nothing to update. The first
+          # update installs a release published meanwhile, if there is one.
+          ppup update
           ppup update | tee update.txt
           grep -q "newest release" update.txt ||
             { echo "ppup update did not report being current" >&2; exit 1; }
+          version=$(ppup default)
 
           # The `curl | sh` form, against the toolchain that is already
           # installed, so this is the pipe and the self-install rather than a
@@ -118,13 +126,14 @@ jobs:
           cat ppup/ppup | sh -s -- --no-modify-path install "$version"
 
           # With a second release published, a second toolchain goes in and
-          # comes out again; the default one refuses to.
-          tags=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName \
-            --jq '[.[] | select(.tagName | startswith("zigpp-"))] | .[0:2] | .[].tagName')
-          echo "$tags"
-          if [ "$(printf '%s\n' "$tags" | grep -c .)" -ge 2 ]; then
-            second=$(printf '%s\n' "$tags" | sed -n '2p')
-            second=${second#zigpp-}
+          # comes out again; the default one refuses to. The second is the
+          # release just before the default: a newer one may not be in the
+          # index yet, and every older one is.
+          second=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName \
+            --jq '.[].tagName | select(startswith("zigpp-")) | ltrimstr("zigpp-")' |
+            grep -A 1 -xF "${version%%+*}" | sed -n 2p)
+          echo "second: ${second:-none}"
+          if [ -n "$second" ]; then
             ppup install "$second"
             ppup list
             ppup default "$second"
@@ -214,13 +223,19 @@ jobs:
             $env:PPUP_NO_MODIFY_PATH = '1'
             $env:LOCALAPPDATA = $savedLocalAppData
           }
+          # A release published since the install is the default now: in
+          # ppup's own home, which is what this checks.
+          $version = (& $ppup default | Out-String).Trim()
           if ($list -notmatch [regex]::Escape("* $version (default)")) { throw 'ppup without PPUP_HOME did not keep to its own home' }
           if (Test-Path -LiteralPath $elsewhere) { throw "ppup without PPUP_HOME wrote to $elsewhere" }
           if ([Environment]::GetEnvironmentVariable('Path', 'User') -ne $userPath) { throw 'the installed ppup changed the user PATH' }
 
           # The newest release is the default: update touches nothing. (ppup's
           # status messages go to the host, so this compares the toolchain
-          # itself rather than its output.)
+          # itself rather than its output.) The first update installs a release
+          # published meanwhile, if there is one.
+          & $ppup update
+          $version = (& $ppup default | Out-String).Trim()
           $before = (Get-Item -LiteralPath (Join-Path $env:PPUP_HOME "toolchains\$version")).LastWriteTimeUtc
           & $ppup update
           $after = (Get-Item -LiteralPath (Join-Path $env:PPUP_HOME "toolchains\$version")).LastWriteTimeUtc
@@ -232,14 +247,18 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "ppup.cmd list failed with $LASTEXITCODE" }
 
           # With a second release published, a second toolchain goes in and
-          # comes out again; the default one refuses to. The list is filtered
-          # here rather than with --jq: Windows PowerShell 5.1 drops the
-          # double quotes inside arguments to native programs.
+          # comes out again; the default one refuses to. The second is the
+          # release just before the default: a newer one may not be in the
+          # index yet, and every older one is. The list is filtered here rather
+          # than with --jq: Windows PowerShell 5.1 drops the double quotes
+          # inside arguments to native programs.
           $releases = gh release list --repo $env:GITHUB_REPOSITORY --limit 100 --json tagName
           if ($LASTEXITCODE -ne 0) { throw "gh release list failed with $LASTEXITCODE" }
-          $tags = @((($releases -join "`n") | ConvertFrom-Json) | ForEach-Object { $_.tagName } | Where-Object { $_ -like 'zigpp-*' } | Select-Object -First 2)
-          if ($tags.Count -ge 2) {
-            $second = $tags[1] -replace '^zigpp-', ''
+          $current = ($version -split '\+')[0]
+          $tagVersions = @((($releases -join "`n") | ConvertFrom-Json) | ForEach-Object { $_.tagName } | Where-Object { $_ -like 'zigpp-*' } | ForEach-Object { $_ -replace '^zigpp-', '' })
+          $at = [array]::IndexOf($tagVersions, $current)
+          if ($at -ge 0 -and $at + 1 -lt $tagVersions.Count) {
+            $second = $tagVersions[$at + 1]
             & $ppup install $second
             & $ppup list
             & $ppup default $second
