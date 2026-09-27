@@ -25,7 +25,7 @@ dump() {
     file=$1
     base=$(basename "$file" .zig)
     ZIG_LIB_DIR=$lib "$zig" test "$file" -fno-emit-bin --verbose-air \
-        --cache-dir "$tmp/cache-$base" 2>&1 >"$tmp/$base.raw" || true
+        --cache-dir "$tmp/cache-$base" >"$tmp/$base.raw" 2>&1 || true
     # The dump goes to stderr; a compile error means there is nothing to compare.
     if ! grep -q '^# Begin Function AIR' "$tmp/$base.raw"; then
         echo "no AIR was dumped for $file" >&2
@@ -35,7 +35,7 @@ dump() {
     for f in $functions; do
         awk -v want="$base.$f" -v base="$base" '
             /^# Begin Function AIR: / {
-                name = $4
+                name = $5
                 sub(/:$/, "", name)
                 gsub(/\//, ".", name)
                 name = substr(name, length(name) - length(want) + 1)
@@ -57,6 +57,17 @@ dump() {
 
 dump "$dir/sugar.zig" >"$tmp/sugar.air"
 dump "$dir/hand.zig" >"$tmp/hand.air"
+
+# A comparison of nothing is not a comparison: every function must be there.
+for f in $functions; do
+    for base in sugar hand; do
+        if ! grep -q "^# $f$" "$tmp/$base.air"; then
+            echo "$base.air has no AIR for $f" >&2
+            exit 1
+        fi
+    done
+done
+echo "compared $(grep -c '^# ' "$tmp/sugar.air") functions, $(grep -c '^  *%' "$tmp/sugar.air") instructions"
 
 if diff -u "$tmp/hand.air" "$tmp/sugar.air"; then
     echo "the AIR of the sugared forms equals the hand-written expansion"

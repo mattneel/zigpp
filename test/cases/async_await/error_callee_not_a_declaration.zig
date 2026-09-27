@@ -12,4 +12,4 @@ fn handler(io: Io) void {
 // error
 // is_test=true
 //
-// :10:15: error: the callee of `async` must name a function; bind the receiver or the function first
+// :9:20: error: the callee of `async` must name a function; bind the receiver or the function first

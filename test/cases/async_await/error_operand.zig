@@ -10,4 +10,4 @@ fn handler(io: Io) void {
 // error
 // is_test=true
 //
-// :7:5: error: the operand of `async` is the `Io` to spawn with: `async(io) f(x)`
+// :7:10: error: the operand of `async` is the `Io` to spawn with: `async(io) f(x)`

@@ -27,7 +27,7 @@ fn awaitBinding(io: Io) u32 {
     return a.await(a_io);
 }
 
-fn concurrentBinding(io: Io) u32 {
+fn concurrentBinding(io: Io) !u32 {
     const a_io = io;
     var a = try a_io.concurrent(add, .{4});
     var a_live = true;

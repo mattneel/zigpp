@@ -7,9 +7,10 @@ fn sleepAndAdd(io: Io, x: u32) Io.Cancelable!u32 {
 }
 
 fn frame(io: Io, seen: *bool) error{Boom}!u32 {
+    // A binding may not be used as a value, so the task is simply left live:
+    // the error exit runs its `errdefer`, which cancels it and joins.
     const a = async(io) sleepAndAdd(io, 1);
     seen.* = true;
-    if (a.ptr == null) unreachable;
     return error.Boom;
 }
 
@@ -20,7 +21,7 @@ test "an error exit cancels before it joins" {
     try std.testing.expectError(error.Boom, frame(io, &seen));
     try std.testing.expect(seen);
     // The frame did not wait out the task's sleep: `errdefer` cancelled it.
-    const elapsed = start.untilNow(io, .awake);
+    const elapsed = start.untilNow(io);
     try std.testing.expect(elapsed.toMilliseconds() < 50);
 }
 

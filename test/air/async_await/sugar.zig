@@ -19,7 +19,7 @@ fn awaitBinding(io: Io) u32 {
     return await a;
 }
 
-fn concurrentBinding(io: Io) u32 {
+fn concurrentBinding(io: Io) !u32 {
     const a = try concurrent(io) add(4);
     return await a;
 }

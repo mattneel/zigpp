@@ -799,7 +799,7 @@ fn emitTaskSpawnCall(
             .payload_index = payload_index,
         } },
     });
-    return call_inst;
+    return rvalue(gz, ri, call_inst, spawn.call_node);
 }
 
 /// The `defer`/`errdefer` pair of §4.1 for a task binding: `if (a_live) <join>`

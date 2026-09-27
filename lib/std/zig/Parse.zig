@@ -2348,11 +2348,14 @@ fn spawnArgsTuple(p: *Parse, call_node: Node.Index) Allocator.Error!Node.Index {
     defer p.scratch.shrinkRetainingCapacity(scratch_top);
 
     const comma = switch (p.nodeTag(call_node)) {
-        .call_one => false,
-        .call_one_comma => true,
-        .call => false,
-        .call_comma => true,
-        else => unreachable, // the spawned call is a call
+        .call_one, .call => false,
+        .call_one_comma, .call_comma => true,
+        // Not a call: AstGen reports that, and the tuple is empty.
+        else => return try p.addNode(.{
+            .tag = .struct_init_dot_two,
+            .main_token = p.nodeMainToken(call_node),
+            .data = .{ .opt_node_and_opt_node = .{ .none, .none } },
+        }),
     };
     const lparen = p.nodeMainToken(call_node);
     switch (p.nodeTag(call_node)) {
