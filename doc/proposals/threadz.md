@@ -34,7 +34,7 @@ scout reports.
 
 | Existing | In the tree today | Under Threadz |
 | --- | --- | --- |
-| The `Io` interface: `async`, `concurrent`, `await`, `cancel`, `group*`, `futexWait`/`futexWake`, `operate`, `batch*`, `sleep`, file, dir and net hooks (`Io.zig:51-244`) | One vocabulary. `Io.Evented` selects `Uring` on Linux, `Kqueue` on BSD and `Dispatch` on Darwin, wherever `fiber.zig` has a switch (`Io.zig:23-39`). | Unchanged. Threadz implements the vtable. `Io.Threadz` becomes the name of the platform selector; `Io.Evented` stays as an alias until nothing references it. |
+| The `Io` interface: `async`, `concurrent`, `await`, `cancel`, `group*`, `futexWait`/`futexWake`, `operate`, `batch*`, `sleep`, file, dir and net hooks (`Io.zig:51-244`) | One vocabulary. `Io.Evented` selects `Uring` on Linux and `Kqueue` on Darwin and the BSDs, wherever `fiber.zig` has a switch (`Io.zig:31-41`). | Unchanged. Threadz implements the vtable. `Io.Threadz` is the name of the platform selector; `Io.Evented` stays as an alias until nothing references it. |
 | `std.Thread.Pool` | Does not exist. Upstream removed it; the compiler runs on `Io.Threaded` (`src/Zcu/PerThread.zig:62-69`). `std.Thread` is `spawn` and `getCpuCount`. | Nothing to rewrite. |
 | `Io.Threaded` (19k lines) | One run queue for the whole pool: a linked list behind an `Io.Mutex` and `Io.Condition`, used LIFO (`Threaded.zig:31-49,1793-1807`). Workers spawned lazily and detached. When `async` hits its limit (CPU count − 1) the work runs on the caller. Blocked syscalls are cancelled with `SIGIO`, `tgkill` or `NtCancelSynchronousIoFile`. | Stays the OS-thread implementation and the dirty pool. **This is the justified rewrite**: per-worker queues with a LIFO slot and batch stealing in place of the single queue, syscall cancellation kept as is. The compiler and the build runner run on it, so "the compiler builds itself no slower" is the benchmark. |
 | `Io.Mutex`, `Condition`, `Event`, `RwLock`, `Semaphore` | Every contended path ends at the vtable's `futexWait`/`futexWake`; none skips it. | Reused unchanged. Threadz implements the futex hooks as park and unpark. |
@@ -43,7 +43,7 @@ scout reports.
 | `Io/fiber.zig` (323 lines) | A context switch for aarch64, riscv64 and x86_64: saves stack pointer, frame pointer and program counter, declares every other register clobbered. No stacks, no TLS handling, no Windows. | Reused as the switch. Added: Windows x64, which must also swap the TEB stack-base and stack-limit fields that `__chkstk` and structured exception handling read; and the rule that `threadlocal` is worker-local, since the switch does not move the TLS base. |
 | `Io.Uring` (6.1k lines) | Already multi-threaded: a ring, a ready stack and a free-fiber queue per worker, CPU-count workers, idle workers stealing and waking each other with `MSG_RING`, futex waits through the ring. Fiber stacks are 60 MiB from the allocator, pooled, unguarded. Networking is unfinished: listen, accept, connect and DNS return `NetworkDown`; `net_write` panics (`Uring.zig:775-785,4986-5058`). `schedule` may resume a task on any worker. | Threadz's Linux core. Its scheduler is extracted into a module the other backends share. Stacks become guarded and lazily committed with a per-spawn size. Networking is finished. `schedule` gets the locality rule below. |
 | `Io.Kqueue` (1.5k lines) | A stale draft: the futex, operate, batch and cancel hooks are missing from its vtable, and group operations panic. | Rewritten against the current vtable on the shared scheduler. The core for macOS and BSD. Done in 5a: one kqueue per worker, `EVFILT.USER` wakes, sockets and connects that park and retry, timers per operation, `EVFILT.PROC` for children, a futex table for tasks and the per-OS kernel futex for other threads, and the whole direct-call surface. |
-| `Io.Dispatch` (5k lines) | Built on GCD, which owns and sizes the threads. No per-worker queues, no networking. | Fails "every thread deliberate." It was the Darwin core until 5a; `Kqueue` has its own networking, and `Dispatch` waits in the tree, unreferenced, for the M4 run that retires it. `Maker.Watch`'s macOS watcher uses FSEvents directly and is unaffected. |
+| `Io.Dispatch` (5k lines) | Built on GCD, which owns and sizes the threads. No per-worker queues, no networking. | **Deleted in 5a.** It was the Darwin core until the kqueue core passed the suites there; `Kqueue` has its own networking, and nothing referenced `Dispatch` any more. `Maker.Watch`'s macOS watcher uses FSEvents directly and was unaffected. |
 | IOCP | Absent. | New, with the Windows fiber work. Last core to land. |
 | Tests | `std.testing.io` is a `Threaded` instance. No evented backend is tested end to end. There is no scheduler benchmark. | The `Io/test.zig` contract tests run against Threadz on every platform it exists on. A scheduler benchmark is added and becomes the gate for the `Threaded` rewrite too. |
 
@@ -111,7 +111,7 @@ pinning. The stealing policy comes from the table above, not from the current co
    and the operation past 128 yields it first, to the back of its worker's queue with its affinity
    kept; the constant is `scheduler.budget`, and every Threadz entry point charges, the count
    starting over at each park or yield. `io.blocking(fn, args)` is a new Io operation: `Threaded`,
-   `Kqueue`, `Dispatch` and the failing implementation make the call on the calling thread, and
+   `Kqueue` and the failing implementation make the call on the calling thread, and
    Threadz runs it on a dirty pool, an `Io.Threaded` instance the instance owns and starts with
    the first such call, parking the calling task with the argument and result slots on its own
    stack; it is not cancelable once started. One watchdog thread per instance, started with the
@@ -151,15 +151,15 @@ pinning. The stealing policy comes from the table above, not from the current co
    declaration; ids are unique in the program, each worker taking them 1024 at a time from one
    counter. Step 7 below adds the naming API on top.
 5. **The other cores.** `Kqueue` rewritten on the shared scheduler for macOS and BSD; `Dispatch`
-   retired once it reaches parity; IOCP and the Windows fiber work last.
+   retired with it; IOCP and the Windows fiber work last.
    *5a, the kqueue core, is written:* the scheduler maps stacks per OS, `readyFromForeign` and the
    dirty pool are the scheduler's, so every core has them, and `Kqueue` implements the whole
    vtable on kqueue (sockets, connect, timers, `EVFILT.PROC`, a futex table, `netLookup`,
    `randomSecure` from `arc4random_buf`), with `EVFILT.USER` wakes that any thread may set, the
    Darwin and BSD stack flags, and no barrier on those systems, so a stuck worker's slot costs a
-   compare-exchange. `Maker.Watch` keeps `Kqueue.kevent` and `createFileDescriptor`. `Dispatch` stays
-   in the tree, unreferenced on Darwin, until the M4 has run the suites on the new core; 5b
-   (Windows, fibers and IOCP) reuses this scheduler.
+   compare-exchange. `Maker.Watch` keeps `Kqueue.kevent` and `createFileDescriptor`. `Dispatch` is
+   deleted: the M4 ran the suites on the new core, nothing referenced it, and its tests went with
+   it. 5b (Windows, fibers and IOCP) reuses this scheduler.
 6. **BEAM shapes.** Arenas, `Io.Scoped`, `Io.Supervisor`, overflow policies.
 
    Shipped: an arena lives in the shared scheduler's task and in each core's own task state, made at
@@ -194,7 +194,7 @@ pinning. The stealing policy comes from the table above, not from the current co
 
 ## Open questions
 
-1. Whether `Dispatch` has a reason to survive `Kqueue` parity.
+1. ~~Whether `Dispatch` has a reason to survive `Kqueue` parity.~~ No: 5a deleted it.
 2. The default stack reservation, measured against Zix's deepest call chain rather than guessed.
 3. The sticky-steal threshold, chosen by the scheduler benchmark rather than by hand.
 4. Whether IOCP is a 1.0 requirement or the first thing after it.
