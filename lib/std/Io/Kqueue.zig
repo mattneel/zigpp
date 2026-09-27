@@ -1357,15 +1357,7 @@ fn alloc(userdata: *anyopaque, len: usize, alignment: Alignment, ret_addr: usize
     const ev_io = ev.io();
     ev.backing_allocator_mutex.lockUncancelable(ev_io);
     defer ev.backing_allocator_mutex.unlock(ev_io);
-    const result = ev.backing_allocator.rawAlloc(len, alignment, ret_addr);
-    std.debug.print("diag alloc: ev={*} len={d} align={d} backing={*} -> {?*}\n", .{
-        ev,
-        len,
-        alignment.toByteUnits(),
-        ev.backing_allocator.ptr,
-        if (result) |r| @as(?*anyopaque, @ptrCast(r)) else null,
-    });
-    return result;
+    return ev.backing_allocator.rawAlloc(len, alignment, ret_addr);
 }
 
 fn resize(
@@ -1379,11 +1371,7 @@ fn resize(
     const ev_io = ev.io();
     ev.backing_allocator_mutex.lockUncancelable(ev_io);
     defer ev.backing_allocator_mutex.unlock(ev_io);
-    const ok = ev.backing_allocator.rawResize(memory, alignment, new_len, ret_addr);
-    std.debug.print("diag resize: mem={*} from={d} to={d} align={d} -> {}\n", .{
-        memory.ptr, memory.len, new_len, alignment.toByteUnits(), ok,
-    });
-    return ok;
+    return ev.backing_allocator.rawResize(memory, alignment, new_len, ret_addr);
 }
 
 fn remap(
@@ -1397,33 +1385,16 @@ fn remap(
     const ev_io = ev.io();
     ev.backing_allocator_mutex.lockUncancelable(ev_io);
     defer ev.backing_allocator_mutex.unlock(ev_io);
-    const p2 = ev.backing_allocator.rawRemap(memory, alignment, new_len, ret_addr);
-    std.debug.print("diag remap: mem={*} from={d} to={d} -> {?*}\n", .{ memory.ptr, memory.len, new_len, if (p2) |q| @as(?*anyopaque, @ptrCast(q)) else null });
-    return p2;
+    return ev.backing_allocator.rawRemap(memory, alignment, new_len, ret_addr);
 }
 
 fn free(userdata: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    std.debug.print("diag free a: ev={*} mem={*} len={d} align={d} backing={*}/{*} needs={}\n", .{
-        ev,
-        memory.ptr,
-        memory.len,
-        alignment.toByteUnits(),
-        ev.backing_allocator.ptr,
-        ev.backing_allocator.vtable,
-        ev.backing_allocator_needs_mutex,
-    });
     const ev_io = ev.io();
-    std.debug.print("diag free b\n", .{});
     ev.backing_allocator_mutex.lockUncancelable(ev_io);
-    std.debug.print("diag free c\n", .{});
     defer ev.backing_allocator_mutex.unlock(ev_io);
-    ev.backing_allocator.rawFree(memory, alignment, ret_addr);
-    std.debug.print("diag free d: child={*}\n", .{ev.backing_allocator.ptr});
-    _ = &mem_lock_probe;
+    return ev.backing_allocator.rawFree(memory, alignment, ret_addr);
 }
-
-var mem_lock_probe: u32 = 0;
 
 pub const InitOptions = struct {
     /// Whether the backing allocator this instance is given needs a lock around it: it is used
