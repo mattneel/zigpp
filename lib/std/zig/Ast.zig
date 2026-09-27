@@ -966,7 +966,6 @@ pub fn lastToken(tree: Ast, node: Node.Index) TokenIndex {
         .bool_and,
         .bool_or,
         .error_union,
-        .spawn_expr,
         .if_simple,
         .while_simple,
         .for_simple,
@@ -977,6 +976,10 @@ pub fn lastToken(tree: Ast, node: Node.Index) TokenIndex {
 
         .test_decl => n = tree.nodeData(n).opt_token_and_node[1],
         .@"defer", .@"errdefer", .consume_expr => n = tree.nodeData(n).node,
+        .spawn_expr => {
+            _, const extra_index = tree.nodeData(n).node_and_extra;
+            n = tree.extraData(extra_index, Node.Spawn).spawned_call;
+        },
         .anyframe_type => n = tree.nodeData(n).token_and_node[1],
 
         .switch_case_one,
