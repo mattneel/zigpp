@@ -562,8 +562,13 @@ const Group = struct {
         ) Allocator.Error!*Task {
             const max_context_misalignment = context_alignment.toByteUnits() -| @alignOf(Task);
             const worst_case_context_offset = context_alignment.forward(@sizeOf(Task) + max_context_misalignment);
+            // A spawn from outside every `Scoped.run`, the common case, copies nothing and takes no
+            // room for bindings.
             const worst_case_scopes_offset = Alignment.of(Io.Scopes).forward(worst_case_context_offset + context.len);
-            const alloc_len = worst_case_scopes_offset + Io.Scopes.copySize(parent_scopes) + @alignOf(Io.Scopes);
+            const alloc_len = if (parent_scopes) |parent|
+                worst_case_scopes_offset + Io.Scopes.copySize(parent) + @alignOf(Io.Scopes)
+            else
+                worst_case_context_offset + context.len;
 
             const task: *Task = @ptrCast(@alignCast(try gpa.alignedAlloc(u8, .of(Task), alloc_len)));
             errdefer comptime unreachable;
@@ -579,7 +584,7 @@ const Group = struct {
                 .func = func,
                 .context_alignment = context_alignment,
                 .alloc_len = alloc_len,
-                .scopes = Io.Scopes.copyInto(parent_scopes, @ptrFromInt(actual_scopes_addr)),
+                .scopes = if (parent_scopes) |parent| Io.Scopes.copyInto(parent, @ptrFromInt(actual_scopes_addr)) else null,
             };
             @memcpy(task.contextPointer()[0..context.len], context);
             return task;
@@ -758,8 +763,13 @@ const Future = struct {
         const max_context_misalignment = context_alignment.toByteUnits() -| @alignOf(Future);
         const worst_case_context_offset = context_alignment.forward(@sizeOf(Future) + max_context_misalignment);
         const worst_case_result_offset = result_alignment.forward(worst_case_context_offset + context.len);
+        // A spawn from outside every `Scoped.run`, the common case, copies nothing and takes no room
+        // for bindings.
         const worst_case_scopes_offset = Alignment.of(Io.Scopes).forward(worst_case_result_offset + result_len);
-        const alloc_len = worst_case_scopes_offset + Io.Scopes.copySize(parent_scopes) + @alignOf(Io.Scopes);
+        const alloc_len = if (parent_scopes) |parent|
+            worst_case_scopes_offset + Io.Scopes.copySize(parent) + @alignOf(Io.Scopes)
+        else
+            worst_case_result_offset + result_len;
 
         const future: *Future = @ptrCast(@alignCast(try gpa.alignedAlloc(u8, .of(Future), alloc_len)));
         errdefer comptime unreachable;
@@ -782,7 +792,7 @@ const Future = struct {
             .context_alignment = context_alignment,
             .result_offset = actual_result_offset,
             .alloc_len = alloc_len,
-            .scopes = Io.Scopes.copyInto(parent_scopes, @ptrFromInt(actual_scopes_addr)),
+            .scopes = if (parent_scopes) |parent| Io.Scopes.copyInto(parent, @ptrFromInt(actual_scopes_addr)) else null,
         };
         @memcpy(future.contextPointer()[0..context.len], context);
         return future;
