@@ -606,7 +606,7 @@ fn consumeExpr(
     }
     const ident_token = tree.nodeMainToken(operand);
     const name = try astgen.identAsString(ident_token);
-    const local = try findTaskLocal(astgen, scope, name, operand);
+    const local = try findTaskLocal(astgen, scope, name, kind, operand);
 
     // §4.2 rule 5: two consumes in one straight-line statement sequence.
     if (local.task.?.consumed_in == gz) {
@@ -634,6 +634,7 @@ fn findTaskLocal(
     astgen: *AstGen,
     scope: *Scope,
     name_str_index: Zir.NullTerminatedString,
+    kind: Ast.TaskKeyword,
     operand: Ast.Node.Index,
 ) InnerError!*Scope.LocalPtr {
     var scope_var = scope;
@@ -657,8 +658,6 @@ fn findTaskLocal(
         },
         .top => break :find,
     }
-    const token = astgen.tree.nodeMainToken(operand);
-    const kind = Ast.TaskKeyword.fromSlice(astgen.tree.tokenSlice(token)).?;
     return astgen.failNode(operand, "`{s}` works on a task spawned by the keywords; for a future value write `x.{s}(io)`", .{ @tagName(kind), @tagName(kind) });
 }
 

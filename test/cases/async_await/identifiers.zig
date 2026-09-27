@@ -36,9 +36,10 @@ test "identifiers named after the forms keep working" {
     const p: ?u32 = await_val;
     try std.testing.expectEqual(3, p orelse 0);
 
-    // Method calls keep their meaning.
-    const f = io.async(log, .{});
-    _ = f.await(io);
+    // Method calls keep their meaning. `Future.await` takes the future by
+    // pointer, so the local is a `var`.
+    var f = io.async(log, .{});
+    f.await(io);
 
     // A spawn, for contrast, is the form the sugar recognises.
     const a = async(io) log();
