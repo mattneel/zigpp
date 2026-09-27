@@ -147,14 +147,12 @@ fn expr(astrl: *AstRlAnnotate, node: Ast.Node.Index, block: ?*Block, ri: ResultI
         },
 
         .spawn_expr => {
-            // The operand is not a call: it is the `Io` the spawn is made
-            // with, and its expression takes no result location.
-            const io_operand, const spawned_call = tree.nodeData(node).node_and_node;
-            var buf: [1]Ast.Node.Index = undefined;
-            for (tree.fullCall(&buf, io_operand).?.ast.params) |param_node| {
-                _ = try astrl.expr(param_node, block, ResultInfo.none);
-            }
-            _ = try astrl.expr(spawned_call, block, ResultInfo.none);
+            // The form is analysed as `<io>.<keyword>(<callee>, .{<args>})`: a
+            // call whose two arguments are the pieces `Node.Spawn` holds.
+            _, const extra_index = tree.nodeData(node).node_and_extra;
+            const spawn = tree.extraData(extra_index, Ast.Node.Spawn);
+            _ = try astrl.expr(spawn.keyword_field, block, ResultInfo.none);
+            _ = try astrl.expr(spawn.args_tuple, block, ResultInfo.type_only);
             return false;
         },
 
