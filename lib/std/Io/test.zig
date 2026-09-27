@@ -809,8 +809,8 @@ test "Io.blocking" {
             return error.Blocked;
         }
 
-        fn inTask(inner_io: Io, result: *std.atomic.Value(u64)) void {
-            result.store(inner_io.blocking(blockUs, .{@as(u64, 1)}), .release);
+        fn inTask(inner_io: Io, result: *std.atomic.Value(u32)) void {
+            result.store(@intCast(inner_io.blocking(blockUs, .{@as(u64, 1)})), .release);
         }
     };
 
@@ -820,7 +820,7 @@ test "Io.blocking" {
     try expectError(error.Blocked, io.blocking(S.fail, .{}));
 
     // A task can make one, and the task's result arrives.
-    var result: std.atomic.Value(u64) = .init(0);
+    var result: std.atomic.Value(u32) = .init(0);
     var group: Io.Group = .init;
     group.async(io, S.inTask, .{ io, &result });
     try group.await(io);
