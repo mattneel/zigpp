@@ -260,7 +260,38 @@ pub fn Scheduler(comptime Backend: type) type {
             /// `Io.spawnedName` is where it comes from for a spawn through `Io`. The name of a
             /// task outlives it: it is a comptime string.
             name: [:0]const u8,
+            /// The task's arena, created at its first use and freed when it returns. See
+            /// `Sched.taskArena`.
+            arena: Arena = .{},
+            /// The scope bindings this task sees, innermost first. Its own pushes are frames on
+            /// the stack of whoever called `Scoped.run`; what it inherited was copied into
+            /// `context_bytes`-style storage of its own at spawn, so a binding cannot outlive the
+            /// task that made it. See `Sched.scopedGet` and `Io.Scoped`.
+            scopes: ?*const Io.Scopes = null,
             tsan_fiber: tsan.Fiber,
+
+            /// A task's arena: buffers from the Io's allocator, released in one step when the
+            /// task returns. Created lazily, so a task that never asks for one costs three words.
+            pub const Arena = struct {
+                created: bool = false,
+                allocator: std.heap.ArenaAllocator = undefined,
+
+                /// The arena of `task`, created here if this is its first use.
+                fn get(task: *Task, backend_allocator: Allocator) Allocator {
+                    if (!task.arena.created) {
+                        task.arena.allocator = .init(backend_allocator);
+                        task.arena.created = true;
+                    }
+                    return task.arena.allocator.allocator();
+                }
+
+                /// Releases everything the arena holds, if it holds anything.
+                fn free(task: *Task) void {
+                    if (!task.arena.created) return;
+                    task.arena.allocator.deinit();
+                    task.arena.created = false;
+                }
+            };
 
             /// The first id of the next block of ids a worker takes. See `Task.id` and
             /// `Worker.nextTaskId`.
@@ -897,6 +928,8 @@ pub fn Scheduler(comptime Backend: type) type {
         pub fn deinit(s: *Sched, gpa: Allocator) void {
             assert(Worker.current().currentTask() == s.mainTask());
             s.yield(null, .stop);
+            // The main task runs no more Io calls, so its arena goes the way every task's does.
+            Task.Arena.free(s.mainTask());
             // Worker 0 has switched back to the main task on the thread that called `init`. A
             // worker may have been starting one more meanwhile, which `.stop` did not wake. Once
             // it has, every worker is woken again: each one sees `stopping` and returns.
@@ -2020,7 +2053,20 @@ pub fn Scheduler(comptime Backend: type) type {
         ) Io.ConcurrentError!*Task {
             const page = std.heap.pageSize();
             const result_space = @max(result_len, @sizeOf(Backend.Completion)) + result_alignment.toByteUnits();
-            const header_size = @sizeOf(Task) + result_space + context.len + context_alignment.toByteUnits() + 64;
+            // The caller is the task spawning this one, so what it sees is what this one
+            // inherits: a copy of its whole scope chain, in storage of this task's own, taken
+            // below the task in the mapping. See `Io.Scoped`.
+            //
+            // A task that inherits nothing - the common case, and every spawn of a program that
+            // uses no `Scoped` - pays this check and nothing else: no room is taken from the
+            // header, and the stack pointer is where it would have been.
+            const parent_scopes = w.currentTask().scopes;
+            const scopes_bytes: usize = if (parent_scopes) |parent|
+                Io.Scopes.copySize(parent) + @alignOf(Io.Scopes)
+            else
+                0;
+            const header_size = @sizeOf(Task) + result_space + context.len + context_alignment.toByteUnits() +
+                scopes_bytes + 64;
             const mapping = if (options.stack_size == null and header_size <= default_header_size)
                 s.takeMapping(w) catch return error.ConcurrencyUnavailable
             else
@@ -2039,7 +2085,15 @@ pub fn Scheduler(comptime Backend: type) type {
             const end = @intFromPtr(mapping.ptr) + mapping.len;
             const task: *Task = @ptrFromInt(std.mem.alignBackward(usize, end - result_space - @sizeOf(Task), @alignOf(Task)));
             const context_bytes: [*]u8 = @ptrFromInt(context_alignment.backward(@intFromPtr(task) - context.len));
-            const sp = std.mem.alignBackward(usize, @intFromPtr(context_bytes), 16);
+            // The inherited bindings sit below the arguments, and the stack starts below them:
+            // the stack grows down from its pointer, so anything under it would be grown over.
+            // The layout, from the top of the mapping down, is
+            // `result, task, arguments, inherited bindings, stack, guard page`.
+            const scopes_base: ?[*]align(@alignOf(Io.Scopes)) u8 = if (scopes_bytes == 0)
+                null
+            else
+                @ptrFromInt(Alignment.of(Io.Scopes).backward(@intFromPtr(context_bytes) - scopes_bytes));
+            const sp = std.mem.alignBackward(usize, @intFromPtr(context_bytes) - scopes_bytes, 16);
             task.* = .{
                 .context = switch (builtin.cpu.arch) {
                     .aarch64, .riscv64 => .{ .sp = sp, .fp = @intFromPtr(task), .pc = @intFromPtr(&taskEntry) },
@@ -2065,6 +2119,7 @@ pub fn Scheduler(comptime Backend: type) type {
                 // The name has to be a comptime string: a task reports it long after the memory
                 // of whoever spawned it is gone. `Io.spawnedName` is one.
                 .name = if (name.len == 0) "unnamed" else name,
+                .scopes = if (scopes_base) |base| Io.Scopes.copyInto(parent_scopes, base) else null,
                 .tsan_fiber = if (tsan.enable) tsan.__tsan_create_fiber(0),
             };
             if (builtin.cpu.arch == .x86_64) @as(*usize, @ptrFromInt(sp - 8)).* = 0; // no return address
@@ -2123,6 +2178,9 @@ pub fn Scheduler(comptime Backend: type) type {
                 .main => unreachable,
                 .future => |start| {
                     start(task.context_bytes, task.resultBytes(task.result_align));
+                    // The task's arena goes with it, before its result is published: nothing that
+                    // outlives the task may point into it. See `Io.arena`.
+                    Task.Arena.free(task);
                     // An awaiter parked already runs next here, if it may. Otherwise it is made
                     // runnable once this task is saved, by `.finished`.
                     const next = if (@atomicLoad(?*Task, &task.link.awaiter, .acquire)) |awaiter|
@@ -2133,6 +2191,7 @@ pub fn Scheduler(comptime Backend: type) type {
                 },
                 .group => |member| {
                     member.start(task.context_bytes);
+                    Task.Arena.free(task);
                     const w: *Worker = .current();
                     const next = if (member.group.removeTask(task)) |awaiter| next: {
                         if (runsHere(w, awaiter)) break :next awaiter;
@@ -2258,6 +2317,46 @@ pub fn Scheduler(comptime Backend: type) type {
             charge(fromUserdata(userdata));
         }
 
+        /// `Io.arena`: the calling task's arena, created here at its first use from the backend's
+        /// allocator. `taskMain` frees it when the task returns, and `deinit` frees the main
+        /// task's. See `Task.Arena`.
+        pub fn taskArena(userdata: ?*anyopaque) Allocator {
+            const s = fromUserdata(userdata);
+            const w = s.chargeFetch() orelse Worker.current();
+            return Task.Arena.get(w.currentTask(), Backend.allocator(s.backendOf()));
+        }
+
+        /// `Io.Scoped`: the value bound to `key` in the calling task's chain, or `null`.
+        pub fn scopedGet(userdata: ?*anyopaque, key: *const anyopaque) ?*const anyopaque {
+            const s = fromUserdata(userdata);
+            const w = s.chargeFetch() orelse Worker.current();
+            var frame = w.currentTask().scopes;
+            while (frame) |f| : (frame = f.next) {
+                if (f.key == key) return f.value;
+            }
+            return null;
+        }
+
+        /// `Io.Scoped`: binds `frame` in front of what the calling task already sees. The frame is
+        /// the caller's, on its stack, and outlives the binding; the tasks the task spawns while
+        /// it is bound inherit a copy of it. See `Io.Scoped`.
+        pub fn scopedPush(userdata: ?*anyopaque, frame: *Io.Scopes) void {
+            const s = fromUserdata(userdata);
+            const w = s.chargeFetch() orelse Worker.current();
+            const task = w.currentTask();
+            frame.next = task.scopes;
+            task.scopes = frame;
+        }
+
+        /// `Io.Scoped`: unbinds `frame`, the calling task's innermost binding.
+        pub fn scopedPop(userdata: ?*anyopaque, frame: *Io.Scopes) void {
+            const s = fromUserdata(userdata);
+            const w = s.chargeFetch() orelse Worker.current();
+            const task = w.currentTask();
+            assert(task.scopes == frame);
+            task.scopes = frame.next;
+        }
+
         pub fn async(
             userdata: ?*anyopaque,
             result: []u8,
@@ -2345,7 +2444,8 @@ pub fn Scheduler(comptime Backend: type) type {
                 .nothing => {},
                 .group => {
                     // The awaiter received a cancelation request while awaiting a group, so
-                    // propagate the cancelation to the group.
+                    // propagate the cancelation to the group. Only an awaiter that its request may
+                    // wake says it awaits a group: see `Group.registerAwaiter`.
                     if (task.status.awaiting_group.cancel(s, null)) {
                         task.status = .{ .queue_next = null };
                         s.ready(.current(), task);
@@ -2609,11 +2709,27 @@ pub fn Scheduler(comptime Backend: type) type {
                         .tasks = .pack(new_head),
                     }, .monotonic);
                 } else if (@atomicLoad(Awaiter, group.awaiterPtr(), .monotonic).awaiter.unpack()) |awaiter| {
-                    if (!awaiter.cancel_status.changeAwaiting(.group, .nothing) or list.cancel_requested) {
+                    // A cancel-protected awaiter never said it awaits the group, so no cancel
+                    // request readies it: the group does, here, and the request waits for the
+                    // awaiter's next cancelation point after it unblocks. Its protection is read
+                    // under the lock it registered under, and it cannot change while it waits.
+                    const requested = awaiter.cancel_protection.check() == .unblocked and
+                        awaiter.cancel_status.changeAwaiting(.group, .nothing);
+                    if (!requested or list.cancel_requested) {
                         @atomicStore(List, list_ptr, .{
                             .cancel_requested = false,
                             .awaiter_delayed = false,
                             .tasks = .null,
+                        }, .release);
+                        // The awaiter is handed back here, so the group keeps none: a group may
+                        // be used again once it has been awaited or canceled, and a later member's
+                        // exit must not find this awaiter again. The lock's own bits stay as they
+                        // are - `removeTask` holds the lock - and only the awaiter field is
+                        // cleared.
+                        _ = @atomicRmw(Awaiter, group.awaiterPtr(), .And, .{
+                            .locked = true,
+                            .contended = true,
+                            .awaiter = .null,
                         }, .release);
                         assert(awaiter.status.awaiting_group.ptr == group.ptr);
                         awaiter.status = .{ .queue_next = null };
@@ -2638,7 +2754,7 @@ pub fn Scheduler(comptime Backend: type) type {
                 group.lock();
                 defer group.unlock();
                 if (@atomicLoad(List, group.listPtr(), .monotonic).tasks.unpack()) |_| {
-                    if (group.registerAwaiter(awaiter) and awaiter.cancel_protection.check() == .unblocked) {
+                    if (group.registerAwaiter(awaiter)) {
                         // The awaiter already had an unacknowledged cancelation request before
                         // attempting to await a group, so propagate the cancelation to the group.
                         assert(!group.cancelLocked(s, null));
@@ -2683,7 +2799,8 @@ pub fn Scheduler(comptime Backend: type) type {
                 return if (maybe_awaiter) |_| true else list.awaiter_delayed;
             }
 
-            /// Assumes the mutex is held.
+            /// Assumes the mutex is held. Returns whether the awaiter has a cancelation request it
+            /// may act on now.
             fn registerAwaiter(group: Group, awaiter: *Task) bool {
                 assert(awaiter.status.queue_next == null);
                 awaiter.status = .{ .awaiting_group = group };
@@ -2694,7 +2811,20 @@ pub fn Scheduler(comptime Backend: type) type {
                     .{ .locked = false, .contended = false, .awaiter = .pack(awaiter) },
                     .monotonic,
                 ).awaiter == .null);
-                return awaiter.cancel_status.changeAwaiting(.nothing, .group);
+                // A cancel-protected awaiter cannot be woken by a cancelation request, so it does
+                // not say that it awaits the group: `requestCancel` only records a request for it,
+                // and never reads its `status`, which the group resets when it readies it. The
+                // awaiter switched out on this thread before this runs, so this reads its own last
+                // write.
+                if (awaiter.cancel_protection.check() == .blocked) return false;
+                // Release: `requestCancel` reads `status` once it sees `.group`, and it does so
+                // without the group's lock.
+                const old_cancel_status = @atomicRmw(Task.CancelStatus, &awaiter.cancel_status, .Add, .{
+                    .requested = false,
+                    .awaiting = Task.CancelStatus.Awaiting.group.subWrap(.nothing),
+                }, .release);
+                assert(old_cancel_status.awaiting == .nothing);
+                return old_cancel_status.requested;
             }
         };
     };
@@ -2765,6 +2895,10 @@ const TestBackend = struct {
         v.swapCancelProtection = Sched.swapCancelProtection;
         v.checkCancel = Sched.checkCancel;
         v.blocking = Sched.blockingDirect;
+        v.taskArena = Sched.taskArena;
+        v.scopedGet = Sched.scopedGet;
+        v.scopedPush = Sched.scopedPush;
+        v.scopedPop = Sched.scopedPop;
         v.now = now;
         v.futexWait = futexWait;
         v.futexWaitUncancelable = futexWaitUncancelable;
@@ -3257,4 +3391,198 @@ test "watchdog: a computing task starts no replacement" {
     try std.testing.expectEqual(before.replacements, after.replacements); // and nothing replaced
     try std.testing.expectEqual(TestBackend.Sched.Stats.Kind.computing, after.last_stuck.?.kind);
     future.await(io);
+}
+
+// Case A: a task is cancel-protected and gets a cancelation request while it awaits nothing, then,
+// still protected, awaits a group whose member finishes normally. Nothing but `removeTask` can
+// ready it, and the request must be kept for its next cancelation point after it unblocks.
+test "cancelation: a protected awaiter of a group is readied, and keeps its request" {
+    const b = try testBackend(3);
+    defer destroyTestBackend(b);
+    const io = b.io();
+
+    const Context = struct {
+        /// The member waits on this word; the test sets it to let the member finish.
+        word: u32 = 0,
+        /// The awaiter's task, published by the test, and the handshake that makes the request land
+        /// while the awaiter awaits nothing.
+        task: std.atomic.Value(?*TestBackend.Sched.Task) = .init(null),
+        protected: std.atomic.Value(bool) = .init(false),
+        requested: std.atomic.Value(bool) = .init(false),
+        member_done: std.atomic.Value(bool) = .init(false),
+        resumed: std.atomic.Value(bool) = .init(false),
+        canceled: std.atomic.Value(bool) = .init(false),
+
+        fn member(b_: *TestBackend, ctx: *@This()) void {
+            TestBackend.futexWaitUncancelable(b_, &ctx.word, 0);
+            ctx.member_done.store(true, .release);
+        }
+
+        fn awaiter(inner_io: Io, ctx: *@This(), group: *Io.Group) void {
+            _ = inner_io.swapCancelProtection(.blocked);
+            ctx.protected.store(true, .release);
+            // The request must arrive before this task awaits anything.
+            var spins: usize = 0;
+            while (!ctx.requested.load(.acquire)) : (spins += 1) {
+                if (spins > (1 << 31)) return;
+                std.atomic.spinLoopHint();
+            }
+            group.await(inner_io) catch |err| switch (err) {
+                error.Canceled => unreachable, // cancelation is blocked
+            };
+            // Readied by the group's last member leaving, not by the request.
+            ctx.resumed.store(true, .release);
+            _ = inner_io.swapCancelProtection(.unblocked);
+            inner_io.checkCancel() catch |err| switch (err) {
+                error.Canceled => ctx.canceled.store(true, .release),
+            };
+        }
+    };
+
+    var ctx: Context = .{};
+    var group: Io.Group = .init;
+    try b.sched.groupConcurrentWith(&group, .{ .affinity = .free }, Context.member, .{ b, &ctx });
+    var awaiter = try b.sched.concurrentWith(.{ .affinity = .free }, Context.awaiter, .{ io, &ctx, &group });
+    ctx.task.store(@ptrCast(@alignCast(awaiter.any_future.?)), .release);
+
+    // Wait for the awaiter to be cancel-protected, then request cancelation on it while it awaits
+    // nothing: the request is kept, and nothing else happens.
+    var spins: usize = 0;
+    while (!ctx.protected.load(.acquire)) : (spins += 1) {
+        if (spins > (1 << 31)) return error.TestUnexpectedResult;
+        std.atomic.spinLoopHint();
+    }
+    b.sched.requestCancel(ctx.task.load(.acquire).?);
+    ctx.requested.store(true, .release);
+
+    // Now the member finishes, and the awaiter must be readied by that alone.
+    @atomicStore(u32, &ctx.word, 1, .monotonic);
+    TestBackend.futexWake(b, &ctx.word, 1);
+
+    spins = 0;
+    while (!ctx.resumed.load(.acquire)) : (spins += 1) {
+        if (spins > (1 << 31)) break; // never readied: the assertions below fail
+        std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(ctx.member_done.load(.acquire));
+    try std.testing.expect(ctx.resumed.load(.acquire));
+    awaiter.await(io);
+    try group.await(io);
+    try std.testing.expect(ctx.canceled.load(.acquire));
+}
+
+// Case B: a cancel request arrives at a registered, cancel-protected awaiter at the same time as
+// the group's last member leaves. The request must not read the awaiter's group state after the
+// group has reset it, and the awaiter must resume exactly once.
+test "cancelation: a cancel request racing the last member's exit" {
+    const b = try testBackend(3);
+    defer destroyTestBackend(b);
+    const io = b.io();
+
+    const Context = struct {
+        word: u32 = 0,
+        member_done: std.atomic.Value(bool) = .init(false),
+        resumed: std.atomic.Value(bool) = .init(false),
+        canceled: std.atomic.Value(bool) = .init(false),
+        finished: std.atomic.Value(bool) = .init(false),
+
+        fn member(b_: *TestBackend, ctx: *@This()) void {
+            TestBackend.futexWaitUncancelable(b_, &ctx.word, 0);
+            ctx.member_done.store(true, .release);
+        }
+
+        fn awaiter(inner_io: Io, ctx: *@This(), group: *Io.Group) void {
+            _ = inner_io.swapCancelProtection(.blocked);
+            group.await(inner_io) catch |err| switch (err) {
+                error.Canceled => unreachable,
+            };
+            ctx.resumed.store(true, .release);
+            _ = inner_io.swapCancelProtection(.unblocked);
+            inner_io.checkCancel() catch |err| switch (err) {
+                error.Canceled => ctx.canceled.store(true, .release),
+            };
+            ctx.finished.store(true, .release);
+        }
+    };
+
+    var iteration: usize = 0;
+    while (iteration < 200) : (iteration += 1) {
+        var ctx: Context = .{};
+        var group: Io.Group = .init;
+        try b.sched.groupConcurrentWith(&group, .{ .affinity = .free }, Context.member, .{ b, &ctx });
+        var awaiter = try b.sched.concurrentWith(.{ .affinity = .free }, Context.awaiter, .{ io, &ctx, &group });
+        const task: *TestBackend.Sched.Task = @ptrCast(@alignCast(awaiter.any_future.?));
+
+        // Wait until the awaiter has registered itself with the group, so the request below races
+        // the member's exit.
+        var spins: usize = 0;
+        while (@atomicLoad(TestBackend.Sched.Group.Awaiter, TestBackend.Sched.Group.awaiterPtr(.{ .ptr = &group }), .monotonic).awaiter == .null) : (spins += 1) {
+            if (spins > (1 << 31)) return error.TestUnexpectedResult;
+            std.atomic.spinLoopHint();
+        }
+
+        b.sched.requestCancel(task);
+        @atomicStore(u32, &ctx.word, 1, .monotonic);
+        TestBackend.futexWake(b, &ctx.word, 1);
+
+        spins = 0;
+        while (!ctx.finished.load(.acquire)) : (spins += 1) {
+            if (spins > (1 << 31)) break;
+            std.atomic.spinLoopHint();
+        }
+        try std.testing.expect(ctx.member_done.load(.acquire));
+        try std.testing.expect(ctx.resumed.load(.acquire));
+        awaiter.await(io);
+        try group.await(io);
+        try std.testing.expect(ctx.canceled.load(.acquire));
+    }
+}
+
+// A group that has handed its awaiter back is clean: `Io.Group` says a group may be added to once
+// it has been awaited or canceled, so the next round's members must not find the awaiter of the
+// round before. Before the fix, the second round tripped an assertion in the group's bookkeeping.
+test "group reuse: an awaited group is clean for the next round" {
+    const b = try testBackend(3);
+    defer destroyTestBackend(b);
+    const io = b.io();
+
+    const Context = struct {
+        /// The member parks on this word; the helper sets it once the group has an awaiter.
+        word: u32 = 0,
+        done: std.atomic.Value(bool) = .init(false),
+        helper_done: std.atomic.Value(bool) = .init(false),
+
+        fn member(b_: *TestBackend, ctx: *@This()) void {
+            TestBackend.futexWaitUncancelable(b_, &ctx.word, 0);
+            ctx.done.store(true, .release);
+        }
+
+        /// Wakes the member once the group has an awaiter, so that the member's exit, not a wake of
+        /// its own, is what readies the awaiter.
+        fn helper(b_: *TestBackend, ctx: *@This(), group: *Io.Group) void {
+            var spins: usize = 0;
+            while (@atomicLoad(TestBackend.Sched.Group.Awaiter, TestBackend.Sched.Group.awaiterPtr(.{ .ptr = group }), .monotonic).awaiter == .null) : (spins += 1) {
+                if (spins > (1 << 31)) return;
+                std.atomic.spinLoopHint();
+            }
+            @atomicStore(u32, &ctx.word, 1, .monotonic);
+            TestBackend.futexWake(b_, &ctx.word, 1);
+            ctx.helper_done.store(true, .release);
+        }
+    };
+
+    var group: Io.Group = .init;
+    var helper_futures: [2]Io.Future(void) = undefined;
+    var round: u32 = 0;
+    while (round < 2) : (round += 1) {
+        var ctx: Context = .{};
+        // `.free`, so the tasks run on workers other than this one, which is waiting on the group.
+        try b.sched.groupConcurrentWith(&group, .{ .affinity = .free }, Context.member, .{ b, &ctx });
+        helper_futures[round] = try b.sched.concurrentWith(.{ .affinity = .free }, Context.helper, .{ b, &ctx, &group });
+        try group.await(io);
+        helper_futures[round].await(io);
+        try std.testing.expect(ctx.done.load(.acquire));
+        try std.testing.expect(ctx.helper_done.load(.acquire));
+        try std.testing.expectEqual(null, group.token.load(.acquire));
+    }
 }
