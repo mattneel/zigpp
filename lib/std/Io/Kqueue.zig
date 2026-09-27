@@ -1379,7 +1379,11 @@ fn resize(
     const ev_io = ev.io();
     ev.backing_allocator_mutex.lockUncancelable(ev_io);
     defer ev.backing_allocator_mutex.unlock(ev_io);
-    return ev.backing_allocator.rawResize(memory, alignment, new_len, ret_addr);
+    const ok = ev.backing_allocator.rawResize(memory, alignment, new_len, ret_addr);
+    std.debug.print("diag resize: mem={*} from={d} to={d} align={d} -> {}\n", .{
+        memory.ptr, memory.len, new_len, alignment.toByteUnits(), ok,
+    });
+    return ok;
 }
 
 fn remap(
@@ -1393,7 +1397,9 @@ fn remap(
     const ev_io = ev.io();
     ev.backing_allocator_mutex.lockUncancelable(ev_io);
     defer ev.backing_allocator_mutex.unlock(ev_io);
-    return ev.backing_allocator.rawRemap(memory, alignment, new_len, ret_addr);
+    const p2 = ev.backing_allocator.rawRemap(memory, alignment, new_len, ret_addr);
+    std.debug.print("diag remap: mem={*} from={d} to={d} -> {?*}\n", .{ memory.ptr, memory.len, new_len, if (p2) |q| @as(?*anyopaque, @ptrCast(q)) else null });
+    return p2;
 }
 
 fn free(userdata: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {
