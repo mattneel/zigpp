@@ -2727,6 +2727,16 @@ pub fn Scheduler(comptime Backend: type) type {
                             .awaiter_delayed = false,
                             .tasks = .null,
                         }, .release);
+                        // The awaiter is handed back here, so the group keeps none: a group may
+                        // be used again once it has been awaited or canceled, and a later member's
+                        // exit must not find this awaiter again. The lock's own bits stay as they
+                        // are - `removeTask` holds the lock - and only the awaiter field is
+                        // cleared.
+                        _ = @atomicRmw(Awaiter, group.awaiterPtr(), .And, .{
+                            .locked = true,
+                            .contended = true,
+                            .awaiter = .null,
+                        }, .release);
                         assert(awaiter.status.awaiting_group.ptr == group.ptr);
                         awaiter.status = .{ .queue_next = null };
                         return awaiter;
@@ -3484,5 +3494,54 @@ test "cancelation: a cancel request racing the last member's exit" {
         awaiter.await(io);
         try group.await(io);
         try std.testing.expect(ctx.canceled.load(.acquire));
+    }
+}
+
+// A group that has handed its awaiter back is clean: `Io.Group` says a group may be added to once
+// it has been awaited or canceled, so the next round's members must not find the awaiter of the
+// round before. Before the fix, the second round tripped an assertion in the group's bookkeeping.
+test "group reuse: an awaited group is clean for the next round" {
+    const b = try testBackend(3);
+    defer destroyTestBackend(b);
+    const io = b.io();
+
+    const Context = struct {
+        /// The member parks on this word; the helper sets it once the group has an awaiter.
+        word: u32 = 0,
+        done: std.atomic.Value(bool) = .init(false),
+        helper_done: std.atomic.Value(bool) = .init(false),
+
+        fn member(b_: *TestBackend, ctx: *@This()) void {
+            TestBackend.futexWaitUncancelable(b_, &ctx.word, 0);
+            ctx.done.store(true, .release);
+        }
+
+        /// Wakes the member once the group has an awaiter, so that the member's exit, not a wake of
+        /// its own, is what readies the awaiter.
+        fn helper(b_: *TestBackend, ctx: *@This(), group: *Io.Group) void {
+            var spins: usize = 0;
+            while (@atomicLoad(TestBackend.Sched.Group.Awaiter, TestBackend.Sched.Group.awaiterPtr(.{ .ptr = group }), .monotonic).awaiter == .null) : (spins += 1) {
+                if (spins > (1 << 31)) return;
+                std.atomic.spinLoopHint();
+            }
+            @atomicStore(u32, &ctx.word, 1, .monotonic);
+            TestBackend.futexWake(b_, &ctx.word, 1);
+            ctx.helper_done.store(true, .release);
+        }
+    };
+
+    var group: Io.Group = .init;
+    var helper_futures: [2]Io.Future(void) = undefined;
+    var round: u32 = 0;
+    while (round < 2) : (round += 1) {
+        var ctx: Context = .{};
+        // `.free`, so the tasks run on workers other than this one, which is waiting on the group.
+        try b.sched.groupConcurrentWith(&group, .{ .affinity = .free }, Context.member, .{ b, &ctx });
+        helper_futures[round] = try b.sched.concurrentWith(.{ .affinity = .free }, Context.helper, .{ b, &ctx, &group });
+        try group.await(io);
+        helper_futures[round].await(io);
+        try std.testing.expect(ctx.done.load(.acquire));
+        try std.testing.expect(ctx.helper_done.load(.acquire));
+        try std.testing.expectEqual(null, group.token.load(.acquire));
     }
 }
