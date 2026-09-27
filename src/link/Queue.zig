@@ -160,6 +160,7 @@ fn runLinkTasks(q: *Queue, comp: *Compilation) void {
         const limit: usize = if (have_idle_tasks) 0 else 1;
         const n = q.prelink_queue.get(io, &task_buf, limit) catch |err| switch (err) {
             error.Canceled => return,
+            error.Resync => unreachable, // the queue blocks: `init`, not `initWithOptions`
             error.Closed => break :prelink_tasks,
         };
         if (n == 0) {
@@ -192,6 +193,7 @@ fn runLinkTasks(q: *Queue, comp: *Compilation) void {
         const limit: usize = if (have_idle_tasks) 0 else 1;
         const n = q.zcu_queue.get(io, &task_buf, limit) catch |err| switch (err) {
             error.Canceled => return,
+            error.Resync => unreachable, // the queue blocks: `init`, not `initWithOptions`
             error.Closed => break :zcu_tasks,
         };
         if (n == 0) {

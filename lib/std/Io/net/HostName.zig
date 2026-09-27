@@ -314,6 +314,7 @@ pub fn connect(
             if (loser) |s| s.close(io) else |_| {}
         } else |err| switch (err) {
             error.Closed => {},
+            error.Resync => unreachable, // the queue blocks: `init`, not `initWithOptions`
         }
     }
 
@@ -337,6 +338,7 @@ pub fn connect(
         }
     } else |err| switch (err) {
         error.Canceled => |e| return e,
+        error.Resync => unreachable, // the queue blocks: `init`, not `initWithOptions`
         error.Closed => {
             // There was no successful connection attempt. If there was a lookup error, return that.
             try connect_many.await(io);
@@ -381,6 +383,7 @@ pub fn connectMany(
         .canonical_name => continue,
     } else |err| switch (err) {
         error.Canceled => |e| return e,
+        error.Resync => unreachable, // the queue blocks: `init`, not `initWithOptions`
         error.Closed => {
             try group.await(io);
             return lookup_future.await(io);

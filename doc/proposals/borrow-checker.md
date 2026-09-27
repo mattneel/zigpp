@@ -1641,7 +1641,7 @@ Why acceptable: race freedom is a different analysis with a different implementa
 
 ### 10.5 Why this is enough for 1.0
 
-The claim Zig++ 1.0 makes is not “memory-safe Zig”. It is: **a module can ask to be checked, and
+The claim the 1.0 milestone makes is not “memory-safe Zig”. It is: **a module can ask to be checked, and
 the checker will reject the four classes issue #7 names, on the code it can see, without changing a
 byte of machine code and without changing what any existing Zig program means.** The non-goals
 above are the boundary of that claim, the escape hatches are documented as the boundary-crossing
@@ -1742,7 +1742,7 @@ Tests: std compiles clean under `-fborrow-check` (a CI job, not a unit test), th
 is recorded as a baseline that may only shrink, and the langref’s own `test_borrow_checking.zig`-
 style runnable examples.
 
-### Stage 6 — Zig++ 1.0 (plan: Zig++ 1.0)
+### Stage 6 — the 1.0 milestone
 
 The acceptance criteria of §12 all hold, and the four checks are on by default for new projects
 through a `build.zig` template line, still off for existing code.
