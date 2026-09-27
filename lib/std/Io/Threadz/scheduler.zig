@@ -799,7 +799,9 @@ pub fn Scheduler(comptime Backend: type) type {
             errdefer gpa.free(spares);
             const idle_stack = try mapStack(idle_stack_size);
             errdefer posix.munmap(idle_stack);
-            const idle_indexes = try gpa.alloc(u32, count);
+            // Every worker and every replacement can be parked at once: a worker that switches
+            // out again wakes its replacement to stop, and may park before the replacement leaves.
+            const idle_indexes = try gpa.alloc(u32, workers.len + spares.len);
             errdefer gpa.free(idle_indexes);
             s.* = .{
                 .workers = workers,
@@ -3093,6 +3095,39 @@ test "watchdog: with one worker, what a blocked task queued still runs" {
     try std.testing.expect(stats.replacements >= 1);
     try std.testing.expectEqual(TestBackend.Sched.Stats.Kind.blocked, stats.last_stuck.?.kind);
     try std.testing.expectEqualStrings("blocker", stats.last_stuck.?.name);
+}
+
+test "watchdog: the replacements park beside the workers they stood in for" {
+    // Every worker waits in the kernel, so the watchdog starts a replacement for each, and the
+    // replacements park, finding nothing to run. Then the workers switch out again: each wakes its
+    // replacement to stop and may park before the replacement has left, so up to twice as many
+    // parked as there are workers.
+    const workers = 4;
+    const b = try testBackend(workers);
+    defer destroyTestBackend(b);
+    const io = b.io();
+
+    const S = struct {
+        /// Holds the worker in raw futex waits, which the scheduler cannot see, until every
+        /// replacement has parked, for ten seconds at most.
+        fn hold(sched: *TestBackend.Sched) void {
+            var word: u32 = 0;
+            var waited_ms: u32 = 0;
+            while (sched.idle.parked.load(.acquire) < workers and waited_ms < 10_000) : (waited_ms += 10) {
+                const ts: linux.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+                _ = linux.futex(&word, .{ .cmd = .WAIT, .private = true }, 0, .{ .timeout = &ts }, null, 0);
+            }
+        }
+    };
+
+    // Worker 0's hold is spawned last and runs once the main task parks in the first await.
+    var holds: [workers]Io.Future(void) = undefined;
+    for (&holds, 0..) |*hold, i| {
+        const index: u32 = @intCast(workers - 1 - i);
+        hold.* = try b.sched.concurrentWith(.{ .affinity = .{ .pinned = index } }, S.hold, .{&b.sched});
+    }
+    for (&holds) |*hold| hold.await(io);
+    try std.testing.expectEqual(workers, b.sched.stats().replacements);
 }
 
 test "watchdog: an idle instance has no rounds" {
