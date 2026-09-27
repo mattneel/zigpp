@@ -2684,8 +2684,9 @@ pub const TypeErasedQueue = struct {
 
     /// What a `put` does when the queue is full. See `QueueOverflow`, and `Options`.
     overflow: QueueOverflow,
-    /// The elements that `drop` and `drop_and_resync` puts dropped. See `droppedElements`.
-    dropped: u64,
+    /// The bytes that `drop` and `drop_and_resync` puts dropped. See `droppedBytes`. A `usize`,
+    /// so that every target can update it atomically.
+    dropped: usize,
     /// Set by a dropped put of a `drop_and_resync` queue, and cleared by the `get` that returns
     /// `error.Resync`.
     resync: bool,
@@ -2739,11 +2740,11 @@ pub const TypeErasedQueue = struct {
 
     /// The bytes puts dropped over the queue's lifetime: a `drop` or `drop_and_resync` queue that
     /// never met a full buffer reads 0. `Queue(Elem).droppedElements` counts elements. See
-    /// `QueueOverflow`.
+    /// `QueueOverflow`. On a target with 32-bit pointers the count wraps after 4 GiB.
     ///
     /// Threadsafe.
     pub fn droppedBytes(q: *const TypeErasedQueue) u64 {
-        return @atomicLoad(u64, &q.dropped, .monotonic);
+        return @atomicLoad(usize, &q.dropped, .monotonic);
     }
 
     /// After this is called, the queue enters a "closed" state. A closed
@@ -2843,7 +2844,7 @@ pub const TypeErasedQueue = struct {
         // Nothing on a queue that drops waits: what did not fit, which can be all of it, is
         // dropped and counted, and the put returns how much it took.
         if (q.overflow != .block) {
-            _ = @atomicRmw(u64, &q.dropped, .Add, elements.len - n, .monotonic);
+            _ = @atomicRmw(usize, &q.dropped, .Add, elements.len - n, .monotonic);
             if (q.overflow == .drop_and_resync) q.resync = true;
             return n;
         }
@@ -3052,11 +3053,12 @@ pub fn Queue(Elem: type) type {
         }
 
         /// The elements puts dropped over the queue's lifetime: a `drop` or `drop_and_resync`
-        /// queue that never met a full buffer reads 0. See `QueueOverflow`.
+        /// queue that never met a full buffer reads 0. See `QueueOverflow`. On a target with
+        /// 32-bit pointers the count wraps after 4 GiB of elements.
         ///
         /// Threadsafe.
         pub fn droppedElements(q: *const @This()) u64 {
-            return @divExact(q.type_erased.droppedBytes(), @sizeOf(Elem));
+            return @divTrunc(q.type_erased.droppedBytes(), @sizeOf(Elem));
         }
 
         /// After this is called, the queue enters a "closed" state. A closed
