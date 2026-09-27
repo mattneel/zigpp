@@ -1265,6 +1265,75 @@ test "Supervisor restarts per strategy" {
     }
 }
 
+test "Supervisor takes the report of a child that ends while it restarts others" {
+    const io = testing.io;
+
+    // rest_for_one: child 1 fails, so child 2 is stopped and both are started again. Child 0 is
+    // left alone, and it ends while the supervisor waits for child 2 to stop: its report is in the
+    // queue during the restart, and the supervisor has to take it, or it waits for child 0 forever.
+    const Children = struct {
+        supervisor: *Io.Supervisor,
+        starts: [3]u32 = .{ 0, 0, 0 },
+        release_first: Io.Event = .unset,
+
+        fn first(io_: Io, ctx: *@This()) anyerror!void {
+            ctx.starts[0] += 1;
+            try ctx.release_first.wait(io_);
+        }
+
+        fn middle(io_: Io, ctx: *@This()) anyerror!void {
+            _ = io_;
+            ctx.starts[1] += 1;
+            if (ctx.starts[1] == 1) return error.ChildFailed;
+        }
+
+        fn last(io_: Io, ctx: *@This()) anyerror!void {
+            ctx.starts[2] += 1;
+            if (ctx.starts[2] > 1) return;
+            var buffer: [1]u8 = .{0};
+            var queue: Io.Queue(u8) = .init(&buffer);
+            // Nothing ever puts into the queue: only the supervisor stopping this child wakes it.
+            _ = queue.getOne(io_) catch |err| switch (err) {
+                error.Canceled => {
+                    ctx.release_first.set(io_);
+                    ctx.awaitReport(io_);
+                    return error.Canceled;
+                },
+                error.Closed, error.Resync => unreachable,
+            };
+            unreachable;
+        }
+
+        /// Waits until child 0's report is in the supervisor's queue. Child 1's report was taken
+        /// already, and this child has not reported, so child 0's is the only one it can hold.
+        fn awaitReport(ctx: *@This(), io_: Io) void {
+            const old = io_.swapCancelProtection(.blocked);
+            defer _ = io_.swapCancelProtection(old);
+            const exits = &ctx.supervisor.exits.type_erased;
+            while (true) {
+                exits.mutex.lockUncancelable(io_);
+                const len = exits.len;
+                exits.mutex.unlock(io_);
+                if (len > 0) return;
+                io_.sleep(.fromMilliseconds(1), .awake) catch unreachable; // cancelation is blocked
+            }
+        }
+    };
+
+    var supervisor: Io.Supervisor = .init(io, testing.allocator, .{ .strategy = .rest_for_one });
+    defer supervisor.deinit();
+    var ctx: Children = .{ .supervisor = &supervisor };
+    try supervisor.add(Children.first, .{&ctx});
+    try supervisor.add(Children.middle, .{&ctx});
+    try supervisor.add(Children.last, .{&ctx});
+    supervisor.run() catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return error.SkipZigTest,
+        else => |e| return e,
+    };
+    try expectEqual(error.ChildFailed, supervisor.lastChildError().?);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 2 }, &ctx.starts);
+}
+
 test "Supervisor intensity" {
     const io = testing.io;
 

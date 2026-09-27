@@ -1986,7 +1986,9 @@ pub const Supervisor = struct {
     restarts: std.ArrayListUnmanaged(Timestamp) = .empty,
     /// The last child error, which `lastChildError` reports.
     last_error: ?anyerror = null,
-    /// The exit reports of the current run's tasks: one per child, plus room for `drain`.
+    /// The exit reports of the current run's tasks, stale ones included: `run` skips those by
+    /// their epoch. Room for one per child; a task finding it full waits for the monitor to take
+    /// a report, or for the monitor to cancel it.
     exits: Queue(Exit) = undefined,
     exits_buffer: []Exit = &.{},
     running: bool = false,
@@ -2084,7 +2086,7 @@ pub const Supervisor = struct {
         defer s.running = false;
         s.last_error = null;
 
-        s.exits_buffer = try s.gpa.alloc(Exit, count + 1);
+        s.exits_buffer = try s.gpa.alloc(Exit, count);
         defer {
             s.gpa.free(s.exits_buffer);
             s.exits_buffer = &.{};
@@ -2123,12 +2125,10 @@ pub const Supervisor = struct {
                 .one_for_one => try s.spawn(exit.index),
                 .one_for_all => {
                     s.stopAll();
-                    s.drain();
                     for (0..count) |index| try s.spawn(@intCast(index));
                 },
                 .rest_for_one => {
                     s.stopFrom(exit.index + 1);
-                    s.drain();
                     for (exit.index..count) |index| try s.spawn(@intCast(index));
                 },
             }
@@ -2165,18 +2165,21 @@ pub const Supervisor = struct {
         child.running = true;
     }
 
-    /// One child task: runs the child's function and reports how it ended to the monitor, which is
-    /// waiting for the report. The report is uncancelable: a canceled task reports too.
+    /// One child task: runs the child's function and reports how it ended to the monitor. The
+    /// report is cancelable. Only the monitor cancels a child, and only to stop it, which makes its
+    /// report stale; the monitor then waits for the task while nothing takes from the queue, so a
+    /// report that waited through the cancel for room would wait forever.
     fn childEntry(context: *const anyopaque) void {
         const live: *const Live = @ptrCast(@alignCast(context));
         const s = live.supervisor;
         const child = &s.children.items[live.index];
         const result: anyerror!void = child.start(s.io, child.args);
-        s.exits.putOneUncancelable(s.io, .{
+        s.exits.putOne(s.io, .{
             .index = live.index,
             .epoch = live.epoch,
             .result = if (result) |_| null else |err| err,
         }) catch |err| switch (err) {
+            error.Canceled => {}, // stopped: the report is stale
             // The monitor never closes the queue.
             error.Closed => unreachable,
         };
@@ -2224,23 +2227,6 @@ pub const Supervisor = struct {
         // an early-returning `await` above would otherwise leave unordered - before whatever the
         // monitor does to the group and its memory next.
         _ = @atomicLoad(usize, &child.group.state, .acquire);
-    }
-
-    /// Throws away the reports of the tasks a strategy just canceled. Their epochs are past, so
-    /// the monitor would ignore them; this keeps the queue from filling up with them.
-    fn drain(s: *Supervisor) void {
-        const old = s.io.swapCancelProtection(.blocked);
-        defer _ = s.io.swapCancelProtection(old);
-        // One at a time, into storage of its own: the queue's ring buffer is the queue's, and a
-        // get into it would copy it onto itself.
-        var scratch: [1]Exit = undefined;
-        while (true) {
-            const n = s.exits.get(s.io, &scratch, 0) catch |err| switch (err) {
-                // Cancelation is blocked, the monitor never closes the queue, and it blocks.
-                error.Canceled, error.Closed, error.Resync => unreachable,
-            };
-            if (n == 0) return;
-        }
     }
 
     /// Records that a child is about to be restarted, and says whether that is one restart too
