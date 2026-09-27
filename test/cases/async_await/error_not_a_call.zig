@@ -9,4 +9,4 @@ fn handler(io: Io) void {
 // error
 // is_test=true
 //
-// :7:15: error: the operand of `async` must be a call: `async(io) f(x)`
+// :6:15: error: the operand of `async` must be a call: `async(io) f(x)`

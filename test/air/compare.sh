@@ -33,14 +33,14 @@ dump() {
         exit 1
     fi
     for f in $functions; do
-        awk -v want="$base.$f" -v base="$base" '
+        awk -v want="$base.$f" -v fn="$f" -v base="$base" '
             /^# Begin Function AIR: / {
                 name = $5
                 sub(/:$/, "", name)
                 gsub(/\//, ".", name)
                 name = substr(name, length(name) - length(want) + 1)
                 printing = (name == want)
-                if (printing) print "# " f
+                if (printing) print "# " fn
                 next
             }
             /^# End Function AIR: / { printing = 0; next }

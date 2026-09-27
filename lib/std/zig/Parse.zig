@@ -45,6 +45,24 @@ fn nodeData(p: *const Parse, node: Node.Index) Node.Data {
     return p.nodes.items(.data)[@backingInt(node)];
 }
 
+/// The extra data at `index`, read as `T`: what `Ast.extraData` does for a
+/// finished tree.
+fn extraData(p: *const Parse, index: ExtraIndex, comptime T: type) T {
+    const info = @typeInfo(T).@"struct";
+    var result: T = undefined;
+    inline for (info.field_names, info.field_types, 0..) |field_name, field_type, i| {
+        @field(result, field_name) = switch (field_type) {
+            Node.Index,
+            Node.OptionalIndex,
+            OptionalTokenIndex,
+            ExtraIndex,
+            => @fromBackingInt(@intCast(p.extra_data.items[@backingInt(index) + i])),
+            else => @compileError("unexpected field type"),
+        };
+    }
+    return result;
+}
+
 /// The task keyword spelled by `token_index`, if it is one. The words are
 /// ordinary identifiers to the tokenizer (`std.zig.Ast.TaskKeyword`), so the
 /// token is re-tokenized to read it exactly.
@@ -2373,7 +2391,10 @@ fn spawnArgsTuple(p: *Parse, call_node: Node.Index) Allocator.Error!Node.Index {
             });
         },
         .call, .call_comma => {
-            const range = p.nodeData(call_node).extra_range;
+            // `.call` holds the function and the index of the argument span,
+            // which is a `Node.SubRange` of its own in the extra data.
+            const extra_index = p.nodeData(call_node).node_and_extra[1];
+            const range = p.extraData(extra_index, Node.SubRange);
             const args = p.extra_data.items[@backingInt(range.start)..@backingInt(range.end)];
             if (args.len <= 2) {
                 return try p.addNode(.{

@@ -844,8 +844,11 @@ fn taskDisposal(
         var then_gen = block_gen.makeSubBlock(&block_gen.base);
         {
             try emitDbgStmtHere(&then_gen);
-            const call_ref = try emitTaskCall(&then_gen, &then_gen.base, future, io, method_str, node, .{ .rl = .discard, .ctx = .assignment });
-            _ = try then_gen.addUnNode(.ensure_result_non_error, call_ref, node);
+            // The result is dropped, not discarded the way `_ = x;` writes it:
+            // `ensure_result_non_error` would make a join of a task whose
+            // `Result` is an error union a compile error, and §3.3 promises
+            // those work. An error is dropped with the value.
+            _ = try emitTaskCall(&then_gen, &then_gen.base, future, io, method_str, node, .{ .rl = .none, .ctx = .assignment });
             _ = try then_gen.addBreak(.@"break", if_block, .void_value);
         }
         var else_gen = block_gen.makeSubBlock(&block_gen.base);
