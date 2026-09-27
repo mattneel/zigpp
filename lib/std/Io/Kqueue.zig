@@ -1357,7 +1357,15 @@ fn alloc(userdata: *anyopaque, len: usize, alignment: Alignment, ret_addr: usize
     const ev_io = ev.io();
     ev.backing_allocator_mutex.lockUncancelable(ev_io);
     defer ev.backing_allocator_mutex.unlock(ev_io);
-    return ev.backing_allocator.rawAlloc(len, alignment, ret_addr);
+    const result = ev.backing_allocator.rawAlloc(len, alignment, ret_addr);
+    std.debug.print("diag alloc: ev={*} len={d} align={d} backing={*} -> {?*}\n", .{
+        ev,
+        len,
+        alignment.toByteUnits(),
+        ev.backing_allocator.ptr,
+        if (result) |r| @as(?*anyopaque, @ptrCast(r)) else null,
+    });
+    return result;
 }
 
 fn resize(
@@ -1390,7 +1398,15 @@ fn remap(
 
 fn free(userdata: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    std.debug.print("diag free a: userdata={*} len={d}\n", .{ userdata, memory.len });
+    std.debug.print("diag free a: ev={*} mem={*} len={d} align={d} backing={*}/{*} needs={}\n", .{
+        ev,
+        memory.ptr,
+        memory.len,
+        alignment.toByteUnits(),
+        ev.backing_allocator.ptr,
+        ev.backing_allocator.vtable,
+        ev.backing_allocator_needs_mutex,
+    });
     const ev_io = ev.io();
     std.debug.print("diag free b\n", .{});
     ev.backing_allocator_mutex.lockUncancelable(ev_io);
