@@ -290,6 +290,7 @@ pub fn Scheduler(comptime Backend: type) type {
 
                 /// Releases everything the arena holds, if it holds anything.
                 fn free(task: *Task) void {
+                    std.debug.print("diag arena free: task={*} id={d} created={}\n", .{ task, task.id, task.arena.created });
                     if (!task.arena.created) return;
                     task.arena.allocator.deinit();
                     task.arena.created = false;
@@ -2508,7 +2509,12 @@ pub fn Scheduler(comptime Backend: type) type {
         pub fn taskArena(userdata: ?*anyopaque) Allocator {
             const s = fromUserdata(userdata);
             const w = s.chargeFetch() orelse Worker.current();
-            return Task.Arena.get(w.currentTask(), Backend.allocator(s.backendOf()));
+            const task = w.currentTask();
+            const alloc = Task.Arena.get(task, Backend.allocator(s.backendOf()));
+            std.debug.print("diag arena: task={*} id={d} worker={d} created={} alloc={*}/{*}\n", .{
+                task, task.id, w.index, task.arena.created, alloc.ptr, alloc.vtable,
+            });
+            return alloc;
         }
 
         /// `Io.Scoped`: the value bound to `key` in the calling task's chain, or `null`.
